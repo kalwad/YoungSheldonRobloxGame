@@ -1,0 +1,11 @@
+.DS_Store
+*.lock
+*.tmp
+*.temp
+.env
+.env.*
+!.env.example
+tmp/
+output/
+generated_images/
+
