@@ -13,8 +13,9 @@ of the row and does not satisfy its remaining live or topology requirement.
 - Reserved Cooper house place: `98645411943406`.
 - Both places remain in universe `10480337589`; the house capacity is exactly
   four, while the lobby supports at least four players and should target 50.
-- One shared five-task sequence. Any present member can advance the active
-  task, and every present member earns its reward exactly once.
+- One shared five-task sequence. Any eligible member can advance the active
+  task. Reward eligibility is an immutable server-owned snapshot captured when
+  the task begins, and every eligible member earns the reward exactly once.
 - The host owns the physical house state and is the only player allowed to buy
   persistent world upgrades.
 - Host loss pauses progression for 60 seconds. A valid host rejoin resumes the
@@ -24,16 +25,40 @@ of the row and does not satisfy its remaining live or topology requirement.
 - Only `Lobby` is enabled. Horror, secrets, finale, postgame, and production
   scenario tools remain disabled.
 
+## Ready/Start and visual closure evidence — 2026-07-22
+
+- Root cause reproduced: one shared request timestamp rejected a valid Launch
+  immediately after Ready as `Please wait a moment`.
+- The lobby now uses per-action gaps plus a five-token/two-per-second burst
+  budget. A clean runtime accepted Create Party → Ready → Launch with the Ready
+  commit and Launch preflight 50 ms apart.
+- Server responses now expose typed `selfReady`, `partyRevision`, and explicit
+  launch-block reason text. The client does not parse captions to infer state.
+- Launch is atomically locked, diagnostics are allowlisted and secret-safe, and
+  stale rollback can only alter its own session/reconnect records.
+- `verify_lobby_launch_repair.luau` passed 32/32 checks in edit mode and 32/32
+  in runtime. `verify_milestone1_foundation.luau` passed 237 edit-mode and 281
+  runtime lobby checks after the final scoped visual update.
+- The responsive CRT UI was inspected at desktop, iPhone 7 portrait/landscape,
+  iPhone 13 portrait, Galaxy A16 landscape, and iPad 6 landscape. All layouts
+  remained legible and scrollable; keyboard/gamepad focus activated Ready and
+  Start successfully. This remains simulator evidence, not physical hardware.
+- The lobby environment is now a warm 1980s suburban rec room. Its updater is
+  scoped and idempotent and cannot clear Workspace, Terrain, replicated data,
+  StarterGui, or runtime scripts.
+- No new version was published. Studio reports `PARTY VALIDATED — Studio safely
+  skipped the live teleport`; the published reserved-server rows remain open.
+
 ## Automated contract checks
 
 | ID | Check | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| A01 | Compile every local `.luau` source | No compile errors | PASS | 2026-07-22: `luau-compile` passed 79/79 sources, including the lobby environment builder |
+| A01 | Compile every local `.luau` source | No compile errors | PASS | 2026-07-22 closure: `luau-compile` passed 80/80 local sources; all 64 active sources also passed |
 | A02 | `git diff --check` | No whitespace errors | PASS | 2026-07-22: exited 0 with no findings |
 | A03 | Run `verify_milestone1_foundation.luau` in house edit mode | PASS | PASS | 2026-07-22 final house: 530 read-only checks passed |
 | A04 | Run verifier in a one-player house runtime | PASS | PASS | 2026-07-22 final house runtime: 616 checks passed |
-| A05 | Run verifier in lobby edit mode | PASS | PASS | 2026-07-22 final lobby after UI fix: 181 checks passed |
-| A06 | Run verifier in a lobby runtime | PASS | PASS | 2026-07-22 final lobby runtime: 225 checks passed |
+| A05 | Run verifier in lobby edit mode | PASS | PASS | 2026-07-22 launch/UI closure: 237 foundation checks plus 32 launch-repair checks passed |
+| A06 | Run verifier in a lobby runtime | PASS | PASS | 2026-07-22 clean runtime: 281 foundation checks plus 32 launch-repair checks passed |
 | A07 | Run every Milestone 0 gameplay regression suite | No regressions except intentional M1 source/cap contracts | NOT RUN | |
 | A08 | Client-authority scan | No client cash awards, task completion, host selection, or story forcing | PASS | 2026-07-22: all 13 active local client sources scanned; no forbidden authority pattern |
 
@@ -46,10 +71,10 @@ handoff, Roblox friend invitation, or physical-device touch behavior.
 | --- | --- | --- | --- | --- |
 | L01 | Play Solo in Studio | Safe preview validates without production teleport or authority | PASS | Final lobby interaction test completed and success notice persisted |
 | L02 | Create Party | Host party is created and controls update | PASS | Final lobby interaction test |
-| L03 | Ready and cancel ready | Text/state toggles correctly in both directions | PASS | Final lobby interaction test |
-| L04 | Host Launch in Studio | Safe-preview result only; no reserved server or MemoryStore authority | PASS | Final lobby interaction test; success notice persisted |
+| L03 | Ready and cancel ready | Text/state toggles correctly in both directions | PASS | Reproduced and repaired; typed server state remained stable through rerenders, Ready/cancel worked, and zero-delay regression passed |
+| L04 | Host Launch in Studio | Safe-preview result only; no reserved server or MemoryStore authority | PASS | Clean final runtime returned `STUDIO_PARTY_VALIDATED`; UI persisted the truthful no-live-teleport result |
 | L05 | Leave Party | Party UI returns to the no-party state | PASS | Final lobby interaction test |
-| L06 | Responsive simulated layouts | Desktop, iPhone 14 portrait/landscape, and iPad landscape fit and scroll | PASS | Final screenshots inspected after UI fix |
+| L06 | Responsive simulated layouts | Desktop, small phone portrait/landscape, modern phone, Android landscape, and tablet fit and scroll | PASS | Final captures: iPhone 7 portrait/landscape, iPhone 13 portrait, Galaxy A16 landscape, iPad 6 landscape, and desktop |
 | L07 | Lobby movement presentation | Scriptable movement prevents mobile joystick/jump controls covering UI | PASS | Confirmed in simulated mobile layouts |
 | L08 | Physical phone/tablet interaction | Touch, safe areas, keyboard opening, and rotation work on real hardware | NOT RUN | Simulator evidence is not a physical-device test |
 | L09 | Fresh lobby client initialization | Runtime stays stable without forcing global GUI selection; ordinary selectable buttons still work | PASS | Removed automatic `GuiService.SelectedObject` writes that crashed current Studio; fresh runtime stayed stable and every button flow passed; exported/published in v308 |

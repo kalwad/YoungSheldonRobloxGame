@@ -57,7 +57,20 @@ was exercised. This exact final lobby source was published as version 308 at
 | `2026-07-22_17-36-51_EDT_milestone-1-lobby-verified-runtime.rbxm` | Lobby protocol/config/server sources | 25182 | `fbba830672f2a7b30c5016741bb145519b391e1ff4f833b2dec2b2f597443c66` |
 | `2026-07-22_17-36-51_EDT_milestone-1-lobby-verified-player-scripts.rbxm` | Lobby `StarterPlayerScripts` | 8244 | `cf7a96e8fab0cf07184e8de42b4415de4000572ffc4ab039d50744c7cc92368e` |
 
-All seven verified hashes above were re-read from the stored files with
+### Ready/Start and 1980s visual closure — 19:20–19:38 EDT
+
+These combined exports contain the lobby environment, active lobby server and
+client, and lobby configuration. The first is the immediate rollback taken
+before the local closure repair. The second was exported after the clean
+Ready→Start runtime, responsive-device captures, and final edit/runtime audits.
+Neither export was published to Roblox.
+
+| File | Scope | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `2026-07-22_19-20-37_EDT_pre-launch-repair-lobby.rbxm` | Pre-repair lobby environment + active lobby sources/config | 44146 | `84dba61ee9b8e4913b60ca35438a2de3fc9413a2eb1ddbcc511d08de6457bad8` |
+| `2026-07-22_19-38-16_EDT_milestone-1-launch-repair-verified-lobby.rbxm` | Repaired Ready/Start + scoped 1980s lobby/UI | 58895 | `78bceda4afb4af2b4b61bad0936eb23b1b7520f89a5695b0901d275d20b23d7e` |
+
+All original seven verified hashes and both closure hashes above were re-read from the stored files with
 SHA-256. The house was published before the final lobby publication; no house
 version number or publication timestamp was supplied for this manifest.
 

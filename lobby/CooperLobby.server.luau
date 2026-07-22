@@ -3,6 +3,7 @@
 -- Install as ServerScriptService.CooperLobby in the lobby place.
 
 local MemoryStoreService = game:GetService("MemoryStoreService")
+local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -187,6 +188,72 @@ end
 -- Opaque attempt tokens prevent an older timeout from clearing a newer retry.
 local teleporting: { [number]: string } = {}
 local teleportFailureMessages: { [number]: string } = {}
+type TeleportDiagnostic = {
+	operationId: string,
+	partyId: string?,
+	sessionId: string?,
+	action: string,
+}
+local teleportDiagnostics: { [number]: TeleportDiagnostic } = {}
+
+-- Keep launch diagnostics useful without ever writing an access code, arrival
+-- ticket, invite ticket, or raw TeleportData to the server log. Every caller is
+-- constrained to this allowlist so future changes cannot accidentally turn a
+-- diagnostic checkpoint into an authentication-secret leak.
+local SAFE_DIAGNOSTIC_FIELDS: { [string]: boolean } = {
+	action = true,
+	failedCount = true,
+	launchedCount = true,
+	memberCount = true,
+	memberUserId = true,
+	operationId = true,
+	partyId = true,
+	partyRevision = true,
+	ready = true,
+	sessionId = true,
+	studio = true,
+	userId = true,
+}
+table.freeze(SAFE_DIAGNOSTIC_FIELDS)
+
+local function emitLobbyDiagnostic(checkpoint: string, reasonCode: string, context: { [string]: any }?)
+	local event: { [string]: any } = {
+		checkpoint = checkpoint,
+		reasonCode = reasonCode,
+		placeId = game.PlaceId,
+		protocolVersion = Protocol.VERSION,
+		timestamp = os.time(),
+	}
+	for key, value in pairs(context or {}) do
+		if SAFE_DIAGNOSTIC_FIELDS[key]
+			and (type(value) == "string" or type(value) == "number" or type(value) == "boolean")
+		then
+			event[key] = value
+		end
+	end
+	local encodedOk, encoded = pcall(function()
+		return HttpService:JSONEncode(event)
+	end)
+	if encodedOk then
+		print("[CooperLobbyDiagnostic] " .. encoded)
+	else
+		print("[CooperLobbyDiagnostic] checkpoint=" .. checkpoint .. " reasonCode=" .. reasonCode)
+	end
+end
+
+local function partyRevision(party: any): number
+	local revision = tonumber(type(party) == "table" and party.revision or nil) or 0
+	if revision ~= revision or revision < 0 or revision == math.huge then
+		return 0
+	end
+	return math.floor(revision)
+end
+
+local function bumpPartyRevision(party: any): number
+	local revision = partyRevision(party) + 1
+	party.revision = revision
+	return revision
+end
 
 local function hasMember(memberUserIds: { number }, userId: number): boolean
 	return Protocol.containsMember(memberUserIds, userId)
@@ -444,6 +511,7 @@ local function currentPartyForUser(userId: number): (any?, string?)
 						current.state = Protocol.PartyStates.Open
 						current.launchSessionId = nil
 						current.updatedAt = os.time()
+						bumpPartyRevision(current)
 					end
 					return current
 				end
@@ -585,6 +653,10 @@ local function publicState(player: Player, notice: string?): any
 		return {
 			version = Protocol.VERSION,
 			hasParty = false,
+			partyRevision = 0,
+			selfReady = false,
+			launchBlockReasonCode = "NO_PARTY",
+			launchBlockMessage = "Create a party or choose solo play first.",
 			canRejoin = canRejoin,
 			studioPreview = isStudio,
 			notice = notice or partyError or rejoinMessage,
@@ -595,12 +667,16 @@ local function publicState(player: Player, notice: string?): any
 	local allReady = #party.memberUserIds >= 1
 	local allPresent = true
 	local ownsPartyLobby = party.lobbyJobId == localLobbyJobId()
+	local selfReady = false
 	for _, userId in ipairs(party.memberUserIds) do
 		local name, displayName = playerNames(userId)
 		local ready = party.readyByUserId[tostring(userId)] == true
 		local present = Players:GetPlayerByUserId(userId) ~= nil
 		allReady = allReady and ready
 		allPresent = allPresent and present
+		if userId == player.UserId then
+			selfReady = ready
+		end
 		table.insert(members, {
 			userId = userId,
 			name = name,
@@ -611,21 +687,45 @@ local function publicState(player: Player, notice: string?): any
 		})
 	end
 
+	local canLaunch = party.hostUserId == player.UserId
+		and party.state == Protocol.PartyStates.Open
+		and ownsPartyLobby
+		and allReady
+		and allPresent
+	local launchBlockReasonCode: string? = nil
+	local launchBlockMessage: string? = nil
+	if party.hostUserId ~= player.UserId then
+		launchBlockReasonCode = "NOT_HOST"
+		launchBlockMessage = "Only the party host can start the house session."
+	elseif party.state ~= Protocol.PartyStates.Open then
+		launchBlockReasonCode = "PARTY_NOT_OPEN"
+		launchBlockMessage = "This party is already launching or playing."
+	elseif not ownsPartyLobby then
+		launchBlockReasonCode = "WRONG_LOBBY_SERVER"
+		launchBlockMessage = "Wait until everyone reaches the host's lobby."
+	elseif not allReady then
+		launchBlockReasonCode = "WAITING_FOR_READY"
+		launchBlockMessage = "Everyone must be ready before the host can start."
+	elseif not allPresent then
+		launchBlockReasonCode = "WAITING_FOR_MEMBERS"
+		launchBlockMessage = "Wait for every party member to arrive in this lobby."
+	end
+
 	return {
 		version = Protocol.VERSION,
 		hasParty = true,
 		partyId = party.partyId,
+		partyRevision = partyRevision(party),
 		hostUserId = party.hostUserId,
 		isHost = party.hostUserId == player.UserId,
+		selfReady = selfReady,
 		state = party.state,
 		members = members,
 		allReady = allReady,
 		allPresent = allPresent,
-		canLaunch = party.hostUserId == player.UserId
-			and party.state == Protocol.PartyStates.Open
-			and ownsPartyLobby
-			and allReady
-			and allPresent,
+		canLaunch = canLaunch,
+		launchBlockReasonCode = launchBlockReasonCode,
+		launchBlockMessage = launchBlockMessage,
 		canInvite = party.hostUserId == player.UserId
 			and party.state == Protocol.PartyStates.Open
 			and ownsPartyLobby
@@ -654,16 +754,37 @@ local function pushParty(party: any, notice: string?)
 	end
 end
 
-local function beginTeleportAttempt(player: Player, failureMessage: string?): string
+local function beginTeleportAttempt(
+	player: Player,
+	failureMessage: string?,
+	diagnostic: TeleportDiagnostic?
+): string
 	local token = Protocol.newOpaqueId("teleport")
 	teleporting[player.UserId] = token
 	teleportFailureMessages[player.UserId] = failureMessage
 		or "Roblox could not move you yet. You can use Rejoin House Session."
+	if diagnostic then
+		teleportDiagnostics[player.UserId] = diagnostic
+	else
+		teleportDiagnostics[player.UserId] = nil
+	end
 	task.delay(30, function()
 		if teleporting[player.UserId] == token and player.Parent == Players then
 			teleporting[player.UserId] = nil
 			local message = teleportFailureMessages[player.UserId]
 			teleportFailureMessages[player.UserId] = nil
+			local timeoutDiagnostic = teleportDiagnostics[player.UserId]
+			teleportDiagnostics[player.UserId] = nil
+			if timeoutDiagnostic then
+				emitLobbyDiagnostic("teleport_failed", "TELEPORT_TIMEOUT", {
+					action = timeoutDiagnostic.action,
+					memberUserId = player.UserId,
+					operationId = timeoutDiagnostic.operationId,
+					partyId = timeoutDiagnostic.partyId,
+					sessionId = timeoutDiagnostic.sessionId,
+					userId = player.UserId,
+				})
+			end
 			pushState(player, message or "Roblox did not move you. Please try again.")
 		end
 	end)
@@ -689,7 +810,8 @@ local function routePartyMemberToHostLobby(player: Player, party: any): (boolean
 	})
 	local token = beginTeleportAttempt(
 		player,
-		"Roblox could not move you into the host's lobby. Leave the party and ask for a new invite."
+		"Roblox could not move you into the host's lobby. Leave the party and ask for a new invite.",
+		nil
 	)
 	local ok = pcall(function()
 		TeleportService:TeleportAsync(Config.LobbyPlaceId, { player }, options)
@@ -698,6 +820,7 @@ local function routePartyMemberToHostLobby(player: Player, party: any): (boolean
 		if teleporting[player.UserId] == token then
 			teleporting[player.UserId] = nil
 			teleportFailureMessages[player.UserId] = nil
+			teleportDiagnostics[player.UserId] = nil
 		end
 		return false, "Roblox could not move you into the host's lobby. Leave the party and ask for a new invite."
 	end
@@ -737,6 +860,7 @@ local function createParty(player: Player, ready: boolean): (any?, string?)
 		readyByUserId = { [tostring(player.UserId)] = ready },
 		lobbyJobId = localLobbyJobId(),
 		state = Protocol.PartyStates.Open,
+		revision = 1,
 		createdAt = now,
 		updatedAt = now,
 	}
@@ -775,6 +899,7 @@ local function leaveParty(player: Player, suppressNotice: boolean?): (boolean, s
 			then
 				current.state = Protocol.PartyStates.Closed
 				current.updatedAt = os.time()
+				bumpPartyRevision(current)
 			end
 			return current
 		end)
@@ -800,6 +925,7 @@ local function leaveParty(player: Player, suppressNotice: boolean?): (boolean, s
 		current.memberUserIds = removeMember(current.memberUserIds, player.UserId)
 		current.readyByUserId[tostring(player.UserId)] = nil
 		current.updatedAt = os.time()
+		bumpPartyRevision(current)
 		return current
 	end)
 	if updateError then
@@ -896,6 +1022,7 @@ local function joinFromInvite(player: Player, ticketId: string, referredByUserId
 		table.insert(party.memberUserIds, player.UserId)
 		party.readyByUserId[tostring(player.UserId)] = false
 		party.updatedAt = os.time()
+		bumpPartyRevision(party)
 		return party
 	end)
 	if updateError then
@@ -913,6 +1040,7 @@ local function joinFromInvite(player: Player, ticketId: string, referredByUserId
 			if type(party) == "table" and party.state == Protocol.PartyStates.Open then
 				party.memberUserIds = removeMember(party.memberUserIds, player.UserId)
 				party.readyByUserId[tostring(player.UserId)] = nil
+				bumpPartyRevision(party)
 			end
 			return party
 		end)
@@ -931,16 +1059,39 @@ local function joinFromInvite(player: Player, ticketId: string, referredByUserId
 	return routePartyMemberToHostLobby(player, updated)
 end
 
-local function setReady(player: Player, ready: boolean): (boolean, string?)
+local function setReady(player: Player, ready: boolean): (boolean, string?, string?)
+	local operationId = Protocol.newOpaqueId("ready")
+	emitLobbyDiagnostic("ready_request_received", "READY_REQUEST_RECEIVED", {
+		action = "SetReady",
+		operationId = operationId,
+		ready = ready,
+		userId = player.UserId,
+	})
 	local party, partyError = currentPartyForUser(player.UserId)
 	if partyError then
-		return false, partyError
+		emitLobbyDiagnostic("ready_rejected", "READY_STORAGE_UNAVAILABLE", {
+			action = "SetReady",
+			operationId = operationId,
+			userId = player.UserId,
+		})
+		return false, partyError, "READY_STORAGE_UNAVAILABLE"
 	end
 	if not party then
-		return false, "Create or join a party first."
+		emitLobbyDiagnostic("ready_rejected", "READY_NO_PARTY", {
+			action = "SetReady",
+			operationId = operationId,
+			userId = player.UserId,
+		})
+		return false, "Create or join a party first.", "READY_NO_PARTY"
 	end
 	if party.state ~= Protocol.PartyStates.Open then
-		return false, "This party is already launching."
+		emitLobbyDiagnostic("ready_rejected", "READY_PARTY_NOT_OPEN", {
+			action = "SetReady",
+			operationId = operationId,
+			partyId = party.partyId,
+			userId = player.UserId,
+		})
+		return false, "This party is already launching.", "READY_PARTY_NOT_OPEN"
 	end
 
 	local updated, updateError = mapUpdate("Parties", party.partyId, Config.PartyTTLSeconds, function(current)
@@ -948,22 +1099,45 @@ local function setReady(player: Player, ready: boolean): (boolean, string?)
 			and current.state == Protocol.PartyStates.Open
 			and hasMember(current.memberUserIds, player.UserId)
 		then
-			current.readyByUserId[tostring(player.UserId)] = ready
-			current.updatedAt = os.time()
+			if current.readyByUserId[tostring(player.UserId)] ~= ready then
+				current.readyByUserId[tostring(player.UserId)] = ready
+				current.updatedAt = os.time()
+				bumpPartyRevision(current)
+			end
 		end
 		return current
 	end)
 	if updateError then
-		return false, updateError
+		emitLobbyDiagnostic("ready_rejected", "READY_STORAGE_UNAVAILABLE", {
+			action = "SetReady",
+			operationId = operationId,
+			partyId = party.partyId,
+			userId = player.UserId,
+		})
+		return false, updateError, "READY_STORAGE_UNAVAILABLE"
 	end
 	if type(updated) ~= "table"
 		or not hasMember(updated.memberUserIds, player.UserId)
 		or updated.readyByUserId[tostring(player.UserId)] ~= ready
 	then
-		return false, "Your party changed before that ready choice could be saved."
+		emitLobbyDiagnostic("ready_rejected", "READY_PARTY_CHANGED", {
+			action = "SetReady",
+			operationId = operationId,
+			partyId = party.partyId,
+			userId = player.UserId,
+		})
+		return false, "Your party changed before that ready choice could be saved.", "READY_PARTY_CHANGED"
 	end
+	emitLobbyDiagnostic("ready_committed", "READY_COMMITTED", {
+		action = "SetReady",
+		operationId = operationId,
+		partyId = updated.partyId,
+		partyRevision = partyRevision(updated),
+		ready = ready,
+		userId = player.UserId,
+	})
 	pushParty(updated, nil)
-	return true, nil
+	return true, nil, "READY_COMMITTED"
 end
 
 local function issueInvite(player: Player): (boolean, string?)
@@ -1002,64 +1176,147 @@ end
 
 local function rollbackLaunch(
 	partyId: string,
-	sessionId: string?,
+	sessionId: string,
 	memberUserIds: { number },
 	ticketIdsByUserId: { [string]: string }?
 )
-	if sessionId then
-		mapRemove("Sessions", "session:" .. sessionId)
-	end
+	mapRemove("Sessions", "session:" .. sessionId)
 	for _, ticketId in pairs(ticketIdsByUserId or {}) do
 		mapRemove("Tickets", "ticket:" .. ticketId)
 	end
 	for _, userId in ipairs(memberUserIds) do
-		teleporting[userId] = nil
-		teleportFailureMessages[userId] = nil
-		mapRemove("Rejoins", rejoinKey(userId))
+		local diagnostic = teleportDiagnostics[userId]
+		if diagnostic and diagnostic.sessionId == sessionId then
+			teleporting[userId] = nil
+			teleportFailureMessages[userId] = nil
+			teleportDiagnostics[userId] = nil
+		end
+		-- A delayed failure from an abandoned launch must never remove a newer
+		-- session's reconnect route. Atomically invalidate only our own record.
+		mapUpdate("Rejoins", rejoinKey(userId), Config.SessionTTLSeconds, function(current)
+			if type(current) == "table" and current.sessionId == sessionId then
+				return {
+					v = Protocol.VERSION,
+					sessionId = false,
+					status = "Released",
+					releasedAt = os.time(),
+				}
+			end
+			return current
+		end)
 	end
 	mapUpdate("Parties", partyId, Config.PartyTTLSeconds, function(party)
-		if type(party) == "table" and party.state == Protocol.PartyStates.Launching then
+		if type(party) == "table"
+			and party.state == Protocol.PartyStates.Launching
+			and party.launchSessionId == sessionId
+		then
 			party.state = Protocol.PartyStates.Open
 			party.launchSessionId = nil
 			party.updatedAt = os.time()
+			bumpPartyRevision(party)
 		end
 		return party
 	end)
 end
 
-local function launchParty(player: Player): (boolean, string?)
-	local party, partyError = currentPartyForUser(player.UserId)
+local function renewLaunchOwnership(partyId: string, sessionId: string): (boolean, string?)
+	local party, partyError = mapUpdate("Parties", partyId, Config.PartyTTLSeconds, function(current)
+		if validPartyRecord(current, partyId)
+			and current.state == Protocol.PartyStates.Launching
+			and current.launchSessionId == sessionId
+		then
+			-- Renew the abandoned-launch recovery lease around slow Roblox/storage
+			-- calls so the 60-second watchdog cannot promote a new launch while this
+			-- attempt is still actively building its secure route.
+			current.updatedAt = os.time()
+		end
+		return current
+	end)
 	if partyError then
 		return false, partyError
 	end
+	return validPartyRecord(party, partyId)
+		and party.state == Protocol.PartyStates.Launching
+		and party.launchSessionId == sessionId, nil
+end
+
+local function launchParty(player: Player): (boolean, string?, string?)
+	local operationId = Protocol.newOpaqueId("launch")
+	local function rejectLaunch(reasonCode: string, message: string, context: { [string]: any }?): (boolean, string?, string?)
+		local diagnosticContext = context or {}
+		diagnosticContext.action = "Launch"
+		diagnosticContext.operationId = operationId
+		diagnosticContext.userId = player.UserId
+		emitLobbyDiagnostic("launch_rejected", reasonCode, diagnosticContext)
+		return false, message, reasonCode
+	end
+	emitLobbyDiagnostic("launch_preflight_started", "LAUNCH_PREFLIGHT_STARTED", {
+		action = "Launch",
+		operationId = operationId,
+		studio = isStudio,
+		userId = player.UserId,
+	})
+	local party, partyError = currentPartyForUser(player.UserId)
+	if partyError then
+		return rejectLaunch("LAUNCH_STORAGE_UNAVAILABLE", partyError, nil)
+	end
 	if not party or party.hostUserId ~= player.UserId then
-		return false, "Only the party host can start the house session."
+		return rejectLaunch("LAUNCH_NOT_HOST", "Only the party host can start the house session.", nil)
 	end
 	if party.state ~= Protocol.PartyStates.Open then
-		return false, "This party is already launching."
+		return rejectLaunch("LAUNCH_PARTY_NOT_OPEN", "This party is already launching.", {
+			partyId = party.partyId,
+			partyRevision = partyRevision(party),
+		})
 	end
 	if party.lobbyJobId ~= localLobbyJobId() then
-		return false, "Wait until every member is together in the host's lobby."
+		return rejectLaunch("LAUNCH_WRONG_LOBBY", "Wait until every member is together in the host's lobby.", {
+			partyId = party.partyId,
+			partyRevision = partyRevision(party),
+		})
 	end
 	if #party.memberUserIds < Config.MinimumPartySize or #party.memberUserIds > Config.MaximumPartySize then
-		return false, "Party size must be between one and four players."
+		return rejectLaunch("LAUNCH_INVALID_PARTY_SIZE", "Party size must be between one and four players.", {
+			memberCount = #party.memberUserIds,
+			partyId = party.partyId,
+			partyRevision = partyRevision(party),
+		})
 	end
 
 	local livePlayersByUserId: { [number]: Player } = {}
 	for _, userId in ipairs(party.memberUserIds) do
 		if party.readyByUserId[tostring(userId)] ~= true then
-			return false, "Everyone must be ready before the host can start."
+			return rejectLaunch("LAUNCH_MEMBER_NOT_READY", "Everyone must be ready before the host can start.", {
+				memberCount = #party.memberUserIds,
+				memberUserId = userId,
+				partyId = party.partyId,
+				partyRevision = partyRevision(party),
+			})
 		end
 		local member = Players:GetPlayerByUserId(userId)
 		if not member then
-			return false, "Wait for every party member to arrive in this lobby."
+			return rejectLaunch("LAUNCH_MEMBER_ABSENT", "Wait for every party member to arrive in this lobby.", {
+				memberCount = #party.memberUserIds,
+				memberUserId = userId,
+				partyId = party.partyId,
+				partyRevision = partyRevision(party),
+			})
 		end
 		livePlayersByUserId[userId] = member
 	end
 
 	if isStudio then
+		emitLobbyDiagnostic("party_snapshot_locked", "STUDIO_PARTY_VALIDATED", {
+			action = "Launch",
+			memberCount = #party.memberUserIds,
+			operationId = operationId,
+			partyId = party.partyId,
+			partyRevision = partyRevision(party),
+			studio = true,
+			userId = player.UserId,
+		})
 		pushParty(party, "Studio party validation passed. Teleports and house authority stay disabled in Studio preview.")
-		return true, "Studio preview passed; launch was safely skipped."
+		return true, "Studio preview passed; launch was safely skipped.", "STUDIO_PARTY_VALIDATED"
 	end
 
 	local sessionId = Protocol.newOpaqueId("session")
@@ -1084,19 +1341,35 @@ local function launchParty(player: Player): (boolean, string?)
 			current.state = Protocol.PartyStates.Launching
 			current.launchSessionId = sessionId
 			current.updatedAt = now
+			bumpPartyRevision(current)
 		end
 		return current
 	end)
 	if markError then
-		return false, markError
+		return rejectLaunch("LAUNCH_STORAGE_UNAVAILABLE", markError, {
+			partyId = party.partyId,
+			partyRevision = partyRevision(party),
+		})
 	end
 	if type(marked) ~= "table" or marked.launchSessionId ~= sessionId then
-		return false, "Another launch request already started."
+		return rejectLaunch("LAUNCH_SNAPSHOT_CHANGED", "Another launch request already started.", {
+			partyId = party.partyId,
+			partyRevision = partyRevision(party),
+		})
 	end
 	-- From this point onward use only the atomically marked manifest. The
 	-- preflight snapshot is deliberately discarded so a concurrent invite,
 	-- leave, or unready operation can never be omitted from the house ticket.
 	party = marked
+	emitLobbyDiagnostic("party_snapshot_locked", "LAUNCH_SNAPSHOT_LOCKED", {
+		action = "Launch",
+		memberCount = #party.memberUserIds,
+		operationId = operationId,
+		partyId = party.partyId,
+		partyRevision = partyRevision(party),
+		sessionId = sessionId,
+		userId = player.UserId,
+	})
 	livePlayersByUserId = {}
 	for _, userId in ipairs(party.memberUserIds) do
 		local member = Players:GetPlayerByUserId(userId)
@@ -1114,8 +1387,31 @@ local function launchParty(player: Player): (boolean, string?)
 		or type(privateServerId) ~= "string"
 		or privateServerId == ""
 	then
-		rollbackLaunch(party.partyId, nil, party.memberUserIds, nil)
-		return false, "Roblox could not reserve the house server. Please try again."
+		rollbackLaunch(party.partyId, sessionId, party.memberUserIds, nil)
+		return rejectLaunch("RESERVED_SERVER_CREATE_FAILED", "Roblox could not reserve the house server. Please try again.", {
+			partyId = party.partyId,
+			sessionId = sessionId,
+		})
+	end
+	emitLobbyDiagnostic("reserved_server_created", "RESERVED_SERVER_CREATED", {
+		action = "Launch",
+		memberCount = #party.memberUserIds,
+		operationId = operationId,
+		partyId = party.partyId,
+		sessionId = sessionId,
+		userId = player.UserId,
+	})
+	local stillOwnsLaunch, ownershipError = renewLaunchOwnership(party.partyId, sessionId)
+	if not stillOwnsLaunch then
+		rollbackLaunch(party.partyId, sessionId, party.memberUserIds, nil)
+		return rejectLaunch(
+			if ownershipError then "LAUNCH_STORAGE_UNAVAILABLE" else "LAUNCH_OWNERSHIP_LOST",
+			ownershipError or "That launch expired before Roblox finished reserving the house. Please try again.",
+			{
+				partyId = party.partyId,
+				sessionId = sessionId,
+			}
+		)
 	end
 
 	local manifest = {
@@ -1135,7 +1431,30 @@ local function launchParty(player: Player): (boolean, string?)
 	local sessionStored = mapSet("Sessions", "session:" .. sessionId, manifest, Config.SessionTTLSeconds)
 	if not sessionStored then
 		rollbackLaunch(party.partyId, sessionId, party.memberUserIds, nil)
-		return false, "The private session could not be secured. Please try again."
+		return rejectLaunch("SESSION_MANIFEST_WRITE_FAILED", "The private session could not be secured. Please try again.", {
+			partyId = party.partyId,
+			sessionId = sessionId,
+		})
+	end
+	emitLobbyDiagnostic("session_manifest_written", "SESSION_MANIFEST_WRITTEN", {
+		action = "Launch",
+		memberCount = #party.memberUserIds,
+		operationId = operationId,
+		partyId = party.partyId,
+		sessionId = sessionId,
+		userId = player.UserId,
+	})
+	stillOwnsLaunch, ownershipError = renewLaunchOwnership(party.partyId, sessionId)
+	if not stillOwnsLaunch then
+		rollbackLaunch(party.partyId, sessionId, party.memberUserIds, nil)
+		return rejectLaunch(
+			if ownershipError then "LAUNCH_STORAGE_UNAVAILABLE" else "LAUNCH_OWNERSHIP_LOST",
+			ownershipError or "That launch expired before its secure route finished. Please try again.",
+			{
+				partyId = party.partyId,
+				sessionId = sessionId,
+			}
+		)
 	end
 
 	local ticketIdsByUserId: { [string]: string } = {}
@@ -1164,8 +1483,22 @@ local function launchParty(player: Player): (boolean, string?)
 		}, Config.SessionTTLSeconds)
 		if not ticketStored or not rejoinStored then
 			rollbackLaunch(party.partyId, sessionId, party.memberUserIds, ticketIdsByUserId)
-			return false, "The secure launch route could not be created. Please try again."
+			return rejectLaunch("MEMBER_TICKET_WRITE_FAILED", "The secure launch route could not be created. Please try again.", {
+				memberCount = #party.memberUserIds,
+				memberUserId = userId,
+				partyId = party.partyId,
+				sessionId = sessionId,
+			})
 		end
+		emitLobbyDiagnostic("member_ticket_written", "MEMBER_TICKET_WRITTEN", {
+			action = "Launch",
+			memberCount = #party.memberUserIds,
+			memberUserId = userId,
+			operationId = operationId,
+			partyId = party.partyId,
+			sessionId = sessionId,
+			userId = player.UserId,
+		})
 	end
 
 	-- TeleportData belongs to the whole TeleportAsync call. Use one call per
@@ -1192,7 +1525,20 @@ local function launchParty(player: Player): (boolean, string?)
 		local options = Instance.new("TeleportOptions")
 		options.ReservedServerAccessCode = accessCode
 		options:SetTeleportData(teleportData)
-		local teleportToken = beginTeleportAttempt(member)
+		emitLobbyDiagnostic("teleport_requested", "TELEPORT_REQUESTED", {
+			action = "Launch",
+			memberUserId = userId,
+			operationId = operationId,
+			partyId = party.partyId,
+			sessionId = sessionId,
+			userId = player.UserId,
+		})
+		local teleportToken = beginTeleportAttempt(member, nil, {
+			action = "Launch",
+			operationId = operationId,
+			partyId = party.partyId,
+			sessionId = sessionId,
+		})
 		local teleportOk = pcall(function()
 			TeleportService:TeleportAsync(Config.HousePlaceId, { member }, options)
 		end)
@@ -1203,26 +1549,59 @@ local function launchParty(player: Player): (boolean, string?)
 			if teleporting[userId] == teleportToken then
 				teleporting[userId] = nil
 				teleportFailureMessages[userId] = nil
+				teleportDiagnostics[userId] = nil
 			end
+			emitLobbyDiagnostic("teleport_failed", "TELEPORT_REQUEST_FAILED", {
+				action = "Launch",
+				memberUserId = userId,
+				operationId = operationId,
+				partyId = party.partyId,
+				sessionId = sessionId,
+				userId = player.UserId,
+			})
 			pushState(member, "Roblox could not move you yet. Use Rejoin House Session to catch up with your party.")
 		end
 	end
 	if launchedCount == 0 then
 		rollbackLaunch(party.partyId, sessionId, party.memberUserIds, ticketIdsByUserId)
-		return false, "The house launch failed. Your party is still together; please try again."
+		return rejectLaunch("ALL_TELEPORTS_FAILED", "The house launch failed. Your party is still together; please try again.", {
+			failedCount = failedCount,
+			launchedCount = launchedCount,
+			partyId = party.partyId,
+			sessionId = sessionId,
+		})
 	end
 
 	mapUpdate("Parties", party.partyId, Config.PartyTTLSeconds, function(current)
 		if type(current) == "table" and current.launchSessionId == sessionId then
 			current.state = Protocol.PartyStates.InHouse
 			current.updatedAt = os.time()
+			bumpPartyRevision(current)
 		end
 		return current
 	end)
 	if failedCount > 0 then
-		return true, "The private house started. Anyone left here can use Rejoin House Session."
+		emitLobbyDiagnostic("launch_completed", "LAUNCH_PARTIAL", {
+			action = "Launch",
+			failedCount = failedCount,
+			launchedCount = launchedCount,
+			operationId = operationId,
+			partyId = party.partyId,
+			sessionId = sessionId,
+			userId = player.UserId,
+		})
+		return true, "The private house started. Anyone left here can use Rejoin House Session.", "LAUNCH_PARTIAL"
 	end
-	return true, "Launching your private house server..."
+	emitLobbyDiagnostic("launch_completed", "LAUNCH_STARTED", {
+		action = "Launch",
+		failedCount = failedCount,
+		launchedCount = launchedCount,
+		operationId = operationId,
+		partyId = party.partyId,
+		sessionId = sessionId,
+		userId = player.UserId,
+	})
+	return true, "Launching your private house server...", "LAUNCH_STARTED"
 end
 
 local function rejoinHouse(player: Player): (boolean, string?)
@@ -1267,7 +1646,7 @@ local function rejoinHouse(player: Player): (boolean, string?)
 	local options = Instance.new("TeleportOptions")
 	options.ReservedServerAccessCode = rejoin.accessCode
 	options:SetTeleportData(teleportData)
-	local teleportToken = beginTeleportAttempt(player)
+	local teleportToken = beginTeleportAttempt(player, nil, nil)
 	local ok = pcall(function()
 		TeleportService:TeleportAsync(Config.HousePlaceId, { player }, options)
 	end)
@@ -1275,6 +1654,7 @@ local function rejoinHouse(player: Player): (boolean, string?)
 		if teleporting[player.UserId] == teleportToken then
 			teleporting[player.UserId] = nil
 			teleportFailureMessages[player.UserId] = nil
+			teleportDiagnostics[player.UserId] = nil
 		end
 		mapRemove("Tickets", "ticket:" .. ticketId)
 		return false, "Roblox could not reconnect you. Please try again."
@@ -1282,9 +1662,21 @@ local function rejoinHouse(player: Player): (boolean, string?)
 	return true, "Rejoining your private house session..."
 end
 
-local lastRequestAt: { [number]: number } = {}
+type RequestRateState = {
+	lastByAction: { [string]: number },
+	tokens: number,
+	updatedAt: number,
+}
+
+-- The old single timestamp coupled unrelated actions: an acknowledged Ready
+-- immediately followed by Launch was rejected as spam. Per-action gaps keep
+-- button spam bounded, while a small token bucket prevents a malicious client
+-- from evading limits by cycling through every action name.
+local REQUEST_BURST_CAPACITY = 5
+local REQUEST_REFILL_PER_SECOND = 2
+local requestRateByUserId: { [number]: RequestRateState } = {}
 local lastRefreshAt: { [number]: number } = {}
-local allowedRequests: { [string]: boolean } = table.freeze({
+local allowedRequests: { [string]: boolean } = {
 	CreateParty = true,
 	PlaySolo = true,
 	SetReady = true,
@@ -1293,13 +1685,50 @@ local allowedRequests: { [string]: boolean } = table.freeze({
 	LeaveParty = true,
 	Rejoin = true,
 	Refresh = true,
-})
+}
+table.freeze(allowedRequests)
+
+local function minimumActionGap(action: string): number
+	if action == "SetReady" then
+		return math.max(0.1, Config.RequestCooldownSeconds * 0.4)
+	end
+	if action == "Launch" or action == "PlaySolo" then
+		return math.max(0.35, Config.RequestCooldownSeconds)
+	end
+	return Config.RequestCooldownSeconds
+end
+
+local function consumeActionBudget(userId: number, action: string, nowClock: number): (boolean, string?)
+	local state = requestRateByUserId[userId]
+	if not state then
+		state = {
+			lastByAction = {},
+			tokens = REQUEST_BURST_CAPACITY,
+			updatedAt = nowClock,
+		}
+		requestRateByUserId[userId] = state
+	end
+	local elapsed = math.max(0, nowClock - state.updatedAt)
+	state.updatedAt = nowClock
+	state.tokens = math.min(REQUEST_BURST_CAPACITY, state.tokens + elapsed * REQUEST_REFILL_PER_SECOND)
+
+	local lastActionAt = state.lastByAction[action]
+	if lastActionAt and nowClock - lastActionAt < minimumActionGap(action) then
+		return false, "RATE_LIMIT_ACTION"
+	end
+	if state.tokens < 1 then
+		return false, "RATE_LIMIT_BURST"
+	end
+	state.tokens -= 1
+	state.lastByAction[action] = nowClock
+	return true, nil
+end
 
 requestRemote.OnServerInvoke = function(player: Player, action: unknown, payload: unknown)
 	if type(action) ~= "string" or allowedRequests[action] ~= true then
 		-- Malformed remote traffic is never entitled to a MemoryStore-backed state
 		-- snapshot. The regular client refresh remains the only recovery path.
-		return { ok = false, message = "Invalid lobby request.", state = nil }
+		return { ok = false, message = "Invalid lobby request.", reasonCode = "INVALID_ACTION", state = nil }
 	end
 	local nowClock = os.clock()
 	if action == "Refresh" then
@@ -1307,21 +1736,27 @@ requestRemote.OnServerInvoke = function(player: Player, action: unknown, payload
 		if nowClock - (lastRefreshAt[player.UserId] or 0) < minimumRefreshGap then
 			-- Do not perform MemoryStore reads for a client-spammed refresh. The
 			-- ordinary UI already retains its last server-authoritative state.
-			return { ok = true, message = nil, state = nil }
+			return { ok = true, message = nil, reasonCode = "REFRESH_THROTTLED", state = nil }
 		end
 		lastRefreshAt[player.UserId] = nowClock
 	else
-		if nowClock - (lastRequestAt[player.UserId] or 0) < Config.RequestCooldownSeconds then
+		local rateAllowed, rateReasonCode = consumeActionBudget(player.UserId, action, nowClock)
+		if not rateAllowed then
 			-- Do not let a malicious client turn rejected button spam into uncapped
 			-- MemoryStore reads through publicState(). The client keeps its last
 			-- server-authored state and the ordinary poll will refresh it shortly.
-			return { ok = false, message = "Please wait a moment.", state = nil }
+			return {
+				ok = false,
+				message = "Please wait a moment.",
+				reasonCode = rateReasonCode or "RATE_LIMIT",
+				state = nil,
+			}
 		end
-		lastRequestAt[player.UserId] = nowClock
 	end
 
 	local ok = false
 	local message: string? = nil
+	local reasonCode: string? = nil
 	if action == "CreateParty" then
 		local party, createError = createParty(player, false)
 		ok = party ~= nil
@@ -1332,21 +1767,25 @@ requestRemote.OnServerInvoke = function(player: Player, action: unknown, payload
 	elseif action == "PlaySolo" then
 		local party, createError = createParty(player, true)
 		if not party then
-			ok, message = false, createError
+			ok, message, reasonCode = false, createError, "PLAY_SOLO_CREATE_FAILED"
 		elseif #party.memberUserIds ~= 1 then
-			ok, message = false, "Leave your group before starting a solo session."
+			ok, message, reasonCode = false, "Leave your group before starting a solo session.", "PLAY_SOLO_PARTY_NOT_SOLO"
 		else
 			if party.readyByUserId[tostring(player.UserId)] ~= true then
 				setReady(player, true)
 			end
-			ok, message = launchParty(player)
+			ok, message, reasonCode = launchParty(player)
 		end
 	elseif action == "SetReady" then
-		ok, message = setReady(player, payload == true)
+		if type(payload) ~= "boolean" then
+			ok, message, reasonCode = false, "Ready must be on or off.", "INVALID_READY_PAYLOAD"
+		else
+			ok, message, reasonCode = setReady(player, payload)
+		end
 	elseif action == "InviteFriends" then
 		ok, message = issueInvite(player)
 	elseif action == "Launch" then
-		ok, message = launchParty(player)
+		ok, message, reasonCode = launchParty(player)
 	elseif action == "LeaveParty" then
 		ok, message = leaveParty(player, false)
 	elseif action == "Rejoin" then
@@ -1357,7 +1796,12 @@ requestRemote.OnServerInvoke = function(player: Player, action: unknown, payload
 		message = "Unknown lobby request."
 	end
 
-	return { ok = ok, message = message, state = publicState(player, message) }
+	return {
+		ok = ok,
+		message = message,
+		reasonCode = reasonCode or (if ok then "OK" else "REQUEST_REJECTED"),
+		state = publicState(player, message),
+	}
 end
 
 TeleportService.TeleportInitFailed:Connect(function(player: Player, _result, errorMessage: string)
@@ -1365,6 +1809,18 @@ TeleportService.TeleportInitFailed:Connect(function(player: Player, _result, err
 		teleporting[player.UserId] = nil
 		local fallback = teleportFailureMessages[player.UserId]
 		teleportFailureMessages[player.UserId] = nil
+		local diagnostic = teleportDiagnostics[player.UserId]
+		teleportDiagnostics[player.UserId] = nil
+		if diagnostic then
+			emitLobbyDiagnostic("teleport_failed", "TELEPORT_INIT_FAILED", {
+				action = diagnostic.action,
+				memberUserId = player.UserId,
+				operationId = diagnostic.operationId,
+				partyId = diagnostic.partyId,
+				sessionId = diagnostic.sessionId,
+				userId = player.UserId,
+			})
+		end
 		pushState(player, (fallback or "Roblox could not move you yet. Please try again.") .. " (" .. errorMessage .. ")")
 	end
 end)
@@ -1409,11 +1865,12 @@ Players.PlayerAdded:Connect(function(player)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-	lastRequestAt[player.UserId] = nil
+	requestRateByUserId[player.UserId] = nil
 	lastRefreshAt[player.UserId] = nil
 	if teleporting[player.UserId] then
 		teleporting[player.UserId] = nil
 		teleportFailureMessages[player.UserId] = nil
+		teleportDiagnostics[player.UserId] = nil
 		return
 	end
 	task.spawn(function()
@@ -1490,6 +1947,7 @@ task.spawn(function()
 									current.readyByUserId[tostring(staleUserId)] = nil
 								end
 								current.updatedAt = os.time()
+								bumpPartyRevision(current)
 							end
 							return current
 						end)

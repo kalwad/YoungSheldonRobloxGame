@@ -18,7 +18,7 @@ to the lobby. The two IDs must never be equal or reversed.
 
 ## Recorded deployment evidence — 2026-07-22
 
-- Local static gate: all `79/79` Luau sources compile; all 13 active client
+- Local static gate at initial deployment: all `79/79` Luau sources compiled; all 13 active client
   sources pass the client-authority scan.
 - House verifier: `530` checks passed in edit mode and `616` checks passed in a
   one-player runtime.
@@ -53,6 +53,33 @@ to the lobby. The two IDs must never be equal or reversed.
   access only.
 - The house had already been published; the final lobby was published as
   version `308` on 2026-07-22 at 17:37 EDT.
+
+## Local launch/UI closure after version 308 — not published
+
+The following repair exists in the canonical local sources and the currently
+open Studio edit model. It was deliberately **not published**, so version 308
+must not be described as containing it.
+
+- Reproduced the Ready→Start failure: a shared request cooldown rejected an
+  immediate Launch after an acknowledged Ready operation.
+- Replaced it with per-action limits plus a bounded cross-action token bucket.
+  A clean Studio runtime accepted Create Party → Ready → Launch with Ready and
+  Launch server checkpoints 50 ms apart.
+- Added authoritative `selfReady`, party revisions, explicit launch-block
+  reasons, atomic launch ownership, secret-safe diagnostics, and session-scoped
+  rollback/reconnect invalidation.
+- Rebuilt the lobby presentation as a warm 1980s suburban rec room with a
+  responsive CRT interface, readable status language, 60-pixel controls,
+  scrolling, Core UI safe-area handling, short-landscape layout, and explicit
+  keyboard/gamepad focus.
+- Final local compilation passed `80/80` `.luau` files. The final lobby passed
+  237 foundation + 32 launch-repair checks in edit mode and 281 foundation +
+  32 launch-repair checks in runtime.
+- Simulator captures passed on iPhone 7 portrait/landscape, iPhone 13 portrait,
+  Galaxy A16 landscape, iPad 6 landscape, and desktop. Physical touch remains
+  a required live gate.
+- Rollback exports and SHA-256 hashes are recorded in
+  `backups/milestone-1/README.md`.
 
 These results establish the local and Studio baseline. They do not replace a
 real Roblox Player cross-place launch. Browser testing could not hand off to the
@@ -98,12 +125,13 @@ Required house contracts:
 | `ServerScriptService.CooperLobby` | `lobby/CooperLobby.server.luau` |
 | `StarterPlayer.StarterPlayerScripts.CooperLobby` | `lobby/CooperLobby.client.luau` |
 
-`lobby/build_lobby_environment.luau` is a destructive, one-time Studio edit-mode
-builder, not a runtime source. It clears the house DataModel, builds the
-lightweight lobby shell, and creates empty source slots. Run it only on the
-backed-up lobby/start-place copy, then synchronize the four canonical sources
-above. Never run it in the reserved house place or after production sources
-have been installed.
+`lobby/build_lobby_environment.luau` is a scoped, idempotent Studio edit-mode
+visual updater, not a runtime source. It replaces only
+`Workspace.CooperPartyLobbyEnvironment` and the lobby's named Lighting effects.
+It never clears Workspace, Terrain, ReplicatedStorage, StarterGui, or runtime
+scripts, and it does not overwrite existing synchronized source slots. It is
+still role-specific: run it only on the backed-up lobby/start-place copy, never
+on the reserved house place.
 
 The protocol module must be byte-for-byte equivalent in both places. Required
 lobby configuration is `LobbyPlaceId = 100748614383412`, `HousePlaceId =
@@ -122,9 +150,9 @@ gates.
    set documented in `backups/milestone-1/README.md`.
 2. Build place `98645411943406` from an inspected copy of the verified Cooper
    house and install the house source map there.
-3. On the backed-up copy of place `100748614383412`, run the one-time lobby
-   environment builder in edit mode, inspect the generated shell, and then
-   install only the lobby source map there.
+3. On the backed-up copy of place `100748614383412`, run the scoped lobby visual
+   updater in edit mode, inspect the generated rec room, and then install only
+   the lobby source map there.
 4. Set the house cap to exactly four and the lobby cap to 50. During a rebuild,
    keep the last known-good start place active until both edit/runtime
    verification passes.

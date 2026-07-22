@@ -624,24 +624,43 @@ elseif isLobby then
 	check(Workspace.StreamingEnabled == false, "Lightweight lobby should not enable workspace streaming")
 	if lobbyEnvironment then
 		check(lobbyEnvironment:GetAttribute("Milestone") == 1, "Lobby environment milestone marker must be 1")
-		check(lobbyEnvironment:GetAttribute("EnvironmentVersion") == "1.0.0", "Lobby environment version changed")
+		check(lobbyEnvironment:GetAttribute("EnvironmentVersion") == "2.0.0", "Lobby environment version changed")
 		check(lobbyEnvironment:GetAttribute("Purpose") == "PrivatePartyLobby", "Lobby environment purpose marker changed")
+		check(lobbyEnvironment:GetAttribute("Theme") == "1980sSuburbanRecRoom", "Lobby must retain its 1980s suburban rec-room theme")
+		check(lobbyEnvironment:GetAttribute("VisualUpdater") == "ScopedIdempotent", "Lobby visuals must come from the scoped idempotent updater")
 		directChild(lobbyEnvironment, "LobbySpawn", "SpawnLocation")
-		directChild(lobbyEnvironment, "Architecture", "Folder")
-		local decor = directChild(lobbyEnvironment, "Decor", "Folder")
+		local architecture = directChild(lobbyEnvironment, "Architecture", "Folder")
+		local furniture = directChild(lobbyEnvironment, "Furniture", "Folder")
+		local decor = directChild(lobbyEnvironment, "PeriodDecor", "Folder")
+		directChild(lobbyEnvironment, "PracticalLights", "Folder")
+		if architecture then
+			directChild(architecture, "PrivateHouseDoorway", "Model")
+		end
+		if furniture then
+			directChild(furniture, "CRTPartyDisplay", "Model")
+			directChild(furniture, "AvocadoSofa", "Model")
+			directChild(furniture, "RustArmchair", "Model")
+		end
 		if decor then
-			directChild(decor, "PrivateHousePortal", "Model")
-			local partyPads = directChild(decor, "PartyPads", "Folder")
-			if partyPads then
-				local padCount = 0
-				for _, child in ipairs(partyPads:GetChildren()) do
-					if child:IsA("BasePart") then
-						padCount += 1
+			directChild(decor, "FamilyBulletinBoard", "Part")
+			directChild(decor, "HouseBlueprint", "Part")
+			local partyRugs = directChild(decor, "PartyRugMarkers", "Folder")
+			if partyRugs then
+				local rugCount = 0
+				local insetCount = 0
+				for _, child in ipairs(partyRugs:GetChildren()) do
+					if child:IsA("BasePart") and string.match(child.Name, "^PartyRug%d+$") then
+						rugCount += 1
+					elseif child:IsA("BasePart") and string.match(child.Name, "^PartyRugInset%d+$") then
+						insetCount += 1
 					end
 				end
-				check(padCount == 4, "Lobby must retain exactly four visible party pads")
+				check(rugCount == 4, "Lobby must retain exactly four woven party rugs")
+				check(insetCount == 4, "Lobby must retain exactly four numbered party-rug insets")
 			end
 		end
+		check(lobbyEnvironment:FindFirstChild("PrivateHousePortal", true) == nil, "Retired sci-fi portal returned to the lobby")
+		check(lobbyEnvironment:FindFirstChild("PartyPads", true) == nil, "Retired glowing party pads returned to the lobby")
 	end
 	check(StarterPlayer.DevComputerMovementMode == Enum.DevComputerMovementMode.Scriptable, "Lobby computer movement must stay UI-only")
 	check(StarterPlayer.DevTouchMovementMode == Enum.DevTouchMovementMode.Scriptable, "Lobby touch movement must stay UI-only")
@@ -680,6 +699,7 @@ elseif isLobby then
 	local lobbyServerSource = sourceOf(lobbyServer, "ServerScriptService.CooperLobby")
 	if lobbyServerSource then
 		markers(lobbyServerSource, "CooperLobby server", {
+			"HttpService",
 			"MemoryStoreService",
 			"TeleportService",
 			"ReserveServerAsync",
@@ -701,7 +721,40 @@ elseif isLobby then
 			'elseif action == "Launch" then',
 			"Only the party host can start the house session.",
 			"Everyone must be ready before the host can start.",
+			"partyRevision = partyRevision(party)",
+			'launchBlockReasonCode = "WAITING_FOR_READY"',
+			"local requestRateByUserId",
+			"local function consumeActionBudget",
+			"state.lastByAction[action]",
+			'emitLobbyDiagnostic("ready_committed", "READY_COMMITTED"',
+			'emitLobbyDiagnostic("launch_preflight_started", "LAUNCH_PREFLIGHT_STARTED"',
+			'emitLobbyDiagnostic("party_snapshot_locked", "LAUNCH_SNAPSHOT_LOCKED"',
+			'emitLobbyDiagnostic("reserved_server_created", "RESERVED_SERVER_CREATED"',
+			'emitLobbyDiagnostic("session_manifest_written", "SESSION_MANIFEST_WRITTEN"',
+			'emitLobbyDiagnostic("member_ticket_written", "MEMBER_TICKET_WRITTEN"',
+			'emitLobbyDiagnostic("teleport_requested", "TELEPORT_REQUESTED"',
+			"local function renewLaunchOwnership",
+			"and party.launchSessionId == sessionId",
+			"if type(current) == \"table\" and current.sessionId == sessionId then",
 		})
+		lacks(lobbyServerSource, "local lastRequestAt", "CooperLobby server")
+		local rateLimiterSource = functionSection(lobbyServerSource, "consumeActionBudget")
+		check(rateLimiterSource ~= nil, "CooperLobby request-rate function is missing")
+		if rateLimiterSource then
+			markers(rateLimiterSource, "CooperLobby request-rate function", {
+				"lastByAction",
+				"REQUEST_BURST_CAPACITY",
+				"REQUEST_REFILL_PER_SECOND",
+				"minimumActionGap(action)",
+			})
+		end
+		local diagnosticSource = functionSection(lobbyServerSource, "emitLobbyDiagnostic")
+		check(diagnosticSource ~= nil, "CooperLobby structured diagnostic function is missing")
+		if diagnosticSource then
+			lacks(diagnosticSource, "accessCode", "CooperLobby diagnostic function")
+			lacks(diagnosticSource, "ticketId", "CooperLobby diagnostic function")
+			lacks(diagnosticSource, "TeleportData", "CooperLobby diagnostic function")
+		end
 		lacks(lobbyServerSource, 'GetService("MatchmakingService")', "CooperLobby server")
 	end
 
@@ -715,7 +768,18 @@ elseif isLobby then
 			"I'M READY",
 			"START PRIVATE HOUSE",
 			"Enum.ScreenInsets.CoreUISafeInsets",
+			"authoritativeSelfReady = state.selfReady == true",
+			"tonumber(state.partyRevision)",
+			"state.launchBlockMessage",
+			"button.Size = UDim2.new(1, 0, 0, 60)",
+			"button.NextSelectionDown",
+			"updateResponsiveLayout",
+			"camera.CameraType = Enum.CameraType.Scriptable",
+			"camera.CFrame = CFrame.lookAt",
+			"STUDIO PARTY TEST",
+			"validatedPartyRevision",
 		})
+		lacks(lobbyClientSource, "string.find(readyButton.Text", "CooperLobby client")
 	end
 
 	if running then
