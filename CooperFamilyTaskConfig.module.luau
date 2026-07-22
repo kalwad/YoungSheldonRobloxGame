@@ -4,13 +4,36 @@
 
 local Config = {}
 
-Config.SchemaVersion = 10
+Config.SchemaVersion = 11
 Config.DataStoreName = "CooperFamilyTasks_v2"
 Config.DataStoreKeyPrefix = "player_"
 Config.AutoSaveSeconds = 75
 Config.RequestCooldown = 0.18
 Config.WorldRootName = "CooperFamilyTaskWorld"
 Config.ServerEventsName = "CooperGameServerEvents"
+-- Mirrored by the Creator Dashboard place setting for Milestone 0. Shared
+-- world objects remain single-player-only until Milestone 1 rewrites them.
+Config.ReleasePlayerCap = 1
+
+export type FeatureFlags = {
+	Lobby: boolean,
+	Horror: boolean,
+	SecretExploration: boolean,
+	TimeMachineFinale: boolean,
+	Postgame: boolean,
+	StudioScenarioTools: boolean,
+}
+
+-- Milestone 0 only establishes the contracts for future systems. Every flag is
+-- deliberately false so adding the schema cannot change the current game loop.
+Config.Features = table.freeze({
+	Lobby = false,
+	Horror = false,
+	SecretExploration = false,
+	TimeMachineFinale = false,
+	Postgame = false,
+	StudioScenarioTools = false,
+}) :: FeatureFlags
 
 Config.TaskDirector = {
 	InitialDelay = 5,
@@ -328,6 +351,19 @@ Config.ProfileDefaults = {
 	pendingPartStage = 0,
 	tutorialSeen = false,
 	totalTasks = 0,
+	cycleIndex = 1,
+	cycleTaskIndex = 1,
+	postRevealCyclesCompleted = 0,
+	firstHorrorRevealed = false,
+	horrorEncountersSurvived = 0,
+	horrorEncountersCaught = 0,
+	horrorCurrentStreak = 0,
+	horrorLongestStreak = 0,
+	backroomsDiscovered = false,
+	domeDiscovered = false,
+	endingCompleted = false,
+	endingChoice = "",
+	postgameUnlocked = false,
 	boomboxPurchased = false,
 	boomboxPlaced = false,
 	boomboxNextPlayAt = 0,

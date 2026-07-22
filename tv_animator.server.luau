@@ -28,11 +28,11 @@ CAN A TRAIN OUTRUN A TORNADO?]],
 	},
 	{
 		background = Color3.fromRGB(105, 37, 34),
-		title = "MEDFORD EMERGENCY BROADCAST",
+		title = "MEDFORD HOUSEHOLD BULLETIN",
 		subtitle = [[WHERE IS
 GEORGE'S BEVERAGE?]],
-		ticker = "PANIC LEVEL: YELLOW • BRISKET STATUS: UNCONFIRMED",
-		live = "ALERT • COOPER HOUSE",
+		ticker = "SHOPPING LIST: LONE STAR • BRISKET STATUS: UNCONFIRMED",
+		live = "LIVE • COOPER HOUSE",
 	},
 	{
 		background = Color3.fromRGB(57, 75, 112),

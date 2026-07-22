@@ -40,7 +40,7 @@ else
 	config = require(freshConfig)
 	freshConfig:Destroy()
 end
-assert(config.SchemaVersion == 10, "The personal profile schema must be version 10")
+assert(config.SchemaVersion == 11, "The personal profile schema must be version 11")
 assert(config.DataStoreName == "CooperFamilyTasks_v2", "Unexpected profile DataStore")
 assert(#config.Tasks == 5, "The family loop must contain exactly five task definitions")
 assert(#config.MachineStages == 11, "The Time Machine must retain all 11 stages")
@@ -61,7 +61,7 @@ for index, expectedId in ipairs(expectedOrder) do
 		rewardCycle += definition.reward
 	end
 	if definition.id == "MissyPlush" then
-		assert(definition.guidance == true, definition.id .. " must expose the temporary development arrow")
+		assert(definition.guidance == true, definition.id .. " must expose the configured guidance arrow")
 	end
 end
 assert(rewardCycle == 195, "The four original chore rewards must total $195")
@@ -98,7 +98,7 @@ assert(math.abs(boombox.DanceBeatOffsetSeconds - 0.16) < 0.000001, "Boombox danc
 assert(math.abs(boombox.DanceJumpHeight - 1.05) < 0.000001, "Boombox dance jump height changed")
 
 local defaults = config.ProfileDefaults
-assert(type(defaults) == "table" and defaults.schemaVersion == 10, "Profile defaults are not v10")
+assert(type(defaults) == "table" and defaults.schemaVersion == 11, "Profile defaults are not v11")
 assert(defaults.allowance == 0 and defaults.machineStage == 0 and defaults.pendingPartStage == 0, "Core profile defaults changed")
 assert(defaults.totalTasks == 0, "Fresh profiles must start with zero completed tasks")
 assert(defaults.boomboxPurchased == false, "Fresh profiles must not own the boombox")
@@ -629,7 +629,7 @@ for _, specification in ipairs({
 	requireChild(serverEvents, specification[1], specification[2])
 end
 
-assert(state:GetAttribute("SchemaVersion") == 10, "Running state does not expose schema version 10")
+assert(state:GetAttribute("SchemaVersion") == 11, "Running state does not expose schema version 11")
 assert(state:GetAttribute("FoundationContract") == "PersonalV4", "Running state does not expose PersonalV4")
 assert(state:GetAttribute("SupportsPaidPartOrdering") == true, "Paid component ordering contract is missing")
 assert(state:GetAttribute("SupportsBoombox") == true, "Boombox ownership/delivery contract is missing")

@@ -150,7 +150,7 @@ local DATA_LOAD_ATTEMPTS = 4
 local DELIVERY_RETRY_ATTEMPTS = 15
 local RELEASE_SAVE_ATTEMPTS = 4
 local SNAPSHOT_REQUEST_COOLDOWN = 0.75
--- The profile data remains schema v10. This reserved, temporary storage field
+-- The profile data uses schema v11. This reserved, temporary storage field
 -- exists only while a live server owns the key and is removed on clean release.
 -- A lease spans more than two autosave intervals so a single throttled renewal
 -- cannot let another server take ownership from a healthy session.
@@ -328,13 +328,35 @@ local function sanitizeData(raw)
 		and #raw.candyBatchToken <= 96
 		and raw.candyBatchToken
 		or (candyBatchReady and HttpService:GenerateGUID(false) or "")
+	local totalTasks = finiteInteger(raw.totalTasks, 0, 0, 10_000_000)
+	-- The current simple game has a strict five-task rotation. Keep the new
+	-- cycle fields canonical by deriving them from its existing lifetime count;
+	-- this makes every schema-10 profile migrate without changing its next task.
+	local cycleIndex = math.floor(totalTasks / #Config.TaskOrder) + 1
+	local cycleTaskIndex = (totalTasks % #Config.TaskOrder) + 1
+	local endingChoice = (raw.endingChoice == "Stay" or raw.endingChoice == "Return")
+		and raw.endingChoice
+		or ""
 	local sanitized = {
 		schemaVersion = Config.SchemaVersion,
 		allowance = finiteInteger(raw.allowance, 0, 0, 2_000_000_000),
 		machineStage = finiteInteger(raw.machineStage, 0, 0, #Config.MachineStages),
 		pendingPartStage = finiteInteger(raw.pendingPartStage, 0, 0, #Config.MachineStages),
 		tutorialSeen = raw.tutorialSeen == true,
-		totalTasks = finiteInteger(raw.totalTasks, 0, 0, 10_000_000),
+		totalTasks = totalTasks,
+		cycleIndex = cycleIndex,
+		cycleTaskIndex = cycleTaskIndex,
+		postRevealCyclesCompleted = finiteInteger(raw.postRevealCyclesCompleted, 0, 0, 10_000_000),
+		firstHorrorRevealed = raw.firstHorrorRevealed == true,
+		horrorEncountersSurvived = finiteInteger(raw.horrorEncountersSurvived, 0, 0, 10_000_000),
+		horrorEncountersCaught = finiteInteger(raw.horrorEncountersCaught, 0, 0, 10_000_000),
+		horrorCurrentStreak = finiteInteger(raw.horrorCurrentStreak, 0, 0, 10_000_000),
+		horrorLongestStreak = finiteInteger(raw.horrorLongestStreak, 0, 0, 10_000_000),
+		backroomsDiscovered = raw.backroomsDiscovered == true,
+		domeDiscovered = raw.domeDiscovered == true,
+		endingCompleted = raw.endingCompleted == true,
+		endingChoice = endingChoice,
+		postgameUnlocked = raw.postgameUnlocked == true,
 		boomboxPurchased = boomboxPurchased,
 		boomboxPlaced = boomboxPlaced,
 		boomboxNextPlayAt = finiteInteger(raw.boomboxNextPlayAt, 0, 0, 4_102_444_800),
@@ -1355,6 +1377,13 @@ local function broadcastState()
 	state:SetAttribute("SupportsSecretBunkerUnlock", true)
 	state:SetAttribute("SupportsBunkerChemistrySetup", true)
 	state:SetAttribute("SupportsCandyDelivery", true)
+	state:SetAttribute("FeatureLobbyEnabled", Config.Features.Lobby == true)
+	state:SetAttribute("FeatureHorrorEnabled", Config.Features.Horror == true)
+	state:SetAttribute("FeatureSecretExplorationEnabled", Config.Features.SecretExploration == true)
+	state:SetAttribute("FeatureTimeMachineFinaleEnabled", Config.Features.TimeMachineFinale == true)
+	state:SetAttribute("FeaturePostgameEnabled", Config.Features.Postgame == true)
+	state:SetAttribute("FeatureStudioScenarioToolsEnabled", Config.Features.StudioScenarioTools == true)
+	state:SetAttribute("ReleasePlayerCap", Config.ReleasePlayerCap)
 	state:SetAttribute("MachineStage", maximumStage)
 	state:SetAttribute("MachineProgress", machineProgress(maximumStage))
 	state:SetAttribute("TaskRevision", globalRevision)
@@ -1739,6 +1768,8 @@ completeTask = function(profile, expectedRecord)
 	end
 	setAllowance(profile, profile.data.allowance + reward)
 	profile.data.totalTasks += 1
+	profile.data.cycleIndex = math.floor(profile.data.totalTasks / #Config.TaskOrder) + 1
+	profile.data.cycleTaskIndex = (profile.data.totalTasks % #Config.TaskOrder) + 1
 	profile.task = nil
 	markDirty(profile)
 	if record.automated == true then

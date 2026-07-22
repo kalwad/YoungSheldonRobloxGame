@@ -128,6 +128,36 @@ local function worldAABB(item)
 	return cframe.Position - extent, cframe.Position + extent
 end
 
+local function localAABB(referencePart, item)
+	local cframe, size = bounds(item)
+	local half = size * 0.5
+	local minimum = Vector3.new(math.huge, math.huge, math.huge)
+	local maximum = Vector3.new(-math.huge, -math.huge, -math.huge)
+	for _, xSign in ipairs({ -1, 1 }) do
+		for _, ySign in ipairs({ -1, 1 }) do
+			for _, zSign in ipairs({ -1, 1 }) do
+				local worldCorner = cframe:PointToWorldSpace(Vector3.new(
+					half.X * xSign,
+					half.Y * ySign,
+					half.Z * zSign
+				))
+				local point = referencePart.CFrame:PointToObjectSpace(worldCorner)
+				minimum = Vector3.new(
+					math.min(minimum.X, point.X),
+					math.min(minimum.Y, point.Y),
+					math.min(minimum.Z, point.Z)
+				)
+				maximum = Vector3.new(
+					math.max(maximum.X, point.X),
+					math.max(maximum.Y, point.Y),
+					math.max(maximum.Z, point.Z)
+				)
+			end
+		end
+	end
+	return minimum, maximum
+end
+
 local function footprintsSeparated(a, b, clearance)
 	local aMin, aMax = worldAABB(a)
 	local bMin, bMax = worldAABB(b)
@@ -151,12 +181,35 @@ local function volumesSeparated(a, b, tolerance)
 end
 
 local function ringOpening(west, east, front, rear, label)
-	local _, westMax = worldAABB(west)
-	local eastMin = select(1, worldAABB(east))
-	local _, frontMax = worldAABB(front)
-	local rearMin = select(1, worldAABB(rear))
-	local minimum = Vector3.new(westMax.X, 0, frontMax.Z)
-	local maximum = Vector3.new(eastMin.X, 0, rearMin.Z)
+	local function innerGap(first, second, axis)
+		local firstMin, firstMax = worldAABB(first)
+		local secondMin, secondMax = worldAABB(second)
+		local function component(vector)
+			return axis == "X" and vector.X or vector.Z
+		end
+		if component(first.Position) <= component(second.Position) then
+			return component(firstMax), component(secondMin)
+		end
+		return component(secondMax), component(firstMin)
+	end
+
+	-- The complete house is rotated in the current place. West/east therefore
+	-- separate on world Z and front/rear on world X. Select axes from the actual
+	-- panel-center separation so this verifier remains valid before or after a
+	-- whole-environment rotation without weakening the physical opening check.
+	local westEastUsesX = math.abs(west.Position.X - east.Position.X)
+		>= math.abs(west.Position.Z - east.Position.Z)
+	local minimumX, maximumX
+	local minimumZ, maximumZ
+	if westEastUsesX then
+		minimumX, maximumX = innerGap(west, east, "X")
+		minimumZ, maximumZ = innerGap(front, rear, "Z")
+	else
+		minimumZ, maximumZ = innerGap(west, east, "Z")
+		minimumX, maximumX = innerGap(front, rear, "X")
+	end
+	local minimum = Vector3.new(minimumX, 0, minimumZ)
+	local maximum = Vector3.new(maximumX, 0, maximumZ)
 	check(maximum.X > minimum.X, label .. " west/east pieces overlap or are reversed")
 	check(maximum.Z > minimum.Z, label .. " front/rear pieces overlap or are reversed")
 	return minimum, maximum
@@ -539,8 +592,8 @@ check(
 	"ShaftOpening marker is not centered on the real foundation opening"
 )
 check(
-	shaftOpening.Size.X <= foundationHoleSize.X + 0.15
-		and shaftOpening.Size.Z <= foundationHoleSize.Y + 0.15,
+	(select(2, worldAABB(shaftOpening)) - select(1, worldAABB(shaftOpening))).X <= foundationHoleSize.X + 0.15
+		and (select(2, worldAABB(shaftOpening)) - select(1, worldAABB(shaftOpening))).Z <= foundationHoleSize.Y + 0.15,
 	"ShaftOpening marker leaves the physical foundation opening"
 )
 
@@ -658,8 +711,8 @@ check(
 	"SurfaceEntrance is not in the planned rear-right-yard Z corridor"
 )
 
-local houseMin, houseMax = worldAABB(house)
-local surfaceMin, surfaceMax = worldAABB(surfaceEntrance)
+local houseMin, houseMax = localAABB(lot, house)
+local surfaceMin, surfaceMax = localAABB(lot, surfaceEntrance)
 check(
 	surfaceMin.Z >= houseMax.Z + 1.5,
 	"SurfaceEntrance is too close to the back of the house"
@@ -672,8 +725,8 @@ check(
 local landscaping = need(environment, "Landscaping", "Model")
 local rearFence = need(landscaping, "RearPrivacyFence", "BasePart")
 local rightFence = need(landscaping, "RightPicketFence", "Model")
-local rearFenceMin = select(1, worldAABB(rearFence))
-local rightFenceMin = select(1, worldAABB(rightFence))
+local rearFenceMin = select(1, localAABB(lot, rearFence))
+local rightFenceMin = select(1, localAABB(lot, rightFence))
 check(surfaceMax.Z <= rearFenceMin.Z - 4, "SurfaceEntrance crowds the rear privacy fence")
 check(surfaceMax.X <= rightFenceMin.X - 4, "SurfaceEntrance crowds the right picket fence")
 
@@ -896,8 +949,9 @@ check(
 	math.abs(landingMax.Y - floorTop) <= 0.45,
 	"BottomLanding is floating above or buried below the bunker floor"
 )
+local landingShaftMin, landingShaftMax = localAABB(shaftOpening, bottomLanding)
 check(
-	landingMin.X <= foundationHoleCenter.X and landingMax.X >= foundationHoleCenter.X,
+	landingShaftMin.X <= 0 and landingShaftMax.X >= 0,
 	"BottomLanding does not meet the shaft centerline"
 )
 
@@ -1146,10 +1200,8 @@ check(
 local fanBasePivot = fanBlades:GetAttribute("BasePivot")
 check(typeof(fanBasePivot) == "CFrame", "FanBlades.BasePivot is missing")
 check(
-	fanBasePivot.RightVector:Dot(Vector3.xAxis) >= 0.999
-		and fanBasePivot.UpVector:Dot(Vector3.yAxis) >= 0.999
-		and fanBasePivot.LookVector:Dot(-Vector3.zAxis) >= 0.999,
-	"FanBlades.BasePivot must have neutral world-axis rotation"
+	cframeClose(fanBlades:GetPivot(), fanBasePivot, 0.05, 1),
+	"FanBlades.BasePivot must match its authored idle pose"
 )
 local fanBoundsCF, fanBoundsSize = fanBlades:GetBoundingBox()
 check(

@@ -200,7 +200,7 @@ end
 
 check(type(Config) == "table", "CooperGame.Config did not return a table")
 check(table.isfrozen(Config), "The top-level gameplay config must remain frozen")
-check(Config.SchemaVersion == 10, "Secret bunker persistence requires schema 10")
+check(Config.SchemaVersion == 11, "Secret bunker persistence requires schema 11")
 check(Config.DataStoreName == "CooperFamilyTasks_v2", "The bunker must migrate the existing profile DataStore")
 check(Config.DataStoreKeyPrefix == "player_", "Unexpected profile key prefix")
 
@@ -229,10 +229,10 @@ check(
 )
 
 local defaults = Config.ProfileDefaults
-check(type(defaults) == "table" and defaults.schemaVersion == 10, "Profile defaults are not schema 10")
+check(type(defaults) == "table" and defaults.schemaVersion == 11, "Profile defaults are not schema 11")
 check(defaults.secretBunkerPurchased == false, "Fresh profiles must not own the secret bunker")
 check(defaults.secretBunkerReadyAt == 0, "Fresh profiles must not begin with a bunker deadline")
-check(state:GetAttribute("SchemaVersion") == 10, "Shared State does not expose schema 10")
+check(state:GetAttribute("SchemaVersion") == 11, "Shared State does not expose schema 11")
 check(
 	state:GetAttribute("SupportsSecretBunkerUnlock") == true,
 	"Shared State does not advertise the secret-bunker phase unlock"
@@ -1347,7 +1347,7 @@ for _, marker in ipairs({
 end
 
 print(string.format(
-	"[SecretBunkerAudit] PASS: %d checks, schema 10, $%d unlock, %ds construction, %d neutral template parts",
+	"[SecretBunkerAudit] PASS: %d checks, schema 11, $%d unlock, %ds construction, %d neutral template parts",
 	checks,
 	bunkerConfig.Price,
 	bunkerConfig.ConstructionSeconds,

@@ -112,7 +112,7 @@ else
 end
 check(type(Config) == "table", "CooperGame.Config did not return a table")
 check(table.isfrozen(Config), "The top-level gameplay config must remain frozen")
-check(Config.SchemaVersion == 10, "Personal persistence schema must be version 10")
+check(Config.SchemaVersion == 11, "Personal persistence schema must be version 11")
 check(Config.DataStoreName == "CooperFamilyTasks_v2", "Unexpected profile DataStore name")
 check(Config.DataStoreKeyPrefix == "player_", "Unexpected profile key prefix")
 
@@ -137,7 +137,7 @@ for index, expectedId in ipairs(expectedTaskOrder) do
 end
 check(rewardCycle == 195, "The four original chore rewards must total $195")
 check(Config.Tasks[1].startTarget == "Keyboard", "The opening beer task must begin at Sheldon's computer")
-check(Config.Tasks[4].guidance == true, "Missy's search must expose the temporary development arrow")
+check(Config.Tasks[4].guidance == true, "Missy's search must expose the configured guidance arrow")
 
 check(#Config.MachineStages == 11, "The Time Machine must retain all eleven paid stages")
 local machineCost = 0
@@ -189,7 +189,7 @@ check(machineCost > rewardCycle * 20, "The complete Time Machine curve is still 
 check(largestTaskReward == 70, "No onboarding chore should exceed the $70 reward cap")
 
 local defaults = Config.ProfileDefaults
-check(type(defaults) == "table" and defaults.schemaVersion == 10, "Profile defaults are not schema v10")
+check(type(defaults) == "table" and defaults.schemaVersion == 11, "Profile defaults are not schema v11")
 check(defaults.allowance == 0, "Fresh profiles must begin with no allowance")
 check(defaults.machineStage == 0 and defaults.pendingPartStage == 0, "Fresh profiles must not own machine progress or a free pending part")
 check(defaults.totalTasks == 0, "Fresh profiles must begin with zero completed chores")
@@ -201,7 +201,7 @@ check(type(defaults.taskAutomationInstalled) == "table" and next(defaults.taskAu
 check(defaults.pendingTaskUpgradeId == "", "Fresh profiles must not begin with an automation delivery")
 check(defaults.bankHackSuccesses == 0, "Fresh profiles must begin with zero successful bank hacks")
 
-check(state:GetAttribute("SchemaVersion") == 10, "Shared state does not expose schema version 10")
+check(state:GetAttribute("SchemaVersion") == 11, "Shared state does not expose schema version 11")
 check(state:GetAttribute("FoundationContract") == "PersonalV4", "Shared state lost the PersonalV4 contract")
 check(state:GetAttribute("SupportsPaidPartOrdering") == true, "Shared state does not advertise paid machine parts")
 check(state:GetAttribute("SupportsIncomeBoombox") == true, "Shared state does not advertise the income boombox")

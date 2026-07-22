@@ -85,7 +85,7 @@ else
 	freshConfig:Destroy()
 end
 local delivery = Config.CandyDelivery
-check(Config.SchemaVersion == 10, "Candy delivery persistence must use schema 10")
+check(Config.SchemaVersion == 11, "Candy delivery persistence must use schema 11")
 check(type(delivery) == "table", "Config.CandyDelivery is missing")
 check(delivery.Id == "blue_rock_candy.delivery", "Candy delivery id changed")
 check(delivery.Name == "Deliver Blue Rock Candy", "Candy delivery player-facing name changed")
@@ -145,7 +145,7 @@ for _, token in ipairs({
 	has(mainSource, token, "Family server is missing " .. token)
 end
 has(mainSource, "CooperGameProfileLoaded", "Candy delivery must wait for the authoritative profile")
-has(mainSource, "local candyBatchReady = chemistrySetupPlaced", "Schema-10 sanitizer does not restore ready batches")
+has(mainSource, "local candyBatchReady = chemistrySetupPlaced", "Schema-11 sanitizer does not restore ready batches")
 has(mainSource, "and not candyDeliveryActive", "Legacy active delivery contracts must win over impossible simultaneous ready state")
 local producedSource = contextContaining(
 	mainSource,
@@ -294,18 +294,47 @@ has(
 	"warn(\"[CooperTaskWorld] Buyer queue failed safely: \"",
 	"Buyer worker errors are not surfaced after fail-safe cleanup"
 )
-local sessionReleaseAt = string.find(buyerQueueSource, "workerSession = nil", 1, true)
-local ordinaryReservationAt = string.find(buyerQueueSource, "ordinaryDeliveryTurnReserved = true", sessionReleaseAt or 1, true)
-local ordinaryWakeAt = string.find(buyerQueueSource, "runDeliveryQueue()", ordinaryReservationAt or 1, true)
+local normalReleaseGuardAt = string.find(buyerQueueSource, "if activeBuyerSession == session then", 1, true)
+local activeSessionClearAt = string.find(buyerQueueSource, "activeBuyerSession = nil", normalReleaseGuardAt or 1, true)
+local routeReleaseAt = string.find(buyerQueueSource, "buyerRouteOccupied = false", activeSessionClearAt or 1, true)
+local sessionReleaseAt = string.find(buyerQueueSource, "workerSession = nil", routeReleaseAt or 1, true)
+local pendingOrdinaryAt = string.find(buyerQueueSource, "if #deliveryQueue > 0 then", sessionReleaseAt or 1, true)
+local ordinaryReservationAt = string.find(buyerQueueSource, "ordinaryDeliveryTurnReserved = true", pendingOrdinaryAt or 1, true)
+local ordinaryWakeGuardAt = string.find(buyerQueueSource, "if runDeliveryQueue then", ordinaryReservationAt or 1, true)
+local ordinaryWakeAt = string.find(buyerQueueSource, "runDeliveryQueue()", ordinaryWakeGuardAt or 1, true)
+local perSessionYieldAt = string.find(buyerQueueSource, "task.wait(0.5)", ordinaryWakeAt or 1, true)
+local buyerWorkerStoppedAt = string.find(buyerQueueSource, "buyerQueueRunning = false", perSessionYieldAt or 1, true)
 check(
-	sessionReleaseAt ~= nil and ordinaryReservationAt ~= nil and ordinaryWakeAt ~= nil
-		and sessionReleaseAt < ordinaryReservationAt and ordinaryReservationAt < ordinaryWakeAt,
+	normalReleaseGuardAt ~= nil and activeSessionClearAt ~= nil and routeReleaseAt ~= nil
+		and sessionReleaseAt ~= nil and pendingOrdinaryAt ~= nil and ordinaryReservationAt ~= nil
+		and ordinaryWakeGuardAt ~= nil and ordinaryWakeAt ~= nil and perSessionYieldAt ~= nil
+		and buyerWorkerStoppedAt ~= nil
+		and normalReleaseGuardAt < activeSessionClearAt and activeSessionClearAt < routeReleaseAt
+		and routeReleaseAt < sessionReleaseAt and sessionReleaseAt < pendingOrdinaryAt
+		and pendingOrdinaryAt < ordinaryReservationAt and ordinaryReservationAt < ordinaryWakeGuardAt
+		and ordinaryWakeGuardAt < ordinaryWakeAt and ordinaryWakeAt < perSessionYieldAt
+		and perSessionYieldAt < buyerWorkerStoppedAt,
 	"Each completed buyer visit must yield one turn to an already-paid ordinary delivery"
 )
-has(
+local failureGuardAt = string.find(
 	buyerQueueSource,
 	"not ok and not buyerRouteOccupied and not deliveryRunning and #deliveryQueue > 0",
-	"Buyer failures can starve ordinary paid deliveries"
+	buyerWorkerStoppedAt or 1,
+	true
+)
+local failureReservationAt = string.find(buyerQueueSource, "ordinaryDeliveryTurnReserved = true", failureGuardAt or 1, true)
+local failureWakeGuardAt = string.find(
+	buyerQueueSource,
+	"if not buyerRouteOccupied and runDeliveryQueue then",
+	failureReservationAt or 1,
+	true
+)
+local failureWakeAt = string.find(buyerQueueSource, "runDeliveryQueue()", failureWakeGuardAt or 1, true)
+check(
+	failureGuardAt ~= nil and failureReservationAt ~= nil and failureWakeGuardAt ~= nil and failureWakeAt ~= nil
+		and buyerWorkerStoppedAt < failureGuardAt and failureGuardAt < failureReservationAt
+		and failureReservationAt < failureWakeGuardAt and failureWakeGuardAt < failureWakeAt,
+	"A failed buyer worker must reserve and wake one ordinary paid-delivery turn after releasing its locks"
 )
 has(
 	worldSource,
@@ -341,6 +370,35 @@ check(
 		and reservedTurnAt < reservedGateAt and reservedGateAt < ordinaryLockAt
 		and ordinaryLockAt < reservationClearAt and reservationClearAt < ordinarySpawnAt,
 	"An ordinary fairness turn must be claimed atomically before its worker yields"
+)
+local oneTripGuardAt = string.find(
+	ordinaryQueueSource,
+	"if buyerQueueRunning or #buyerQueue > 0 or entryRequeued then",
+	ordinarySpawnAt or 1,
+	true
+)
+local oneTripBreakAt = string.find(ordinaryQueueSource, "break", oneTripGuardAt or 1, true)
+local ordinaryWorkerReleaseAt = string.find(ordinaryQueueSource, "deliveryRunning = false", oneTripBreakAt or 1, true)
+local buyerResumeGuardAt = string.find(
+	ordinaryQueueSource,
+	"if buyerQueueRunning or #buyerQueue > 0 then",
+	ordinaryWorkerReleaseAt or 1,
+	true
+)
+local buyerResumeAt = string.find(ordinaryQueueSource, "runBuyerQueue()", buyerResumeGuardAt or 1, true)
+local ordinaryRetryBranchAt = string.find(
+	ordinaryQueueSource,
+	"elseif #deliveryQueue > 0 then",
+	buyerResumeAt or 1,
+	true
+)
+check(
+	oneTripGuardAt ~= nil and oneTripBreakAt ~= nil and ordinaryWorkerReleaseAt ~= nil
+		and buyerResumeGuardAt ~= nil and buyerResumeAt ~= nil and ordinaryRetryBranchAt ~= nil
+		and ordinarySpawnAt < oneTripGuardAt and oneTripGuardAt < oneTripBreakAt
+		and oneTripBreakAt < ordinaryWorkerReleaseAt and ordinaryWorkerReleaseAt < buyerResumeGuardAt
+		and buyerResumeGuardAt < buyerResumeAt and buyerResumeAt < ordinaryRetryBranchAt,
+	"A reserved ordinary worker must complete at most one trip before returning the shared street to waiting buyers"
 )
 has(ordinaryQueueSource, "pcall(setTruckVisible, false)", "Ordinary truck errors do not force the shared route vehicle hidden")
 has(ordinaryQueueSource, "Delivery queue item failed safely", "Ordinary delivery item failures are not surfaced after cleanup")
@@ -490,7 +548,7 @@ end
 if RunService:IsRunning() then
 	local state = gameRoot:FindFirstChild("State")
 	check(state and state:IsA("Folder"), "Runtime CooperGame.State is missing")
-	check(state:GetAttribute("SchemaVersion") == 10, "Runtime shared state does not expose schema 10")
+	check(state:GetAttribute("SchemaVersion") == 11, "Runtime shared state does not expose schema 11")
 	check(state:GetAttribute("SupportsCandyDelivery") == true, "Runtime shared state has candy delivery disabled")
 	local serverEvents = ServerScriptService:FindFirstChild(Config.ServerEventsName or "CooperGameServerEvents")
 	local familyAPI = serverEvents and serverEvents:FindFirstChild("API")

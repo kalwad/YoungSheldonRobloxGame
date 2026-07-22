@@ -1977,6 +1977,26 @@ local function treeFile(prefix, branch, fileName, callback)
 	return treeLine(fileName, true, callback)
 end
 
+function upgradeNoticeUi.creditCard(text)
+	-- Selectable no-op cards let keyboard/gamepad focus auto-scroll long credits
+	-- without introducing a remote action or an external-link interaction.
+	local row = treeLine(text, true, function() end)
+	row.Name = "CreditCard"
+	row.AutomaticSize = Enum.AutomaticSize.Y
+	row.Size = UDim2.new(1, 0, 0, 0)
+	row.TextYAlignment = Enum.TextYAlignment.Top
+	row.TextSize = upgradeNoticeUi.compactLayout and 14 or 15
+	local padding = row:FindFirstChildOfClass("UIPadding")
+	if padding then
+		padding.PaddingTop = UDim.new(0, 12)
+		padding.PaddingBottom = UDim.new(0, 12)
+	end
+	local minimum = Instance.new("UISizeConstraint")
+	minimum.MinSize = Vector2.new(0, upgradeNoticeUi.compactLayout and 76 or 68)
+	minimum.Parent = row
+	return row
+end
+
 local function showPage(page)
 	if terminalPage == "Bank" and page ~= "Bank" then
 		resetBankAttempt(true)
@@ -1986,6 +2006,10 @@ local function showPage(page)
 	if page == "Bank" then
 		bindBankInputs()
 	end
+	-- Each terminal page owns its own reading position. In particular, the
+	-- Credits entry sits near the bottom of the Home list on phones; carrying
+	-- that scroll offset into Credits would open with the first card clipped.
+	terminalButtons.CanvasPosition = Vector2.zero
 	upgradeNoticeUi.updateScale()
 	renderTerminal()
 end
@@ -2031,6 +2055,9 @@ function renderTerminal()
 		end)
 		treeFile("", true, "Type Commands (Optional)", function()
 			showPage("DOS")
+		end)
+		treeFile("", true, "Credits", function()
+			showPage("Credits")
 		end)
 		treeFile("", false, "Exit Computer", function()
 			closeComputer(true)
@@ -2381,6 +2408,26 @@ function renderTerminal()
 				treeLine("PURCHASE TEMPORARILY UNAVAILABLE", false).TextColor3 = COLORS.red
 			end
 		end
+	elseif terminalPage == "Credits" then
+		terminalTitle.Text = "COOPER TERMINAL // CREDITS"
+		terminalBody.Text = "Unofficial parody; not endorsed by the actors, CBS, or the rights holders."
+			.. string.char(10) .. string.char(10)
+			.. "Photos are cropped by Roblox UI; parody captions are added separately." .. string.char(10) .. string.char(10)
+			.. "Select each card to scroll. Full source and license links are recorded with the project."
+		terminalTreeHeader.Text = "PHOTO ATTRIBUTIONS"
+		local newline = string.char(10)
+		upgradeNoticeUi.creditCard("SHELDON / IAIN ARMITAGE" .. newline .. "Iain Armitage (2019).png" .. newline
+			.. "White Pony Express • CC BY 3.0" .. newline .. "Source: Wikimedia Commons")
+		upgradeNoticeUi.creditCard("GEORGE / LANCE BARBER" .. newline .. "Lance Barber at Fan Expo Denver 2026.jpg" .. newline
+			.. "SpiritedMichelle • CC BY-SA 4.0" .. newline .. "Source: Wikimedia Commons")
+		upgradeNoticeUi.creditCard("MISSY / RAEGAN REVORD" .. newline .. "Raegan Revord - LATFOB 2026-01.jpg" .. newline
+			.. "Kevin Paul (PaulLim11) • CC BY 4.0" .. newline .. "Source: Wikimedia Commons")
+		upgradeNoticeUi.creditCard("GEORGIE / MONTANA JORDAN" .. newline .. "Montana Jordan - Los Angeles Comic Con 2025.jpg" .. newline
+			.. "Kevin Paul (PaulLim11) • CC BY 4.0" .. newline .. "Source: Wikimedia Commons")
+		upgradeNoticeUi.creditCard("MARY / ZOE PERRY" .. newline .. "Zoe Perry at Fan Expo Denver 2026.jpg" .. newline
+			.. "SpiritedMichelle • CC BY-SA 4.0" .. newline .. "Source: Wikimedia Commons")
+		upgradeNoticeUi.creditCard("MEEMAW / ANNIE POTTS" .. newline .. "Annie Potts (53705697262).jpg" .. newline
+			.. "Louise Palanker • CC BY-SA 2.0" .. newline .. "Source: Wikimedia Commons")
 	elseif terminalPage == "DOS" then
 		terminalTitle.Text = "COOPER TERMINAL // OPTIONAL COMMANDS"
 		treeLine("OPTIONAL COMMAND MODE", false)
@@ -3252,7 +3299,10 @@ local function applySnapshot(snapshot)
 		-- BankHack packets, not general economy/task snapshots, own the live
 		-- sequence presentation. Leave the animation token and input index intact.
 		refreshBankStartButton()
-	elseif terminal.Visible and (terminalPage ~= "DOS" or not dosInput or not dosInput:IsFocused()) then
+	elseif terminal.Visible
+		and terminalPage ~= "Credits"
+		and (terminalPage ~= "DOS" or not dosInput or not dosInput:IsFocused())
+	then
 		renderTerminal()
 	end
 end
@@ -3628,6 +3678,7 @@ feedbackEvent.OnClientEvent:Connect(function(packet)
 		resetBankAttempt(false)
 		unbindBankInputs()
 		terminalPage = "Home"
+		terminalButtons.CanvasPosition = Vector2.zero
 		terminal.Visible = true
 		upgradeNoticeUi.terminalVisible = true
 		gui.DisplayOrder = 65

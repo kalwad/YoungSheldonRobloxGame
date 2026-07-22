@@ -80,7 +80,7 @@ else
 end
 local chemistry = Config.ChemistrySetup
 local candyDelivery = Config.CandyDelivery
-check(Config.SchemaVersion == 10, "Chemistry/candy persistence must use schema 10")
+check(Config.SchemaVersion == 11, "Chemistry/candy persistence must use schema 11")
 check(type(chemistry) == "table", "Config.ChemistrySetup is missing")
 check(chemistry.Id == "chemistry.setup", "Chemistry setup id changed")
 check(chemistry.Name == "Advanced Chemistry Setup", "Chemistry setup name changed")
@@ -99,7 +99,7 @@ check(Config.ProfileDefaults.candyBatchesSold == 0, "Fresh profiles must begin w
 
 local state = gameRoot:FindFirstChild("State")
 check(state and state:IsA("Folder"), "CooperGame.State is missing")
-check(state:GetAttribute("SchemaVersion") == 10, "Shared State must advertise schema 10")
+check(state:GetAttribute("SchemaVersion") == 11, "Shared State must advertise schema 11")
 check(state:GetAttribute("SupportsSecretBunkerUnlock") == true, "Shared State lost bunker progression support")
 check(state:GetAttribute("SupportsBunkerChemistrySetup") == true, "Shared State does not advertise bunker chemistry")
 
@@ -622,7 +622,7 @@ if RunService:IsRunning() then
 		candyPan.Size.Y < candyPan.Size.X and candyPan.Size.Y < candyPan.Size.Z,
 		"Chemistry output pan must read as a wide, shallow metal vessel"
 	)
-	if chemistryLab:GetAttribute("RewardAvailable") == true then
+	if lab:GetAttribute("RewardAvailable") == true then
 		local verticalCenterDistance = (candyPan.Position - outputDrawer.Position):Dot(outputDrawer.CFrame.UpVector)
 		local drawerToPanGap = verticalCenterDistance - outputDrawer.Size.Y * 0.5 - candyPan.Size.Y * 0.5
 		check(drawerToPanGap >= -0.03, "Presented candy pan intersects the metal output drawer")

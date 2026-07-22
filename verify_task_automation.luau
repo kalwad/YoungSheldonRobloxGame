@@ -133,7 +133,7 @@ else
 end
 check(type(Config) == "table", "CooperGame.Config did not return a table")
 check(table.isfrozen(Config), "The top-level gameplay config must remain frozen")
-check(Config.SchemaVersion == 10, "Task automation must use persistence schema 10")
+check(Config.SchemaVersion == 11, "Task automation must use persistence schema 11")
 check(Config.DataStoreName == "CooperFamilyTasks_v2", "Task automation unexpectedly forked the profile DataStore")
 check(Config.DataStoreKeyPrefix == "player_", "Unexpected profile key prefix")
 
@@ -245,12 +245,12 @@ for _, taskId in ipairs(Config.TaskOrder) do
 end
 
 local defaults = Config.ProfileDefaults
-check(type(defaults) == "table" and defaults.schemaVersion == 10, "Profile defaults are not schema 10")
+check(type(defaults) == "table" and defaults.schemaVersion == 11, "Profile defaults are not schema 11")
 check(type(defaults.taskAutomationInstalled) == "table", "Fresh profiles need an empty installed-upgrades map")
 check(next(defaults.taskAutomationInstalled) == nil, "Fresh profiles must not receive a free task robot")
 check(defaults.pendingTaskUpgradeId == "", "Fresh profiles must not begin with a paid delivery pending")
 check(defaults.bankHackSuccesses == 0, "Fresh profiles must begin with zero successful bank hacks")
-check(state:GetAttribute("SchemaVersion") == 10, "Shared State does not expose schema 10")
+check(state:GetAttribute("SchemaVersion") == 11, "Shared State does not expose schema 11")
 check(state:GetAttribute("FoundationContract") == "PersonalV4", "Task automation must preserve the PersonalV4 foundation contract")
 check(state:GetAttribute("SupportsTaskAutomation") == true, "Shared State does not advertise task automation")
 check(state:GetAttribute("SupportsMedfordBankHack") == true, "Shared State does not advertise Medford Bank hacking")
@@ -1402,6 +1402,31 @@ has(worldSource, "local SAFE_DELIVERY_LANES = { 0, 1, -1, 2, -2, 3, -3, 4, -4, 5
 has(worldSource, "for lane = 7, 18 do", "Delivery allocator must exhaust the safe negative driveway lanes")
 has(crateSlotSource, "return nil, nil", "A full driveway must reject unsafe overflow placement")
 lacks(crateSlotSource, "41 * slotSpacing", "Delivery allocator must not place overflow crates off-site")
+local buyerFairnessSource = section(
+	worldSource,
+	"runBuyerQueue = function()",
+	"candyDeliveryChanged.Event:Connect",
+	"Buyer/ordinary delivery fairness"
+)
+ordered(buyerFairnessSource, {
+	"if activeBuyerSession == session then",
+	"activeBuyerSession = nil",
+	"buyerRouteOccupied = false",
+	"workerSession = nil",
+	"if #deliveryQueue > 0 then",
+	"ordinaryDeliveryTurnReserved = true",
+	"if runDeliveryQueue then",
+	"runDeliveryQueue()",
+	"task.wait(0.5)",
+	"buyerQueueRunning = false",
+}, "A completed candy-buyer visit must reserve and wake an ordinary delivery before its worker can take another buyer")
+ordered(buyerFairnessSource, {
+	"buyerQueueRunning = false",
+	"not ok and not buyerRouteOccupied and not deliveryRunning and #deliveryQueue > 0",
+	"ordinaryDeliveryTurnReserved = true",
+	"if not buyerRouteOccupied and runDeliveryQueue then",
+	"runDeliveryQueue()",
+}, "Candy-buyer failure cleanup must preserve and wake the ordinary-delivery fairness turn")
 local queueCapacitySource = section(worldSource, "runDeliveryQueue = function()", "enqueueDelivery = function", "Full-driveway queue backpressure")
 for _, marker in ipairs({
 	"if not reservedSpawnOffset then",
@@ -1422,6 +1447,21 @@ for _, marker in ipairs({
 }) do
 	has(queueCapacitySource, marker, "Failure-safe/fair delivery queue is missing " .. marker)
 end
+ordered(queueCapacitySource, {
+	"local hasReservedOrdinaryTurn = ordinaryDeliveryTurnReserved and #deliveryQueue > 0",
+	"and not hasReservedOrdinaryTurn",
+	"deliveryRunning = true",
+	"ordinaryDeliveryTurnReserved = false",
+	"task.spawn(function()",
+}, "The reserved ordinary-delivery turn must be claimed atomically before its worker yields")
+ordered(queueCapacitySource, {
+	"if buyerQueueRunning or #buyerQueue > 0 or entryRequeued then",
+	"break",
+	"deliveryRunning = false",
+	"if buyerQueueRunning or #buyerQueue > 0 then",
+	"runBuyerQueue()",
+	"elseif #deliveryQueue > 0 then",
+}, "An ordinary fairness worker must give the route back after one trip whenever a buyer remains waiting")
 local manualBeerStockSource = section(worldSource, 'elseif action == "BeerDrop" then', 'elseif action == "MachineInstall" then', "Manual six-pack stocking")
 has(manualBeerStockSource, "math.min(capacity, count + 6)", "Manual Lone Star six-pack does not stock exactly six beers")
 lacks(manualBeerStockSource, "count + 12", "Manual Lone Star six-pack still duplicates itself into twelve beers")
@@ -1491,7 +1531,7 @@ if running then
 		check(type(entry.installed) == "boolean" and type(entry.pending) == "boolean", contract.id .. " runtime ownership state is not explicit")
 	end
 	for _, player in ipairs(Players:GetPlayers()) do
-		check(player:GetAttribute("CooperGameSchemaVersion") == 10, player.Name .. " did not load a schema-10 profile")
+		check(player:GetAttribute("CooperGameSchemaVersion") == 11, player.Name .. " did not load a schema-11 profile")
 		local playerSnapshot = familyAPI:Invoke("GetSnapshot", player)
 		check(type(playerSnapshot) == "table" and playerSnapshot.loaded == true, player.Name .. " has no loaded family profile")
 		check(type(playerSnapshot.automation) == "table" and #playerSnapshot.automation.catalog == 5, player.Name .. " has an incomplete automation snapshot")

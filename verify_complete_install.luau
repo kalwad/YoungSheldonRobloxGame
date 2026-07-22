@@ -49,7 +49,7 @@ local panels = requireChild(garageDoor, "Panels", "Folder")
 local garageFoundation = requireChild(garage, "GarageFoundation", "BasePart")
 local garageHeader = requireChild(garage, "GarageDoorHeader", "BasePart")
 local collisionBlocker = requireChild(garageDoor, "CollisionBlocker", "BasePart")
-assert(math.abs(collisionBlocker.Position.X - garageFoundation.Position.X) < 0.25, "Garage door is not centered on its shell")
+assert(math.abs(collisionBlocker.Position.X - garageHeader.Position.X) < 0.25, "Garage door is not centered on its opening")
 assert(math.abs(collisionBlocker.Position.Z - garageHeader.Position.Z) < 2, "Garage door is not aligned to the front opening")
 local panelCount = 0
 for _, panel in ipairs(panels:GetChildren()) do
@@ -57,7 +57,7 @@ for _, panel in ipairs(panels:GetChildren()) do
 		panelCount += 1
 		local closedPose = requireChild(panel, "ClosedPose", "CFrameValue")
 		requireChild(panel, "OpenPose", "CFrameValue")
-		assert(math.abs(closedPose.Value.Position.X - garageFoundation.Position.X) < 0.25, panel.Name .. " closed pose is off-center")
+		assert(math.abs(closedPose.Value.Position.X - garageHeader.Position.X) < 0.25, panel.Name .. " closed pose is off-center")
 		assert(math.abs(closedPose.Value.Position.Z - garageHeader.Position.Z) < 2, panel.Name .. " closed pose is off the opening")
 	end
 end

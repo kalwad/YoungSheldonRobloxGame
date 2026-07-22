@@ -570,7 +570,7 @@ end
 local garageDoor = need(garage, "InteractiveSectionalGarageDoor", "Model")
 local panels = need(garageDoor, "Panels", "Folder")
 local garageHeader = need(garage, "GarageDoorHeader", "BasePart")
-assert(math.abs((garageDoor:GetAttribute("DoorCenterX") or math.huge) - garageFoundation.Position.X) < 0.25, "Garage door center is stale")
+assert(math.abs((garageDoor:GetAttribute("DoorCenterX") or math.huge) - garageHeader.Position.X) < 0.25, "Garage door center is stale")
 assert(math.abs((garageDoor:GetAttribute("DoorPlaneZ") or math.huge) - garageHeader.Position.Z) < 2, "Garage door plane is stale")
 local panelCount = 0
 for _, panel in ipairs(panels:GetChildren()) do
@@ -578,7 +578,7 @@ for _, panel in ipairs(panels:GetChildren()) do
 		panelCount += 1
 		local closedPose = need(panel, "ClosedPose", "CFrameValue").Value
 		need(panel, "OpenPose", "CFrameValue")
-		assert(math.abs(closedPose.Position.X - garageFoundation.Position.X) < 0.25, panel.Name .. " closed pose is off-center")
+		assert(math.abs(closedPose.Position.X - garageHeader.Position.X) < 0.25, panel.Name .. " closed pose is off-center")
 		assert(math.abs(closedPose.Position.Z - garageHeader.Position.Z) < 2, panel.Name .. " closed pose is off the opening")
 		if garageDoor:GetAttribute("IsOpen") ~= true then
 			assert(cframeClose(panel.CFrame, closedPose, 0.05, 1), panel.Name .. " is not physically closed")
@@ -689,7 +689,9 @@ local truckStop = need(route, "TruckStop", "BasePart")
 local truckExit = need(route, "TruckExit", "BasePart")
 local dropZone = need(delivery, "DeliveryDropZone", "BasePart")
 assert((truckSpawn.Position - truckExit.Position).Magnitude < 0.05, "Truck exit no longer returns to spawn")
-assert(math.abs(truckSpawn.Position.X - truckApproach.Position.X) < 0.05, "Truck approaches in an unsafe diagonal lane")
+local spawnInLot = cooperLot.CFrame:PointToObjectSpace(truckSpawn.Position)
+local approachInLot = cooperLot.CFrame:PointToObjectSpace(truckApproach.Position)
+assert(math.abs(spawnInLot.X - approachInLot.X) < 0.05, "Truck approaches in an unsafe diagonal lane")
 assert((truckApproach.Position - truckStop.Position).Magnitude < 22, "Truck curb pull-in is too long")
 
 local truckPivot = truck:GetPivot()
