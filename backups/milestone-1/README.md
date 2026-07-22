@@ -64,8 +64,8 @@ version number or publication timestamp was supplied for this manifest.
 The Git source baseline for the pre-Milestone exports is commit `813f93c`
 (`feat: complete milestone 0 pre-horror baseline`). Use a detached worktree or a
 fresh clone to inspect it; do not overwrite an uncommitted working tree. The
-verified Milestone 1 source commit must be recorded here once the final
-Milestone 1 commit is created.
+verified Milestone 1 implementation source is commit `e1d4b29`
+(`feat: implement milestone 1 lobby and co-op foundation`).
 
 ## Narrow house rollback
 
@@ -100,8 +100,8 @@ Use this only if the entire lobby/co-op release must be removed.
 
 ## Forward recovery
 
-If only one Milestone 1 source is damaged, restore that source from the verified
-source commit once recorded instead of importing an entire model. For model
+If only one Milestone 1 source is damaged, restore that source from commit
+`e1d4b29` instead of importing an entire model. For model
 recovery, import house-verified exports only into place `98645411943406` and
 lobby-verified exports only into place `100748614383412`. Never mix the role
 sets. The live-only and full-regression rows in

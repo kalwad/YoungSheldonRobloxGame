@@ -140,7 +140,7 @@ gates.
    after the pre-publication matrix gates pass, then run one final fresh-profile
    and migrated-profile production smoke test.
 9. Export a dated `milestone-1-verified` rollback set and record the verified Git
-   commit. The dated house/lobby exports now exist; the matrix remains open
+   implementation commit (`e1d4b29`). The dated house/lobby exports now exist; the matrix remains open
    until its genuine live and full-regression rows are evidenced.
 
 ## Remaining gates not proven by local or Studio evidence
