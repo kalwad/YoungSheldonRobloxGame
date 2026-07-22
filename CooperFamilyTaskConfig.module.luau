@@ -11,9 +11,9 @@ Config.AutoSaveSeconds = 75
 Config.RequestCooldown = 0.18
 Config.WorldRootName = "CooperFamilyTaskWorld"
 Config.ServerEventsName = "CooperGameServerEvents"
--- Mirrored by the Creator Dashboard place setting for Milestone 0. Shared
--- world objects remain single-player-only until Milestone 1 rewrites them.
-Config.ReleasePlayerCap = 1
+-- Mirrored by the Creator Dashboard place setting. Milestone 1 makes the
+-- house authoritative to one private party of at most four players.
+Config.ReleasePlayerCap = 4
 
 export type FeatureFlags = {
 	Lobby: boolean,
@@ -24,16 +24,46 @@ export type FeatureFlags = {
 	StudioScenarioTools: boolean,
 }
 
--- Milestone 0 only establishes the contracts for future systems. Every flag is
--- deliberately false so adding the schema cannot change the current game loop.
+-- Milestone 1 enables only the private-party lobby/co-op foundation. Horror,
+-- secret exploration, the finale, postgame, and scenario grants stay inert.
 Config.Features = table.freeze({
-	Lobby = false,
+	Lobby = true,
 	Horror = false,
 	SecretExploration = false,
 	TimeMachineFinale = false,
 	Postgame = false,
 	StudioScenarioTools = false,
 }) :: FeatureFlags
+
+-- Ephemeral party/session state never belongs in a persistent player profile.
+-- The lobby keeps access codes and authoritative tickets server-side; the
+-- destination accepts only a short-lived, one-use ticket from this universe.
+Config.Party = table.freeze({
+	ProtocolVersion = 1,
+	MaxMembers = 4,
+	HostReconnectGraceSeconds = 60,
+	InviteLifetimeSeconds = 300,
+	LaunchTicketLifetimeSeconds = 180,
+	SessionLifetimeSeconds = 3600,
+	SessionHeartbeatSeconds = 120,
+	-- The existing start place is the public lobby. The verified house clone is
+	-- the only reserved gameplay destination for Milestone 1 parties.
+	LobbyPlaceId = 100748614383412,
+	HousePlaceId = 98645411943406,
+	TicketMapName = "CooperPartyLaunchTickets_v1",
+	SessionMapName = "CooperPartySessions_v1",
+	RejoinMapName = "CooperPartyRejoin_v1",
+	HostOnlyPersistentPurchases = true,
+})
+
+Config.Movement = table.freeze({
+	WalkSpeed = 16,
+	SprintSpeed = 22,
+	SprintStaminaSeconds = 6,
+	SprintRegenDelaySeconds = 0.8,
+	SprintRegenPerSecond = 1.5,
+	IntentRateLimitSeconds = 0.08,
+})
 
 Config.TaskDirector = {
 	InitialDelay = 5,

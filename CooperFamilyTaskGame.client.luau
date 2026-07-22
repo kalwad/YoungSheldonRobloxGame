@@ -1,19 +1,15 @@
 --!nonstrict
--- Personal task HUD, button-driven computer, hidden clues, ground guidance,
--- and per-player Time Machine presentation.
+-- Shared-party task HUD, personal allowance/objectives, button-driven computer,
+-- hidden clues, ground guidance, and per-player Time Machine presentation.
 -- Installed as StarterPlayer.StarterPlayerScripts.CooperGame.
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local ContextActionService = game:GetService("ContextActionService")
 local GuiService = game:GetService("GuiService")
 
-local player = Players.LocalPlayer
+local player = game:GetService("Players").LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
-local root = ReplicatedStorage:WaitForChild("CooperGame", 30)
+local root = game:GetService("ReplicatedStorage"):WaitForChild("CooperGame", 30)
 if not root then
 	return
 end
@@ -139,7 +135,7 @@ topBar.Parent = scaleRoot
 corner(topBar, 12)
 stroke(topBar, COLORS.cream, 2, 0.25)
 
-local allowanceTitle = label(topBar, "AllowanceTitle", "ALLOWANCE", UDim2.fromOffset(190, 20), UDim2.fromOffset(20, 10), Enum.Font.GothamBold, 13, COLORS.cream)
+local allowanceTitle = label(topBar, "AllowanceTitle", "MY ALLOWANCE", UDim2.fromOffset(190, 20), UDim2.fromOffset(20, 10), Enum.Font.GothamBold, 13, COLORS.cream)
 local allowanceValue = label(topBar, "AllowanceValue", "$0", UDim2.fromOffset(190, 36), UDim2.fromOffset(20, 31), Enum.Font.GothamBlack, 28, COLORS.yellow)
 local divider = Instance.new("Frame")
 divider.Position = UDim2.fromOffset(225, 12)
@@ -147,7 +143,7 @@ divider.Size = UDim2.fromOffset(2, 54)
 divider.BackgroundColor3 = COLORS.cream
 divider.BackgroundTransparency = 0.7
 divider.Parent = topBar
-local machineTitle = label(topBar, "MachineTitle", "TIME MACHINE • 0%", UDim2.fromOffset(650, 24), UDim2.fromOffset(250, 8), Enum.Font.GothamBlack, 17, COLORS.cream)
+local machineTitle = label(topBar, "MachineTitle", "SHARED TIME MACHINE • 0%", UDim2.fromOffset(650, 24), UDim2.fromOffset(250, 8), Enum.Font.GothamBlack, 17, COLORS.cream)
 local machineStage = label(topBar, "MachineStage", "Blueprint Pending", UDim2.fromOffset(650, 22), UDim2.fromOffset(250, 31), Enum.Font.GothamMedium, 14, COLORS.blue)
 local machineTrack = Instance.new("Frame")
 machineTrack.Position = UDim2.fromOffset(250, 58)
@@ -169,11 +165,48 @@ taskPanel.BackgroundTransparency = 0.05
 taskPanel.Parent = scaleRoot
 corner(taskPanel, 12)
 local taskStroke = stroke(taskPanel, COLORS.green, 2, 0.15)
-local taskRequester = label(taskPanel, "Requester", "FAMILY REQUEST", UDim2.new(1, -28, 0, 22), UDim2.fromOffset(14, 12), Enum.Font.GothamBold, 13, COLORS.green)
+local taskRequester = label(taskPanel, "Requester", "SHARED FAMILY TASK", UDim2.new(1, -28, 0, 22), UDim2.fromOffset(14, 12), Enum.Font.GothamBold, 13, COLORS.green)
 local taskTitle = label(taskPanel, "Title", "WAITING FOR A REQUEST", UDim2.new(1, -28, 0, 50), UDim2.fromOffset(14, 39), Enum.Font.GothamBlack, 20, COLORS.white)
 local taskDescription = label(taskPanel, "Description", "Explore the Cooper house. Someone will need help soon.", UDim2.new(1, -28, 0, 88), UDim2.fromOffset(14, 91), Enum.Font.GothamMedium, 15, COLORS.muted)
 taskDescription.TextYAlignment = Enum.TextYAlignment.Top
 local taskReward = label(taskPanel, "Reward", "", UDim2.new(1, -28, 0, 24), UDim2.fromOffset(14, 204), Enum.Font.GothamBold, 14, COLORS.yellow)
+
+-- Chemistry sales belong to one player, while the five family tasks are
+-- shared by the whole party. Give the personal sale its own compact card so it
+-- can never replace or hide the authoritative shared-task card.
+do
+local personalObjectiveUi = {}
+personalObjectiveUi.frame = Instance.new("Frame")
+personalObjectiveUi.frame.Name = "PersonalObjectiveChip"
+personalObjectiveUi.frame.Position = UDim2.fromOffset(18, 369)
+personalObjectiveUi.frame.Size = UDim2.fromOffset(390, 94)
+personalObjectiveUi.frame.BackgroundColor3 = Color3.fromRGB(43, 36, 12)
+personalObjectiveUi.frame.BackgroundTransparency = 0.04
+personalObjectiveUi.frame.Visible = false
+personalObjectiveUi.frame.Parent = scaleRoot
+corner(personalObjectiveUi.frame, 10)
+personalObjectiveUi.stroke = stroke(personalObjectiveUi.frame, COLORS.yellow, 2, 0.12)
+personalObjectiveUi.title = label(
+	personalObjectiveUi.frame,
+	"Title",
+	"MY OBJECTIVE • LOS POLLOS PICKUP",
+	UDim2.new(1, -24, 0, 24),
+	UDim2.fromOffset(12, 8),
+	Enum.Font.GothamBlack,
+	14,
+	COLORS.yellow
+)
+personalObjectiveUi.text = label(
+	personalObjectiveUi.frame,
+	"Text",
+	"",
+	UDim2.new(1, -24, 0, 54),
+	UDim2.fromOffset(12, 34),
+	Enum.Font.GothamMedium,
+	13,
+	COLORS.cream
+)
+end
 
 local deliveryChip = Instance.new("Frame")
 deliveryChip.Name = "DeliveryChip"
@@ -200,6 +233,51 @@ local toastStroke = stroke(toast, COLORS.green, 2, 0.15)
 local toastTitle = label(toast, "Title", "", UDim2.new(1, -28, 0, 28), UDim2.fromOffset(14, 8), Enum.Font.GothamBlack, 17, COLORS.green, Enum.TextXAlignment.Center)
 local toastText = label(toast, "Text", "", UDim2.new(1, -28, 0, 29), UDim2.fromOffset(14, 38), Enum.Font.GothamMedium, 14, COLORS.white, Enum.TextXAlignment.Center)
 local toastToken = 0
+
+-- If the host disconnects, the server freezes every shared mutation for a
+-- short reconnect window. This card remains visible for that whole window and
+-- counts down locally between snapshots, so guests never mistake a paused
+-- prompt or purchase for a broken one.
+do
+local partyPauseUi = {}
+partyPauseUi.frame = Instance.new("Frame")
+partyPauseUi.frame.Name = "PartyReconnectPause"
+partyPauseUi.frame.AnchorPoint = Vector2.new(0.5, 0)
+partyPauseUi.frame.Position = UDim2.new(0.5, 0, 0, 100)
+partyPauseUi.frame.Size = UDim2.fromOffset(520, 88)
+partyPauseUi.frame.BackgroundColor3 = Color3.fromRGB(39, 22, 12)
+partyPauseUi.frame.BackgroundTransparency = 0.02
+partyPauseUi.frame.BorderSizePixel = 0
+partyPauseUi.frame.Visible = false
+partyPauseUi.frame.ZIndex = 90
+partyPauseUi.frame.Parent = scaleRoot
+corner(partyPauseUi.frame, 12)
+partyPauseUi.stroke = stroke(partyPauseUi.frame, COLORS.orange, 3, 0)
+partyPauseUi.title = label(
+	partyPauseUi.frame,
+	"Title",
+	"GAME PAUSED • HOST RECONNECTING",
+	UDim2.new(1, -28, 0, 29),
+	UDim2.fromOffset(14, 9),
+	Enum.Font.GothamBlack,
+	18,
+	COLORS.orange,
+	Enum.TextXAlignment.Center
+)
+partyPauseUi.title.ZIndex = 91
+partyPauseUi.text = label(
+	partyPauseUi.frame,
+	"Text",
+	"Shared tasks and purchases are safely paused.",
+	UDim2.new(1, -28, 0, 38),
+	UDim2.fromOffset(14, 42),
+	Enum.Font.GothamBold,
+	13,
+	COLORS.white,
+	Enum.TextXAlignment.Center
+)
+partyPauseUi.text.ZIndex = 91
+end
 
 local function showToast(titleText, detailText, color, duration)
 	toastToken += 1
@@ -248,7 +326,7 @@ introTitle.ZIndex = 82
 local introBody = label(
 	introCard,
 	"Body",
-	"Help George, Mary, and Missy with their requests to earn allowance." .. string.char(10) .. string.char(10) .. "Use Sheldon's computer to order Time Machine components. A delivery truck will bring each part—carry it into the garage and install it." .. string.char(10) .. string.char(10) .. "Reach 100% construction to finish the machine.",
+	"Work together on George, Mary, and Missy's shared requests. Every present player earns the reward as personal allowance." .. string.char(10) .. string.char(10) .. "The party host uses Sheldon's computer to buy shared upgrades and Time Machine components. Everyone can help with tasks." .. string.char(10) .. string.char(10) .. "Reach 100% construction to finish the shared machine.",
 	UDim2.new(1, -70, 0, 205),
 	UDim2.fromOffset(35, 90),
 	Enum.Font.GothamMedium,
@@ -1130,6 +1208,100 @@ local currentSnapshotReceivedAt = 0
 local dosInput = nil
 local automationSelectedId = nil
 
+local partyUx = {}
+
+function partyUx.data(snapshot)
+	local party = type(snapshot) == "table" and snapshot.party or nil
+	return type(party) == "table" and party or {}
+end
+
+function partyUx.isActive(snapshot)
+	local party = partyUx.data(snapshot)
+	-- Preserve compatibility with the pre-party snapshot shape. A Milestone 1
+	-- snapshot always has a state, and only its explicit Active state may mutate
+	-- the shared house.
+	return party.state == nil or tostring(party.state) == "Active"
+end
+
+function partyUx.isHost(snapshot)
+	return partyUx.data(snapshot).isHost == true
+end
+
+function partyUx.pauseLabel(snapshot)
+	local state = tostring(partyUx.data(snapshot).state or "Active")
+	if state == "HostGrace" then
+		return "SHARED GAME PAUSED • WAITING FOR HOST RECONNECT"
+	elseif state == "Hydrating" then
+		return "SHARED HOUSE LOADING • WAITING FOR PARTY MEMBERS"
+	elseif state == "Closing" or state == "Closed" then
+		return "PARTY SESSION ENDING • RETURNING TO LOBBY"
+	end
+	return "SHARED GAME TEMPORARILY PAUSED"
+end
+
+function partyUx.pauseDetail(snapshot)
+	local state = tostring(partyUx.data(snapshot).state or "Active")
+	if state == "HostGrace" then
+		return "Shared progress is frozen safely until the host reconnects or the party returns to the lobby."
+	elseif state == "Hydrating" then
+		return "Shared progress will begin as soon as every teleported party member finishes loading."
+	elseif state == "Closing" or state == "Closed" then
+		return "Purchases and tasks are closed while profiles save and the party returns to the lobby."
+	end
+	return "Shared progress is temporarily paused by the server."
+end
+
+function partyUx.memberName(userId, fallback)
+	local numericId = tonumber(userId)
+	if numericId then
+		local member = game:GetService("Players"):GetPlayerByUserId(numericId)
+		if member then
+			return member.DisplayName
+		end
+	end
+	return tostring(fallback or "a teammate")
+end
+
+function partyUx.ownsCarrier(taskData)
+	local carrierUserId = type(taskData) == "table" and tonumber(taskData.carrierUserId) or nil
+	return carrierUserId == nil or carrierUserId == player.UserId
+end
+
+function partyUx.reconnectRemaining(snapshot)
+	local party = partyUx.data(snapshot)
+	local elapsed = math.max(0, os.clock() - currentSnapshotReceivedAt)
+	return math.max(0, math.ceil((tonumber(party.reconnectRemaining) or 0) - elapsed))
+end
+
+function partyUx.updatePause(snapshot)
+	local frame = scaleRoot:FindFirstChild("PartyReconnectPause")
+	if not frame or not frame:IsA("Frame") then
+		return
+	end
+	local party = partyUx.data(snapshot)
+	local state = tostring(party.state or "Active")
+	if state ~= "HostGrace" then
+		frame.Visible = false
+		return
+	end
+	local remaining = partyUx.reconnectRemaining(snapshot)
+	local minutes = math.floor(remaining / 60)
+	local seconds = remaining % 60
+	frame.Visible = true
+	local title = frame:FindFirstChild("Title")
+	local detail = frame:FindFirstChild("Text")
+	if title and title:IsA("TextLabel") then
+		title.Text = "GAME PAUSED • HOST RECONNECTING"
+	end
+	if detail and detail:IsA("TextLabel") then
+		detail.Text = string.format(
+		"Shared tasks and purchases are safely paused. Returning to the lobby in %d:%02d if the host does not return.",
+		minutes,
+		seconds
+		)
+	end
+end
+
 local bankPhase = "Idle"
 local bankSessionId = nil
 local bankAnimationToken = 0
@@ -1554,6 +1726,8 @@ local function refreshBankStartButton()
 		bankStartButton.Text = "SECURE LINK ACTIVE"
 	elseif enabled then
 		bankStartButton.Text = "HACK BANK"
+	elseif partyUx.bankOccupiedByOther then
+		bankStartButton.Text = "BANKLINK IN USE BY TEAMMATE"
 	elseif bankPhase == "Failed" then
 		bankStartButton.Text = "RETRY LINK UNAVAILABLE"
 	elseif bankPhase == "Succeeded" then
@@ -1585,6 +1759,11 @@ local function updateBankSnapshot(snapshot)
 	bankStepSeconds = math.max(0.1, tonumber(data.previewStepSeconds) or bankStepSeconds)
 	bankRoundCount = math.clamp(math.floor(tonumber(data.roundCount) or bankRoundCount), 1, #bankRoundLeds)
 	bankSnapshotCanStart = data.canStart == true
+	partyUx.bankOccupiedByOther = data.occupiedByOther == true
+	partyUx.bankActorDisplayName = partyUx.memberName(data.actorUserId, "a teammate")
+	if not bankAttemptActive() and (partyUx.bankOccupiedByOther or not partyUx.isActive(snapshot)) then
+		bankPhase = "Idle"
+	end
 	if bankPhase == "Failed" and bankSnapshotCanStart then
 		bankPhase = "Idle"
 	end
@@ -1612,7 +1791,15 @@ local function updateBankSnapshot(snapshot)
 		setAllBankKeys("Idle")
 		if bankPhase == "Idle" then
 			local retryRemaining = math.max(0, tonumber(data.retryRemaining) or 0)
-			if retryRemaining > 0 then
+			if not partyUx.isActive(snapshot) then
+				setBankMode(string.upper(partyUx.pauseLabel(snapshot)), COLORS.orange)
+				bankSignal.Text = "● SHARED GAME PAUSED"
+				bankSignal.TextColor3 = COLORS.orange
+			elseif partyUx.bankOccupiedByOther then
+				setBankMode(string.upper(partyUx.bankActorDisplayName) .. " IS USING BANKLINK // WATCH OR WAIT", COLORS.yellow)
+				bankSignal.Text = "● TEAMMATE LINK ACTIVE"
+				bankSignal.TextColor3 = COLORS.yellow
+			elseif retryRemaining > 0 then
 				setBankMode(string.format("MODEM COOLING DOWN // RETRY IN %.1f SEC", retryRemaining), COLORS.yellow)
 			elseif bankSnapshotCanStart then
 				setBankMode("READY // DIAL THE BANK SECURITY NODE", COLORS.terminal)
@@ -1626,6 +1813,12 @@ local function updateBankSnapshot(snapshot)
 	if bankAttemptActive() then
 		bankSignal.Text = "● LINK ACTIVE"
 		bankSignal.TextColor3 = COLORS.terminal
+	elseif bankPhase == "Idle" and not partyUx.isActive(snapshot) then
+		bankSignal.Text = "● SHARED GAME PAUSED"
+		bankSignal.TextColor3 = COLORS.orange
+	elseif bankPhase == "Idle" and partyUx.bankOccupiedByOther then
+		bankSignal.Text = "● TEAMMATE LINK ACTIVE"
+		bankSignal.TextColor3 = COLORS.yellow
 	elseif bankPhase == "Idle" then
 		bankSignal.Text = "● LINK STANDBY"
 		bankSignal.TextColor3 = COLORS.yellow
@@ -1635,7 +1828,7 @@ end
 
 local function waitForBankServerTime(token, targetTime)
 	while bankAnimationToken == token and bankPanel.Parent and workspace:GetServerTimeNow() < targetTime do
-		RunService.Heartbeat:Wait()
+		game:GetService("RunService").Heartbeat:Wait()
 	end
 	return bankAnimationToken == token and bankPanel.Parent ~= nil
 end
@@ -1645,7 +1838,7 @@ local function bindBankInputs()
 		return
 	end
 	bankInputBound = true
-	ContextActionService:BindActionAtPriority(
+	game:GetService("ContextActionService"):BindActionAtPriority(
 		BANK_INPUT_ACTION,
 		function(_, inputState, inputObject)
 			if inputState == Enum.UserInputState.Begin then
@@ -1678,7 +1871,7 @@ end
 
 local function unbindBankInputs()
 	if bankInputBound then
-		ContextActionService:UnbindAction(BANK_INPUT_ACTION)
+		game:GetService("ContextActionService"):UnbindAction(BANK_INPUT_ACTION)
 		bankInputBound = false
 	end
 	local selected = GuiService.SelectedObject
@@ -2014,6 +2207,35 @@ local function showPage(page)
 	renderTerminal()
 end
 
+function partyUx.purchaseBlock(snapshot)
+	if not partyUx.isActive(snapshot) then
+		return partyUx.pauseLabel(snapshot)
+	end
+	if not partyUx.isHost(snapshot) then
+		return "HOST ONLY • THE PARTY HOST MANAGES SHARED PURCHASES"
+	end
+	if partyUx.data(snapshot).canManageHouse == false then
+		return "SHARED HOUSE CONTROLS TEMPORARILY UNAVAILABLE"
+	end
+	return nil
+end
+
+function partyUx.purchaseExplanation(snapshot)
+	if not partyUx.isActive(snapshot) then
+		return partyUx.pauseDetail(snapshot)
+	end
+	local party = partyUx.data(snapshot)
+	if party.isHost == true and party.canManageHouse == false then
+		return "The server is protecting shared progress while a party profile finishes loading or saving. Please wait a moment."
+	end
+	local hostName = partyUx.memberName(party.hostUserId, "the party host")
+	return string.format(
+		"%s manages shared house purchases. Your $%d personal allowance stays on your profile.",
+		hostName,
+		math.max(0, math.floor(tonumber(snapshot.allowance) or 0))
+	)
+end
+
 function renderTerminal()
 	clearTerminalControls()
 	terminalBack.Visible = terminalPage ~= "Home"
@@ -2038,16 +2260,16 @@ function renderTerminal()
 		treeFile("", true, "Order Beer", function()
 			showPage("Beer")
 		end)
-		treeFile("", true, "Buy Time Machine Parts", function()
+		treeFile("", true, "Buy Time Machine Parts (Host)", function()
 			showPage("Machine")
 		end)
-		treeFile("", true, "Buy Task Robots", function()
+		treeFile("", true, "Buy Task Robots (Host)", function()
 			showPage("Automation")
 		end)
-		treeFile("", true, "Buy / Upgrade Party Boombox", function()
+		treeFile("", true, "Buy / Upgrade Party Boombox (Host)", function()
 			showPage("Boombox")
 		end)
-		treeFile("", true, "Secret Underground Bunker", function()
+		treeFile("", true, "Secret Underground Bunker (Host)", function()
 			showPage("SecretBunker")
 		end)
 		treeFile("", true, "Hack Medford Bank", function()
@@ -2065,7 +2287,15 @@ function renderTerminal()
 	elseif terminalPage == "Beer" then
 		terminalTitle.Text = "COOPER TERMINAL // ORDER BEER"
 		treeLine("BEER DELIVERY", false)
-		if taskData and taskData.id == "GeorgeBeer" and taskData.step == "Order" and not taskIsAutomated(taskData) then
+		if not partyUx.isActive(snapshot) then
+			terminalBody.Text = partyUx.pauseLabel(snapshot) .. string.char(10)
+				.. partyUx.pauseDetail(snapshot)
+			treeLine(partyUx.pauseLabel(snapshot), false).TextColor3 = COLORS.orange
+		elseif taskData and taskData.id == "GeorgeBeer" and not partyUx.ownsCarrier(taskData) then
+			local carrierName = partyUx.memberName(taskData.carrierUserId, "A teammate")
+			terminalBody.Text = carrierName .. " is carrying George's beer for the shared task."
+			treeLine("TEAMMATE HANDLING DELIVERY", false).TextColor3 = COLORS.yellow
+		elseif taskData and taskData.id == "GeorgeBeer" and taskData.step == "Order" and not taskIsAutomated(taskData) then
 			terminalBody.Text = "LONE STAR BEER CASE" .. string.char(10) .. "George's tab covers delivery." .. string.char(10) .. "Truck drops the crate in the driveway."
 			treeFile("", true, "Order Beer Delivery", function()
 				requestEvent:FireServer("OrderBeer")
@@ -2087,10 +2317,13 @@ function renderTerminal()
 			local pendingKind = tostring(snapshot.delivery.kind or "MachinePart")
 			local pendingName = tostring(snapshot.delivery.name or (pendingKind == "Boombox" and "Party Boombox" or "component"))
 			terminalBody.Text = "PENDING DELIVERY:" .. string.char(10) .. pendingName
-				.. string.char(10) .. string.char(10) .. "Finish the current delivery before ordering another crate."
+				.. string.char(10) .. string.char(10)
+				.. (partyUx.isHost(snapshot)
+					and "Finish the current delivery before ordering another crate."
+					or "The party host is handling this shared delivery.")
 		else
 			terminalBody.Text = string.format(
-				"NEXT: %s" .. string.char(10) .. "PROGRESS: %d%%" .. string.char(10) .. "COST: $%d" .. string.char(10) .. "ALLOWANCE: $%d",
+				"NEXT: %s" .. string.char(10) .. "PROGRESS: %d%%" .. string.char(10) .. "COST: $%d" .. string.char(10) .. "MY ALLOWANCE: $%d",
 				tostring(nextPart.name),
 				tonumber(nextPart.progress) or 0,
 				tonumber(nextPart.cost) or 0,
@@ -2098,7 +2331,11 @@ function renderTerminal()
 			)
 			local partCost = math.max(0, math.floor(tonumber(nextPart.cost) or 0))
 			local allowance = math.max(0, math.floor(tonumber(snapshot.allowance) or 0))
-			if nextPart.canOrder == true and allowance >= partCost then
+			local authorityBlock = partyUx.purchaseBlock(snapshot)
+			if authorityBlock then
+				terminalBody.Text ..= string.char(10) .. string.char(10) .. partyUx.purchaseExplanation(snapshot)
+				treeLine(authorityBlock, false).TextColor3 = partyUx.isActive(snapshot) and COLORS.yellow or COLORS.orange
+			elseif nextPart.canOrder == true and allowance >= partCost then
 				treeFile("", false, "Buy " .. tostring(nextPart.name) .. " — $" .. tostring(partCost), function()
 					requestEvent:FireServer("OrderMachinePart")
 				end)
@@ -2115,6 +2352,7 @@ function renderTerminal()
 		local allowance = math.max(0, math.floor(tonumber(snapshot.allowance) or 0))
 		local installedCount = math.max(0, math.floor(tonumber(automation.installedCount) or 0))
 		local totalCount = math.max(#catalog, math.floor(tonumber(automation.totalCount) or #catalog))
+		local authorityBlock = partyUx.purchaseBlock(snapshot)
 
 		treeLine("TASK ROBOTS", false)
 		if #catalog == 0 then
@@ -2137,7 +2375,9 @@ function renderTerminal()
 			local selectedState = if selected.installed == true
 				then "INSTALLED / RUNS AUTOMATICALLY"
 				elseif selectedPending
-				then "DELIVERY / SETUP IN PROGRESS"
+				then (partyUx.isHost(snapshot) and "DELIVERY / SETUP IN PROGRESS" or "HOST DELIVERY IN PROGRESS")
+				elseif authorityBlock
+				then authorityBlock
 				elseif allowance < selectedPrice
 				then "NEED $" .. tostring(selectedPrice - allowance) .. " MORE"
 				elseif selected.canOrder == false
@@ -2150,7 +2390,7 @@ function renderTerminal()
 			terminalBody.Text = string.format(
 				"TASK AUTOMATION" .. string.char(10)
 					.. "INSTALLED: %d/%d" .. string.char(10)
-					.. "ALLOWANCE: $%d" .. string.char(10) .. string.char(10)
+					.. "MY ALLOWANCE: $%d" .. string.char(10) .. string.char(10)
 					.. "%s" .. string.char(10)
 					.. "%s" .. string.char(10) .. string.char(10)
 					.. "TASK: %s FOR %s" .. string.char(10)
@@ -2186,12 +2426,17 @@ function renderTerminal()
 					elseif pending then
 						local delivery = type(snapshot.delivery) == "table" and snapshot.delivery or {}
 						local deliveryStatus = tostring(delivery.status or "WaitingDelivery")
-						stateLabel = if deliveryStatus == "Collect"
+						stateLabel = if not partyUx.isHost(snapshot)
+							then "HOST DELIVERY"
+							elseif deliveryStatus == "Collect"
 							then "PICK UP CRATE"
 							elseif deliveryStatus == "Install"
 							then "SET IT UP"
 							else "TRUCK EN ROUTE"
 						stateColor = COLORS.yellow
+					elseif authorityBlock then
+						stateLabel = partyUx.isHost(snapshot) and "PAUSED" or "HOST ONLY"
+						stateColor = partyUx.isActive(snapshot) and COLORS.yellow or COLORS.orange
 					elseif allowance < price then
 						stateLabel = "NEED $" .. tostring(price - allowance)
 						stateColor = COLORS.red
@@ -2233,7 +2478,15 @@ function renderTerminal()
 			if selected.installed == true then
 				treeLine("INSTALLED — THIS TASK NOW RUNS AUTOMATICALLY", false).TextColor3 = COLORS.green
 			elseif selectedPending then
-				treeLine("FINISH THE DELIVERY AND FOLLOW ITS SETUP ARROW", false).TextColor3 = COLORS.yellow
+				treeLine(
+					partyUx.isHost(snapshot)
+						and "FINISH THE DELIVERY AND FOLLOW ITS SETUP ARROW"
+						or "THE PARTY HOST IS HANDLING THIS DELIVERY",
+					false
+				).TextColor3 = COLORS.yellow
+			elseif authorityBlock then
+				treeLine(authorityBlock, false).TextColor3 = partyUx.isActive(snapshot) and COLORS.yellow or COLORS.orange
+				treeLine(partyUx.purchaseExplanation(snapshot), false)
 			elseif allowance < selectedPrice then
 				treeLine("NEED $" .. tostring(selectedPrice - allowance) .. " MORE", false).TextColor3 = COLORS.red
 			elseif selected.canOrder == false then
@@ -2255,6 +2508,9 @@ function renderTerminal()
 		if boombox.autoplayPurchased == true then
 			autoplayState = "INSTALLED / ARMED"
 			autoplayColor = COLORS.green
+		elseif authorityBlock then
+			autoplayState = partyUx.isHost(snapshot) and "PAUSED" or "HOST ONLY"
+			autoplayColor = partyUx.isActive(snapshot) and COLORS.yellow or COLORS.orange
 		elseif boombox.purchased ~= true then
 			autoplayState = "BUY BOOMBOX FIRST"
 			autoplayColor = COLORS.red
@@ -2274,6 +2530,7 @@ function renderTerminal()
 		if boombox.autoplayPurchased ~= true
 			and boombox.purchased == true
 			and boombox.placed == true
+			and not authorityBlock
 			and boombox.canUpgradeAutoplay == true
 			and allowance >= autoplayPrice
 		then
@@ -2288,6 +2545,7 @@ function renderTerminal()
 		local price = math.max(1, math.floor(tonumber(boombox.price) or 350))
 		local allowance = math.max(0, math.floor(tonumber(snapshot.allowance) or 0))
 		local status = boomboxStatus(snapshot)
+		local authorityBlock = partyUx.purchaseBlock(snapshot)
 		if status == "Unowned" then
 			local maximumPayout = math.max(0, math.floor(tonumber(boombox.maximumPayout) or 0))
 			local earningsLine = maximumPayout > 0
@@ -2296,12 +2554,15 @@ function renderTerminal()
 			terminalBody.Text = string.format(
 				"COOPER PARTY BOOMBOX" .. string.char(10)
 					.. "PRICE: $%d" .. string.char(10)
-					.. "ALLOWANCE: $%d" .. string.char(10) .. string.char(10)
+					.. "MY ALLOWANCE: $%d" .. string.char(10) .. string.char(10)
 					.. "Delivered by truck. Set it up in the living room. " .. earningsLine,
 				price,
 				allowance
 			)
-			if snapshot.delivery or boombox.canOrder == false then
+			if authorityBlock then
+				terminalBody.Text ..= string.char(10) .. string.char(10) .. partyUx.purchaseExplanation(snapshot)
+				treeLine(authorityBlock, false).TextColor3 = partyUx.isActive(snapshot) and COLORS.yellow or COLORS.orange
+			elseif snapshot.delivery or boombox.canOrder == false then
 				treeLine("FINISH YOUR CURRENT DELIVERY FIRST", false)
 			elseif allowance < price then
 				treeLine("NEED $" .. tostring(price - allowance) .. " MORE", false).TextColor3 = COLORS.red
@@ -2313,18 +2574,24 @@ function renderTerminal()
 		elseif status == "WaitingDelivery" or status == "Ordered" then
 			terminalBody.Text = "BOOMBOX PURCHASED" .. string.char(10)
 				.. "STATUS: DELIVERY TRUCK EN ROUTE" .. string.char(10) .. string.char(10)
-				.. "Meet the truck at the driveway when it arrives."
+				.. (partyUx.isHost(snapshot)
+					and "Meet the truck at the driveway when it arrives."
+					or "The party host will collect this shared delivery.")
 			treeLine("DELIVERY PENDING", false)
 		elseif status == "Collect" then
 			terminalBody.Text = "BOOMBOX DELIVERED" .. string.char(10)
 				.. "STATUS: WAITING IN DRIVEWAY" .. string.char(10) .. string.char(10)
-				.. "Pick up your boombox crate from the driveway."
-			treeLine("PICK UP THE BOOMBOX", false)
+				.. (partyUx.isHost(snapshot)
+					and "Pick up the boombox crate from the driveway."
+					or "The crate is reserved for the party host.")
+			treeLine(partyUx.isHost(snapshot) and "PICK UP THE BOOMBOX" or "HOST WILL PICK UP BOOMBOX", false)
 		elseif status == "Setup" or status == "Carried" then
 			terminalBody.Text = "BOOMBOX IN HAND" .. string.char(10)
 				.. "STATUS: SETUP REQUIRED" .. string.char(10) .. string.char(10)
-				.. "Follow the purple arrow into the living room. It sets itself up automatically when you enter the marked area."
-			treeLine("FOLLOW THE PURPLE SETUP ARROW", false)
+				.. (partyUx.isHost(snapshot)
+					and "Follow the purple arrow into the living room. It sets itself up automatically when you enter the marked area."
+					or "The party host is carrying and setting up this shared item.")
+			treeLine(partyUx.isHost(snapshot) and "FOLLOW THE PURPLE SETUP ARROW" or "HOST IS SETTING UP BOOMBOX", false)
 		elseif status == "Playing" then
 			terminalBody.Text = "BOOMBOX INSTALLED" .. string.char(10)
 				.. "STATUS: NOW PLAYING" .. string.char(10) .. string.char(10)
@@ -2340,13 +2607,17 @@ function renderTerminal()
 			terminalBody.Text = "BOOMBOX INSTALLED" .. string.char(10)
 				.. "STATUS: COOLING DOWN" .. string.char(10)
 				.. "READY IN: " .. formatCountdown(remaining) .. string.char(10) .. string.char(10)
-				.. "Come back to the living-room boombox when the timer reaches zero."
+				.. (partyUx.isHost(snapshot)
+					and "Come back to the living-room boombox when the timer reaches zero."
+					or "The party host can start the next shared session when this reaches zero.")
 			treeLine("READY AGAIN IN " .. formatCountdown(remaining), false)
 		else
 			terminalBody.Text = "BOOMBOX INSTALLED" .. string.char(10)
 				.. "STATUS: READY" .. string.char(10) .. string.char(10)
-				.. "Use the power button on the boombox in the living room to start the music, disco lights, and automatic allowance."
-			treeLine("USE THE LIVING-ROOM POWER BUTTON", false)
+				.. (partyUx.isHost(snapshot)
+					and "Use the power button in the living room to start the music, disco lights, and automatic allowance."
+					or "The shared boombox is ready. The party host controls its power button.")
+			treeLine(partyUx.isHost(snapshot) and "USE THE LIVING-ROOM POWER BUTTON" or "WAITING FOR PARTY HOST", false)
 		end
 		if boombox.placed == true then
 			local autoplayPrice = math.max(1, math.floor(tonumber(boombox.autoplayPrice) or 1250))
@@ -2359,7 +2630,9 @@ function renderTerminal()
 				terminalBody.Text ..= string.char(10) .. string.char(10)
 					.. string.format("AUTOPLAY UPGRADE: $%d", autoplayPrice) .. string.char(10)
 					.. "Automatically starts the same full music, dance, lights, and allowance session whenever your cooldown finishes while you are online."
-				if boombox.canUpgradeAutoplay == true and allowance >= autoplayPrice then
+				if authorityBlock then
+					treeLine(authorityBlock, false).TextColor3 = partyUx.isActive(snapshot) and COLORS.yellow or COLORS.orange
+				elseif boombox.canUpgradeAutoplay == true and allowance >= autoplayPrice then
 					treeFile("", false, string.format("Buy Boombox Autoplay — $%d", autoplayPrice), function()
 						requestEvent:FireServer("UpgradeBoomboxAutoplay")
 					end)
@@ -2377,6 +2650,7 @@ function renderTerminal()
 		local price = math.max(1, math.floor(tonumber(secretBunker.price) or 2500))
 		local allowance = math.max(0, math.floor(tonumber(snapshot.allowance) or 0))
 		local status = tostring(secretBunker.status or "Loading")
+		local authorityBlock = partyUx.purchaseBlock(snapshot)
 		if secretBunker.unlocked == true or status == "Unlocked" then
 			terminalBody.Text = "SECRET UNDERGROUND BUNKER" .. string.char(10)
 				.. "STATUS: ONLINE / ACCESS GRANTED" .. string.char(10) .. string.char(10)
@@ -2393,12 +2667,15 @@ function renderTerminal()
 			terminalBody.Text = string.format(
 				"SECRET UNDERGROUND BUNKER" .. string.char(10)
 					.. "PRICE: $%d" .. string.char(10)
-					.. "ALLOWANCE: $%d" .. string.char(10) .. string.char(10)
+					.. "MY ALLOWANCE: $%d" .. string.char(10) .. string.char(10)
 					.. "Buy a full backyard excavation, reinforced underground shelter, and future chemistry workspace. A professional construction convoy will build it on site.",
 				price,
 				allowance
 			)
-			if allowance < price then
+			if authorityBlock then
+				terminalBody.Text ..= string.char(10) .. string.char(10) .. partyUx.purchaseExplanation(snapshot)
+				treeLine(authorityBlock, false).TextColor3 = partyUx.isActive(snapshot) and COLORS.yellow or COLORS.orange
+			elseif allowance < price then
 				treeLine("NEED $" .. tostring(price - allowance) .. " MORE", false).TextColor3 = COLORS.red
 			elseif secretBunker.canOrder == true then
 				treeFile("", false, "Buy Secret Underground Bunker — $" .. tostring(price), function()
@@ -2806,6 +3083,17 @@ local function deliveryStatusText(delivery, snapshot)
 	local kind = type(delivery) == "table" and tostring(delivery.kind or "MachinePart") or "MachinePart"
 	local status = type(delivery) == "table" and tostring(delivery.status or "WaitingDelivery") or "WaitingDelivery"
 	local deliveryName = tostring(type(delivery) == "table" and delivery.name or "crate")
+	if type(delivery) == "table" and delivery.hostOnly == true and not partyUx.isHost(snapshot) then
+		local ownerName = partyUx.memberName(delivery.ownerUserId, "The party host")
+		if status == "WaitingDelivery" or status == "Ordered" then
+			return ownerName .. " ordered this shared item. Its truck is headed to the driveway."
+		elseif status == "Collect" then
+			return ownerName .. " can collect this host-reserved crate from the driveway."
+		elseif status == "Install" or status == "Carried" or status == "Setup" then
+			return ownerName .. " is carrying and installing this shared item. You do not need to move it."
+		end
+		return ownerName .. " is handling this shared house delivery."
+	end
 	if status == "WaitingDelivery" then
 		return kind == "TaskUpgrade"
 			and (deliveryName .. " is on the delivery truck headed to the driveway.")
@@ -2834,6 +3122,9 @@ local function deliveryStatusText(delivery, snapshot)
 end
 
 local function guideForSnapshot(snapshot)
+	if not partyUx.isActive(snapshot) then
+		return nil
+	end
 	local taskData = snapshot.task
 	local delivery = snapshot.delivery
 	local candyDelivery = type(snapshot.candyDelivery) == "table" and snapshot.candyDelivery or {}
@@ -2899,12 +3190,14 @@ local function guideForSnapshot(snapshot)
 	then
 		return "BunkerConstructionViewingAnchor", "WATCH THE BUNKER CONSTRUCTION", COLORS.orange
 	end
-	if taskData and not taskIsAutomated(taskData)
+	if taskData and partyUx.ownsCarrier(taskData) and not taskIsAutomated(taskData)
 		and taskData.id == "GeorgeBeer" and taskData.guidance and taskData.targetHint
 	then
 		return taskData.targetHint, taskData.title, requesterColors[taskData.requester] or COLORS.orange
 	end
-	if taskData and not taskIsAutomated(taskData) and taskData.guidance and taskData.targetHint then
+	if taskData and partyUx.ownsCarrier(taskData)
+		and not taskIsAutomated(taskData) and taskData.guidance and taskData.targetHint
+	then
 		return taskData.targetHint, taskData.title, requesterColors[taskData.requester] or COLORS.yellow
 	end
 	if delivery and delivery.targetHint then
@@ -2948,7 +3241,7 @@ workspace.DescendantAdded:Connect(function()
 	end)
 end)
 
-RunService.RenderStepped:Connect(function()
+game:GetService("RunService").RenderStepped:Connect(function()
 	if not arrowModel or not arrowParts then
 		return
 	end
@@ -3111,7 +3404,8 @@ local function updateWorldPrompts(snapshot)
 		return
 	end
 	local taskData = snapshot.task
-	local manualTask = not taskIsAutomated(taskData) and taskData or nil
+	local activeParty = partyUx.isActive(snapshot)
+	local manualTask = activeParty and partyUx.ownsCarrier(taskData) and not taskIsAutomated(taskData) and taskData or nil
 	local function configure(anchorName, enabled, actionText)
 		local anchor = stations:FindFirstChild(anchorName)
 		local prompt = anchor and anchor:FindFirstChild("TaskPrompt")
@@ -3144,7 +3438,7 @@ local function updateWorldPrompts(snapshot)
 		end
 	end
 	local delivery = type(snapshot.delivery) == "table" and snapshot.delivery or nil
-	local machineInstallVisible = delivery ~= nil
+	local machineInstallVisible = activeParty and partyUx.isHost(snapshot) and delivery ~= nil
 		and tostring(delivery.kind or "MachinePart") == "MachinePart"
 		and delivery.status == "Install"
 	configure(
@@ -3159,13 +3453,13 @@ local function updateWorldPrompts(snapshot)
 	upgradeNoticeUi.setTaskPadVisible(visuals, "GeorgeBeerPad", manualTask and manualTask.id == "GeorgeBeer" and manualTask.step == "Deliver")
 	upgradeNoticeUi.setTaskPadVisible(visuals, "MachineInstallPad", machineInstallVisible)
 	local boombox = type(snapshot.boombox) == "table" and snapshot.boombox or {}
-	local boomboxSetup = delivery ~= nil
+	local boomboxSetup = activeParty and partyUx.isHost(snapshot) and delivery ~= nil
 		and tostring(delivery.kind or "") == "Boombox"
 		and (tostring(delivery.status or "") == "Setup" or tostring(delivery.status or "") == "Install")
 	configure("BoomboxSetupAnchor", boomboxSetup, "Set Up Boombox")
 
 	local cooldown = boomboxCooldownRemaining(snapshot)
-	local boomboxApproachable = boombox.purchased == true
+	local boomboxApproachable = activeParty and partyUx.isHost(snapshot) and boombox.purchased == true
 		and boombox.placed == true
 		and not boomboxIsPlaying(boombox)
 	local powerText = if boombox.occupiedByOther == true
@@ -3221,7 +3515,7 @@ local function applySnapshot(snapshot)
 	local progress = math.clamp(tonumber(snapshot.machineProgress) or 0, 0, 100)
 	allowanceValue.Text = "$" .. tostring(allowance)
 	upgradeNoticeUi.update(snapshot)
-	machineTitle.Text = string.format("TIME MACHINE • %d%%", math.floor(progress + 0.5))
+	machineTitle.Text = string.format("SHARED TIME MACHINE • %d%%", math.floor(progress + 0.5))
 	machineStage.Text = tostring(snapshot.machineStageName or "Blueprint Pending")
 	TweenService:Create(machineFill, TweenInfo.new(0.35, Enum.EasingStyle.Quad), {
 		Size = UDim2.fromScale(progress / 100, 1),
@@ -3229,22 +3523,12 @@ local function applySnapshot(snapshot)
 
 	local taskData = snapshot.task
 	local candyDelivery = type(snapshot.candyDelivery) == "table" and snapshot.candyDelivery or nil
-	if candyDelivery and candyDelivery.active == true then
-		taskData = {
-			id = candyDelivery.id,
-			title = "DELIVER THE BLUE ROCK CANDY",
-			requester = "Los Pollos",
-			description = "Equip the metal candy pan, follow the yellow arrow, and hand the batch to the Los Pollos Hermanos buyer truck.",
-			reward = candyDelivery.payout,
-		}
-	end
 	if taskData then
-		local accent = taskData.id == "blue_rock_candy.delivery" and COLORS.yellow
-			or requesterColors[taskData.requester] or COLORS.green
+		local accent = requesterColors[taskData.requester] or COLORS.green
 		local automated = taskIsAutomated(taskData)
 		taskRequester.Text = automated
-			and ("AUTOMATION • " .. string.upper(tostring(taskData.requester)))
-			or (string.upper(tostring(taskData.requester)) .. " REQUEST")
+			and ("SHARED TASK • AUTOMATION • " .. string.upper(tostring(taskData.requester)))
+			or ("SHARED FAMILY TASK • " .. string.upper(tostring(taskData.requester)))
 		taskRequester.TextColor3 = accent
 		taskStroke.Color = accent
 		taskTitle.Text = automated
@@ -3252,12 +3536,20 @@ local function applySnapshot(snapshot)
 			or tostring(taskData.title)
 		-- The server owns the exact automation phase and wording. Do not
 		-- substitute the old manual instructions while a robot is active.
-		taskDescription.Text = tostring(taskData.description)
+		local description = tostring(taskData.description)
+		if tonumber(taskData.carrierUserId) and not partyUx.ownsCarrier(taskData) then
+			description = partyUx.memberName(taskData.carrierUserId, "A teammate")
+				.. " is carrying the shared task item. Follow along or explore while they finish it."
+		elseif tonumber(taskData.actorUserId) and tonumber(taskData.actorUserId) ~= player.UserId then
+			description = partyUx.memberName(taskData.actorUserId, "A teammate")
+				.. " is using BANKLINK for this shared task. You can watch, but only their keyboard input counts."
+		end
+		taskDescription.Text = description
 		taskReward.Text = automated
-			and string.format("AUTOMATIC REWARD: $%d ALLOWANCE", tonumber(taskData.reward) or 0)
-			or string.format("REWARD: $%d ALLOWANCE", tonumber(taskData.reward) or 0)
+			and string.format("SHARED AUTO REWARD: EACH PLAYER +$%d", tonumber(taskData.reward) or 0)
+			or string.format("SHARED REWARD: EACH PLAYER +$%d", tonumber(taskData.reward) or 0)
 	else
-		taskRequester.Text = "FAMILY REQUEST"
+		taskRequester.Text = "SHARED FAMILY TASK"
 		taskRequester.TextColor3 = COLORS.green
 		taskStroke.Color = COLORS.green
 		taskTitle.Text = "WAITING FOR A REQUEST"
@@ -3265,22 +3557,44 @@ local function applySnapshot(snapshot)
 		taskReward.Text = ""
 	end
 
+	local personalObjectiveActive = candyDelivery ~= nil and candyDelivery.active == true
+	local personalObjectiveFrame = scaleRoot:FindFirstChild("PersonalObjectiveChip")
+	if personalObjectiveFrame and personalObjectiveFrame:IsA("Frame") then
+		personalObjectiveFrame.Visible = personalObjectiveActive
+		if personalObjectiveActive then
+			local personalTitle = personalObjectiveFrame:FindFirstChild("Title")
+			local personalText = personalObjectiveFrame:FindFirstChild("Text")
+			if personalTitle and personalTitle:IsA("TextLabel") then
+				personalTitle.Text = "MY OBJECTIVE • LOS POLLOS PICKUP"
+			end
+			if personalText and personalText:IsA("TextLabel") then
+				personalText.Text = string.format(
+					"Take the Blue Rock Candy pan to the yellow buyer truck. MY PAYOUT: +$%d",
+					math.max(0, math.floor(tonumber(candyDelivery.payout) or 0))
+				)
+			end
+		end
+	end
+	deliveryChip.Position = personalObjectiveActive and UDim2.fromOffset(18, 475) or UDim2.fromOffset(18, 369)
+
 	local delivery = snapshot.delivery
 	deliveryChip.Visible = delivery ~= nil
 	if delivery then
 		local deliveryLabel, deliveryColor = deliveryPresentation(delivery, snapshot)
 		local kind = tostring(delivery.kind or "MachinePart")
+		local hostPrefix = delivery.hostOnly == true and not partyUx.isHost(snapshot) and "HOST DELIVERY • " or ""
 		if kind == "Boombox" then
-			deliveryTitle.Text = deliveryLabel
+			deliveryTitle.Text = hostPrefix .. deliveryLabel
 		elseif kind == "TaskUpgrade" then
-			deliveryTitle.Text = deliveryLabel .. " • " .. string.upper(tostring(delivery.name or "TASK ROBOT"))
+			deliveryTitle.Text = hostPrefix .. deliveryLabel .. " • " .. string.upper(tostring(delivery.name or "TASK ROBOT"))
 		else
-			deliveryTitle.Text = string.upper(tostring(delivery.name or deliveryLabel))
+			deliveryTitle.Text = hostPrefix .. string.upper(tostring(delivery.name or deliveryLabel))
 		end
 		deliveryTitle.TextColor3 = deliveryColor
 		deliveryStroke.Color = deliveryColor
 		deliveryText.Text = deliveryStatusText(delivery, snapshot)
 	end
+	partyUx.updatePause(snapshot)
 
 	if snapshot.introNeeded then
 		introScrim.Visible = true
@@ -3318,6 +3632,9 @@ task.spawn(function()
 	while gui.Parent do
 		task.wait(1)
 		local snapshot = currentSnapshot
+		if type(snapshot) == "table" then
+			partyUx.updatePause(snapshot)
+		end
 		local boombox = type(snapshot) == "table" and snapshot.boombox or nil
 		if type(boombox) == "table" and boombox.purchased == true and boombox.placed == true then
 			local remaining = boomboxCooldownRemaining(snapshot)
@@ -3374,7 +3691,7 @@ local function restoreDanceVisual(model)
 	saved.active = false
 end
 
-RunService.RenderStepped:Connect(function()
+game:GetService("RunService").RenderStepped:Connect(function()
 	local environment = workspace:FindFirstChild("CooperHouseEnvironment")
 	local npcWorld = environment and environment:FindFirstChild("CooperFamilyNPCs")
 	local taskWorld = environment and environment:FindFirstChild("CooperFamilyTaskWorld")
@@ -3869,18 +4186,62 @@ function upgradeNoticeUi.updateScale()
 	local narrowPortrait = safeWidth <= 560 and safeHeight > safeWidth
 	upgradeNoticeUi.compactLayout = safeHeight < 600 or narrowPortrait
 
-	-- The always-on HUD is informational, so it can scale to fit the complete
-	-- safe viewport. On a short landscape phone, keep readable text at roughly
-	-- the original camera-fit scale and shorten the authored root itself. That
-	-- repositions bottom-anchored toasts/cards into the safe canvas without
-	-- shrinking all task copy to 6px. Width, rather than height, owns the scale;
-	-- the authored root is shortened to the exact safe height afterward.
-	if upgradeNoticeUi.compactLayout and not narrowPortrait then
+	-- Portrait phones use a narrower authored canvas instead of shrinking the
+	-- 1280-wide desktop HUD into illegible text. The task and machine panels are
+	-- reflowed to the full safe width while preserving room to see and steer the
+	-- character underneath them.
+	if narrowPortrait then
+		uiScale.Scale = math.max(0.62, math.min(0.72, safeWidth / 640))
+		scaleRoot.Size = UDim2.fromOffset(640, math.max(900, math.floor(safeHeight / uiScale.Scale)))
+		topBar.Position = UDim2.new(0.5, 0, 0, 12)
+		topBar.Size = UDim2.fromOffset(616, 88)
+		allowanceTitle.Position = UDim2.fromOffset(16, 10)
+		allowanceTitle.Size = UDim2.fromOffset(136, 20)
+		allowanceValue.Position = UDim2.fromOffset(16, 34)
+		allowanceValue.Size = UDim2.fromOffset(136, 38)
+		divider.Position = UDim2.fromOffset(158, 13)
+		divider.Size = UDim2.fromOffset(2, 60)
+		machineTitle.Position = UDim2.fromOffset(178, 9)
+		machineTitle.Size = UDim2.fromOffset(420, 26)
+		machineStage.Position = UDim2.fromOffset(178, 36)
+		machineStage.Size = UDim2.fromOffset(420, 22)
+		machineTrack.Position = UDim2.fromOffset(178, 65)
+		machineTrack.Size = UDim2.fromOffset(420, 10)
+		taskPanel.Position = UDim2.fromOffset(12, 116)
+		taskPanel.Size = UDim2.fromOffset(616, 245)
+		deliveryChip.Position = UDim2.fromOffset(12, 373)
+		deliveryChip.Size = UDim2.fromOffset(616, 94)
+		toast.Size = UDim2.fromOffset(600, 82)
+	elseif upgradeNoticeUi.compactLayout then
+		-- On a short landscape phone, keep readable text at roughly the original
+		-- camera-fit scale and shorten the authored root itself. Width, rather
+		-- than height, owns the scale.
 		uiScale.Scale = math.max(0.45, math.min(0.625, safeWidth / 1280))
 		scaleRoot.Size = UDim2.fromOffset(1280, math.max(480, math.floor(safeHeight / uiScale.Scale)))
 	else
 		scaleRoot.Size = UDim2.fromOffset(1280, 720)
 		uiScale.Scale = math.max(0.25, math.min(1, safeWidth / 1280, safeHeight / 720))
+	end
+	if not narrowPortrait then
+		topBar.Position = UDim2.new(0.5, 0, 0, 12)
+		topBar.Size = UDim2.fromOffset(920, 78)
+		allowanceTitle.Position = UDim2.fromOffset(20, 10)
+		allowanceTitle.Size = UDim2.fromOffset(190, 20)
+		allowanceValue.Position = UDim2.fromOffset(20, 31)
+		allowanceValue.Size = UDim2.fromOffset(190, 36)
+		divider.Position = UDim2.fromOffset(225, 12)
+		divider.Size = UDim2.fromOffset(2, 54)
+		machineTitle.Position = UDim2.fromOffset(250, 8)
+		machineTitle.Size = UDim2.fromOffset(650, 24)
+		machineStage.Position = UDim2.fromOffset(250, 31)
+		machineStage.Size = UDim2.fromOffset(650, 22)
+		machineTrack.Position = UDim2.fromOffset(250, 58)
+		machineTrack.Size = UDim2.fromOffset(650, 10)
+		taskPanel.Position = UDim2.fromOffset(18, 112)
+		taskPanel.Size = UDim2.fromOffset(390, 245)
+		deliveryChip.Position = UDim2.fromOffset(18, 369)
+		deliveryChip.Size = UDim2.fromOffset(390, 94)
+		toast.Size = UDim2.fromOffset(570, 76)
 	end
 
 	if upgradeNoticeUi.compactLayout then
@@ -4104,6 +4465,35 @@ function upgradeNoticeUi.updateScale()
 			keyButton.Position = UDim2.fromOffset((column - 1) * 158, 0)
 			keyButton.Size = UDim2.fromOffset(146, 62)
 			keyButton.TextSize = 27
+		end
+	end
+	local personalFrame = scaleRoot:FindFirstChild("PersonalObjectiveChip")
+	if personalFrame and personalFrame:IsA("Frame") then
+		personalFrame.Position = narrowPortrait and UDim2.fromOffset(12, 373) or UDim2.fromOffset(18, 369)
+		personalFrame.Size = narrowPortrait and UDim2.fromOffset(616, 94) or UDim2.fromOffset(390, 94)
+		local personalTitle = personalFrame:FindFirstChild("Title")
+		local personalText = personalFrame:FindFirstChild("Text")
+		if personalTitle and personalTitle:IsA("TextLabel") then
+			personalTitle.TextSize = upgradeNoticeUi.compactLayout and 16 or 14
+		end
+		if personalText and personalText:IsA("TextLabel") then
+			personalText.TextSize = upgradeNoticeUi.compactLayout and 15 or 13
+		end
+	end
+	local pauseFrame = scaleRoot:FindFirstChild("PartyReconnectPause")
+	if pauseFrame and pauseFrame:IsA("Frame") then
+		pauseFrame.Size = narrowPortrait
+			and UDim2.fromOffset(600, 104)
+			or upgradeNoticeUi.compactLayout
+			and UDim2.fromOffset(920, 98)
+			or UDim2.fromOffset(520, 88)
+		local pauseTitle = pauseFrame:FindFirstChild("Title")
+		local pauseText = pauseFrame:FindFirstChild("Text")
+		if pauseTitle and pauseTitle:IsA("TextLabel") then
+			pauseTitle.TextSize = upgradeNoticeUi.compactLayout and 22 or 18
+		end
+		if pauseText and pauseText:IsA("TextLabel") then
+			pauseText.TextSize = upgradeNoticeUi.compactLayout and 17 or 13
 		end
 	end
 	if previousCompact ~= upgradeNoticeUi.compactLayout and terminal.Visible then

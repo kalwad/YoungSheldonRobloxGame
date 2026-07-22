@@ -1371,9 +1371,20 @@ end
 
 local function updateChemistryPromptState()
 	local now = Workspace:GetServerTimeNow()
+	local hasActiveOwner = false
+	for _, candidate in ipairs(Players:GetPlayers()) do
+		if candidate:GetAttribute("CooperGameProfileLoaded") == true
+			and candidate:GetAttribute("CooperChemistrySetupPlaced") == true
+			and candidate:GetAttribute("CooperPartyState") == "Active"
+		then
+			hasActiveOwner = true
+			break
+		end
+	end
 	if not chemistryVisible
 		or chemistryAssemblyActive
 		or bunker:GetAttribute("UnlockState") ~= "Unlocked"
+		or not hasActiveOwner
 	then
 		chemistryPrompt.ActionText = "Do Chemistry"
 		chemistryPrompt.Enabled = false
@@ -2512,6 +2523,10 @@ local function collectChemistryReward(subjectPlayer)
 	then
 		return false
 	end
+	if player:GetAttribute("CooperPartyState") ~= "Active" then
+		sendNotice(player, "Chemistry is paused until the party host reconnects.")
+		return false
+	end
 	if chemistryRewardOwnerUserId ~= player.UserId then
 		sendNotice(player, "That blue rock-candy batch belongs to the chemist who ran it.")
 		return false
@@ -2588,6 +2603,10 @@ end
 
 local function startChemistryExperiment(player)
 	local now = Workspace:GetServerTimeNow()
+	if player:GetAttribute("CooperPartyState") ~= "Active" then
+		sendNotice(player, "Chemistry is paused until the party host reconnects.")
+		return false
+	end
 	if player:GetAttribute("CooperCandyDeliveryActive") == true or playerHasBlueRockCandy(player) then
 		sendNotice(player, "Finish delivering your current Blue Rock Candy pan before starting another batch.")
 		return false
@@ -2764,6 +2783,21 @@ local function watchChemistryOwnership(player)
 			ensureCandyDeliveryTool(player, false)
 		end)
 	end))
+	table.insert(connections, player:GetAttributeChangedSignal("CooperPartyState"):Connect(function()
+		if player:GetAttribute("CooperPartyState") ~= "Active"
+			and chemistryExperimentOwnerUserId == player.UserId
+			and chemistryExperimentActive
+		then
+			-- The profile authority deliberately rejects progression while the host
+			-- is absent. Cancel the visual reaction as well so it cannot finish into
+			-- an output that no durable profile is allowed to claim.
+			chemistryExperimentToken += 1
+			chemistryExperimentReadyAt = 0
+			resetChemistryExperimentVisuals()
+			sendNotice(player, "The reaction paused safely because the party host disconnected. Start it again when the party resumes.")
+		end
+		updateChemistryPromptState()
+	end))
 	table.insert(connections, player.CharacterAdded:Connect(function()
 		task.delay(0.75, function()
 			ensureCandyDeliveryTool(player, false)
@@ -2789,6 +2823,10 @@ end
 researchPrompt.Triggered:Connect(function(player)
 	if not playerHasBunkerAccess(player) then
 		sendNotice(player, "Unlock your personal bunker before using its research computer.")
+		return
+	end
+	if player:GetAttribute("CooperPartyState") ~= "Active" then
+		sendNotice(player, "The research terminal is paused until the party host reconnects.")
 		return
 	end
 	if not isNear(player, bunkerTerminalInputAnchor, researchPrompt.MaxActivationDistance + 3) then

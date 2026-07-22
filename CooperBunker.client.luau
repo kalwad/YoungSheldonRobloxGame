@@ -143,6 +143,38 @@ noticePadding.Parent = notice
 local noticeStroke = stroke(notice, COLORS.amber, 2, 1)
 local noticeGeneration = 0
 
+local partyPauseBanner = Instance.new("TextLabel")
+partyPauseBanner.Name = "PartyReconnectPause"
+partyPauseBanner.AnchorPoint = Vector2.new(0.5, 0)
+partyPauseBanner.Position = UDim2.new(0.5, 0, 0, 12)
+partyPauseBanner.Size = UDim2.new(0.86, 0, 0, 76)
+partyPauseBanner.BackgroundColor3 = Color3.fromRGB(39, 22, 12)
+partyPauseBanner.BackgroundTransparency = 0.02
+partyPauseBanner.BorderSizePixel = 0
+partyPauseBanner.Font = Enum.Font.GothamBold
+partyPauseBanner.TextColor3 = COLORS.white
+partyPauseBanner.TextScaled = true
+partyPauseBanner.TextWrapped = true
+partyPauseBanner.Visible = false
+partyPauseBanner.ZIndex = 240
+partyPauseBanner.Parent = gui
+corner(partyPauseBanner, 10)
+stroke(partyPauseBanner, COLORS.amber, 3, 0)
+local partyPauseTextConstraint = Instance.new("UITextSizeConstraint")
+partyPauseTextConstraint.MaxTextSize = 17
+partyPauseTextConstraint.MinTextSize = 12
+partyPauseTextConstraint.Parent = partyPauseBanner
+local partyPauseSizeConstraint = Instance.new("UISizeConstraint")
+partyPauseSizeConstraint.MaxSize = Vector2.new(760, 76)
+partyPauseSizeConstraint.MinSize = Vector2.new(260, 76)
+partyPauseSizeConstraint.Parent = partyPauseBanner
+local partyPausePadding = Instance.new("UIPadding")
+partyPausePadding.PaddingLeft = UDim.new(0, 16)
+partyPausePadding.PaddingRight = UDim.new(0, 16)
+partyPausePadding.PaddingTop = UDim.new(0, 8)
+partyPausePadding.PaddingBottom = UDim.new(0, 8)
+partyPausePadding.Parent = partyPauseBanner
+
 local function showNotice(text, color, duration)
 	if type(text) ~= "string" or text == "" then
 		return
@@ -317,7 +349,7 @@ local statusHeader = label(
 	COLORS.violet
 )
 statusHeader.ZIndex = 109
-local allowanceTitle = label(statusPanel, "AllowanceTitle", "AVAILABLE ALLOWANCE", UDim2.new(1, -28, 0, 20), UDim2.fromOffset(14, 58), Enum.Font.RobotoMono, 11, COLORS.muted)
+local allowanceTitle = label(statusPanel, "AllowanceTitle", "MY ALLOWANCE", UDim2.new(1, -28, 0, 20), UDim2.fromOffset(14, 58), Enum.Font.RobotoMono, 11, COLORS.muted)
 allowanceTitle.ZIndex = 109
 local allowanceValue = label(statusPanel, "AllowanceValue", "$0", UDim2.new(1, -28, 0, 44), UDim2.fromOffset(14, 77), Enum.Font.GothamBlack, 32, COLORS.amber)
 allowanceValue.ZIndex = 109
@@ -427,12 +459,61 @@ actionLayout.Parent = actionList
 local terminalOpen = false
 local currentPage = "Home"
 local currentSnapshot = nil
+local currentSnapshotReceivedAt = 0
 local firstSelectable = nil
 local compactLayout = false
 local narrowPortrait = false
 local TERMINAL_MOVEMENT_ACTION = "CooperBunkerTerminalMovement"
 local TERMINAL_MOVEMENT_PRIORITY = Enum.ContextActionPriority.High.Value + 200
 local terminalMovementBound = false
+
+local function partyData(snapshot)
+	local party = type(snapshot) == "table" and snapshot.party or nil
+	return type(party) == "table" and party or {}
+end
+
+local function viewerIsHost(snapshot)
+	return partyData(snapshot).isHost == true
+end
+
+local function partyIsActive(snapshot)
+	local state = partyData(snapshot).state
+	return state == nil or tostring(state) == "Active"
+end
+
+local function partyPauseCopy(snapshot)
+	local state = tostring(partyData(snapshot).state or "Active")
+	if state == "HostGrace" then
+		return "Purchases are safely paused while the party waits for its host to reconnect."
+	elseif state == "Hydrating" then
+		return "Purchases will unlock as soon as every teleported party member finishes loading."
+	elseif state == "Closing" or state == "Closed" then
+		return "Purchases are closed while profiles save and the party returns to the lobby."
+	end
+	return "Shared purchases are temporarily paused by the server."
+end
+
+local function hostDisplayName(snapshot)
+	local hostUserId = tonumber(partyData(snapshot).hostUserId)
+	local host = hostUserId and Players:GetPlayerByUserId(hostUserId) or nil
+	return host and host.DisplayName or "The party host"
+end
+
+local function updatePartyPauseBanner(snapshot)
+	local party = partyData(snapshot)
+	if tostring(party.state or "Active") ~= "HostGrace" then
+		partyPauseBanner.Visible = false
+		return
+	end
+	local elapsed = math.max(0, os.clock() - currentSnapshotReceivedAt)
+	local remaining = math.max(0, math.ceil((tonumber(party.reconnectRemaining) or 0) - elapsed))
+	partyPauseBanner.Text = string.format(
+		"GAME PAUSED • HOST RECONNECTING\nShared tasks and purchases are safe. Lobby return in %d:%02d if the host does not return.",
+		math.floor(remaining / 60),
+		remaining % 60
+	)
+	partyPauseBanner.Visible = true
+end
 
 local function bindTerminalMovementSink()
 	if terminalMovementBound then
@@ -526,6 +607,9 @@ render = function()
 	local allowance = math.max(0, math.floor(tonumber(snapshot.allowance) or 0))
 	local price = math.max(1, math.floor(tonumber(chemistry.price) or 1800))
 	local statusText, statusColor = chemistryStatusText(chemistry)
+	local isHost = viewerIsHost(snapshot)
+	local activeParty = partyIsActive(snapshot)
+	local canManageHouse = isHost and partyData(snapshot).canManageHouse ~= false
 	allowanceValue.Text = "$" .. tostring(allowance)
 	labStatusValue.Text = statusText
 	labStatusValue.TextColor3 = statusColor
@@ -571,17 +655,43 @@ CHEM BUS      STANDBY]]
 			)
 		elseif chemistry.purchased == true then
 			local deliveryStatus = tostring(chemistry.status or "WaitingDelivery")
-			local detail = if deliveryStatus == "Collect"
+			local detail = if not isHost
+				then hostDisplayName(snapshot) .. " is handling this shared chemistry-lab delivery. You do not need to collect or install it."
+				elseif deliveryStatus == "Collect"
 				then "Your reinforced research case is waiting in the driveway. Pick it up and carry it through the bunker hatch."
 				elseif deliveryStatus == "Install" or deliveryStatus == "Carried"
-					then "Follow the cyan-and-violet arrow to the chemistry bay. The lab assembles automatically when you enter the marked pad."
-					else "The equipment truck is bringing your research case to the driveway now."
+				then "Follow the cyan-and-violet arrow to the chemistry bay. The lab assembles automatically when you enter the marked pad."
+				else "The equipment truck is bringing your research case to the driveway now."
 			actionButton("Chemistry Setup Ordered", detail, COLORS.amber, nil, false)
 		elseif chemistry.bunkerUnlocked ~= true then
 			actionButton(
 				"Unlock the Secret Bunker First",
-				"The chemistry lab can only be ordered from a completed personal bunker.",
+				"The chemistry lab can only be ordered after the party's shared bunker is complete.",
 				COLORS.red,
+				nil,
+				false
+			)
+		elseif not activeParty then
+			actionButton(
+				"Shared Game Paused",
+				partyPauseCopy(snapshot),
+				COLORS.amber,
+				nil,
+				false
+			)
+		elseif not isHost then
+			actionButton(
+				"Party Host Purchase Only",
+				hostDisplayName(snapshot) .. " manages shared bunker equipment. Your $" .. tostring(allowance) .. " personal allowance stays on your profile.",
+				COLORS.amber,
+				nil,
+				false
+			)
+		elseif not canManageHouse then
+			actionButton(
+				"Shared House Controls Unavailable",
+				"The server is protecting shared progress while a party profile finishes loading or saving. Please wait a moment.",
+				COLORS.amber,
 				nil,
 				false
 			)
@@ -858,8 +968,19 @@ snapshotEvent.OnClientEvent:Connect(function(snapshot)
 		return
 	end
 	currentSnapshot = snapshot
+	currentSnapshotReceivedAt = os.clock()
+	updatePartyPauseBanner(snapshot)
 	if terminalOpen then
 		render()
+	end
+end)
+
+task.spawn(function()
+	while gui.Parent do
+		task.wait(1)
+		if type(currentSnapshot) == "table" then
+			updatePartyPauseBanner(currentSnapshot)
+		end
 	end
 end)
 

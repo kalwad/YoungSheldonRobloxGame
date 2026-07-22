@@ -4,10 +4,12 @@
 
 local DataStoreService = game:GetService("DataStoreService")
 local HttpService = game:GetService("HttpService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
+local TeleportService = game:GetService("TeleportService")
 
 local ROOT_TIMEOUT = 30
 local root = ReplicatedStorage:WaitForChild("CooperGame", ROOT_TIMEOUT)
@@ -15,6 +17,9 @@ assert(root and root:IsA("Folder"), "ReplicatedStorage.CooperGame is missing")
 local configModule = root:WaitForChild("Config", ROOT_TIMEOUT)
 assert(configModule and configModule:IsA("ModuleScript"), "CooperGame.Config is missing")
 local Config = require(configModule)
+local partyProtocolModule = ReplicatedStorage:WaitForChild("CooperPartyProtocol", ROOT_TIMEOUT)
+assert(partyProtocolModule and partyProtocolModule:IsA("ModuleScript"), "CooperPartyProtocol is missing")
+local Protocol = require(partyProtocolModule)
 
 local state = root:FindFirstChild("State") or Instance.new("Folder")
 state.Name = "State"
@@ -103,10 +108,22 @@ local bankHackConfig = Config.BankHack
 local secretBunkerConfig = Config.SecretBunker
 local chemistrySetupConfig = Config.ChemistrySetup
 local candyDeliveryConfig = Config.CandyDelivery
+local partyConfig = Config.Party
 assert(type(bankHackConfig) == "table", "CooperGame.Config.BankHack is missing")
 assert(type(secretBunkerConfig) == "table", "CooperGame.Config.SecretBunker is missing")
 assert(type(chemistrySetupConfig) == "table", "CooperGame.Config.ChemistrySetup is missing")
 assert(type(candyDeliveryConfig) == "table", "CooperGame.Config.CandyDelivery is missing")
+assert(type(partyConfig) == "table", "CooperGame.Config.Party is missing")
+assert(tonumber(partyConfig.MaxMembers) == 4, "Milestone 1 parties must support exactly 1-4 players")
+assert(tonumber(partyConfig.HostReconnectGraceSeconds) == 60, "Host reconnect grace must remain 60 seconds")
+assert(partyConfig.ProtocolVersion == Protocol.VERSION, "House config and party protocol versions differ")
+assert(partyConfig.MaxMembers == Protocol.MAX_PARTY_SIZE, "House and party protocol size caps differ")
+assert(
+	partyConfig.TicketMapName == Protocol.MemoryStoreNames.Tickets
+		and partyConfig.SessionMapName == Protocol.MemoryStoreNames.Sessions
+		and partyConfig.RejoinMapName == Protocol.MemoryStoreNames.Rejoins,
+	"House config and party protocol MemoryStore names differ"
+)
 assert(secretBunkerConfig.Id == "secretbunker.underground", "Secret bunker terminal id changed")
 assert(secretBunkerConfig.Name == "Secret Underground Bunker", "Secret bunker name changed")
 assert(tonumber(secretBunkerConfig.Price) == 2500, "Secret bunker price changed")
@@ -140,6 +157,7 @@ local dataStore = dataStoreEnabled and DataStoreService:GetDataStore(Config.Data
 local randomizer = Random.new()
 
 local profiles = {}
+local profilesByUserId = {}
 local hydratingProfiles = {}
 local requestNextAt = {}
 local snapshotNextAt = {}
@@ -147,7 +165,7 @@ local bankInputNextAt = {}
 local shuttingDown = false
 local globalRevision = 0
 local DATA_LOAD_ATTEMPTS = 4
-local DELIVERY_RETRY_ATTEMPTS = 15
+local DELIVERY_RETRY_INTERVAL_SECONDS = 2
 local RELEASE_SAVE_ATTEMPTS = 4
 local SNAPSHOT_REQUEST_COOLDOWN = 0.75
 -- The profile data uses schema v11. This reserved, temporary storage field
@@ -170,12 +188,389 @@ local BOOMBOX_TICK_EARLY_TOLERANCE = 0.15
 local BOOMBOX_FINAL_TICK_TOLERANCE = 0.35
 local BOOMBOX_END_WATCHDOG_GRACE = 2
 
+-- M1_SHARED_TASK_SESSION_CONTRACT
+-- There is exactly one authoritative party/session in a reserved house server,
+-- including the synthetic one-member session used by solo play. Persistent
+-- player profiles retain personal currency and statistics; the active task,
+-- physical house state, and task reward token live here once per server.
+local partySession = {
+	id = "",
+	hostUserId = 0,
+	expectedMembers = {},
+	activePlayers = {},
+	state = "Loading",
+	taskCursor = 0,
+	completedTasks = 0,
+	taskSerial = 0,
+	task = nil,
+	nextTaskAt = math.huge,
+	lastHiddenMarker = nil,
+	nextPlushKind = "Teddy",
+	hostGraceSerial = 0,
+	hostGraceDeadline = 0,
+	hostGraceUnixExpiresAt = 0,
+	pausedAt = 0,
+	validated = false,
+	studioSynthetic = false,
+	loadingWatchStarted = false,
+	closingStarted = false,
+	closeSerial = 0,
+}
+
+local ticketMap = MemoryStoreService:GetHashMap(tostring(partyConfig.TicketMapName))
+local sessionMap = MemoryStoreService:GetHashMap(tostring(partyConfig.SessionMapName))
+local rejoinMap = MemoryStoreService:GetHashMap(tostring(partyConfig.RejoinMapName))
+
 local function serverNow()
 	return workspace:GetServerTimeNow()
 end
 
 local function unixNow()
 	return os.time()
+end
+
+local function normalizePartyMembers(rawMembers)
+	if type(rawMembers) ~= "table" then
+		return nil
+	end
+	local set = {}
+	local ordered = {}
+	for _, rawUserId in ipairs(rawMembers) do
+		local userId = tonumber(rawUserId)
+		if not userId or userId % 1 ~= 0 or userId <= 0 or set[userId] then
+			return nil
+		end
+		set[userId] = true
+		table.insert(ordered, userId)
+	end
+	if #ordered < 1 or #ordered > partyConfig.MaxMembers then
+		return nil
+	end
+	table.sort(ordered)
+	return ordered, set
+end
+
+local function sameMemberSet(left, right)
+	for userId in pairs(left or {}) do
+		if not (right and right[userId]) then
+			return false
+		end
+	end
+	for userId in pairs(right or {}) do
+		if not (left and left[userId]) then
+			return false
+		end
+	end
+	return true
+end
+
+local function syncSessionManifest(sessionState, hostGraceExpiresAt)
+	if RunService:IsStudio() or partySession.studioSynthetic then
+		return true
+	end
+	if not partySession.validated or not Protocol.isOpaqueId(partySession.id) then
+		return false
+	end
+	local updated = nil
+	local lastFailure = nil
+	local renewedExpiresAt = unixNow() + partyConfig.SessionLifetimeSeconds
+	for attempt = 1, 3 do
+		local ok, result = pcall(function()
+			return sessionMap:UpdateAsync("session:" .. partySession.id, function(manifest)
+				if type(manifest) ~= "table"
+					or manifest.sessionId ~= partySession.id
+					or tonumber(manifest.hostUserId) ~= partySession.hostUserId
+				then
+					return nil
+				end
+				manifest.state = sessionState
+				manifest.hostGraceExpiresAt = math.max(0, math.floor(tonumber(hostGraceExpiresAt) or 0))
+				manifest.houseJobId = game.JobId
+				manifest.updatedAt = unixNow()
+				manifest.expiresAt = renewedExpiresAt
+				return manifest
+			end, partyConfig.SessionLifetimeSeconds)
+		end)
+		if ok and type(result) == "table" then
+			updated = result
+			break
+		end
+		lastFailure = result
+		if attempt < 3 then
+			task.wait(0.2 * attempt)
+		end
+	end
+	if not updated then
+		warn(string.format(
+			"[CooperGame] Could not synchronize party session state %s: %s",
+			tostring(sessionState),
+			tostring(lastFailure)
+		))
+		return false
+	end
+	-- The lobby alone knows the reserved access code. The house renews each
+	-- existing server-only route without ever reading or replicating that code.
+	-- Closed sessions remove their routes immediately.
+	for userId in pairs(partySession.expectedMembers) do
+		local key = "rejoin:" .. tostring(userId)
+		if sessionState == "Closed" then
+			pcall(rejoinMap.RemoveAsync, rejoinMap, key)
+		else
+			local routeOk, routeFailure = pcall(function()
+				return rejoinMap:UpdateAsync(key, function(route)
+					if type(route) ~= "table" or route.sessionId ~= partySession.id
+						or type(route.accessCode) ~= "string" or route.accessCode == ""
+					then
+						return nil
+					end
+					route.expiresAt = renewedExpiresAt
+					route.updatedAt = unixNow()
+					return route
+				end, partyConfig.SessionLifetimeSeconds)
+			end)
+			if not routeOk then
+				warn("[CooperGame] Could not renew rejoin route for " .. tostring(userId)
+					.. ": " .. tostring(routeFailure))
+			end
+		end
+	end
+	return true
+end
+
+local function setPartyPlayerAttributes(player)
+	local isMember = partySession.expectedMembers[player.UserId] == true
+	player:SetAttribute("CooperPartyMember", isMember)
+	player:SetAttribute("CooperPartySessionId", isMember and partySession.id or nil)
+	player:SetAttribute("CooperPartyHostUserId", isMember and partySession.hostUserId or nil)
+	player:SetAttribute("CooperPartyIsHost", isMember and player.UserId == partySession.hostUserId)
+	player:SetAttribute("CooperPartyState", isMember and partySession.state or nil)
+end
+
+local function createSyntheticParty(player)
+	if partySession.validated then
+		if RunService:IsStudio()
+			and partySession.studioSynthetic
+			and not partySession.expectedMembers[player.UserId]
+			and #Players:GetPlayers() <= partyConfig.MaxMembers
+		then
+			partySession.expectedMembers[player.UserId] = true
+		end
+		return partySession.expectedMembers[player.UserId] == true
+	end
+	partySession.id = string.format(
+		"%s:%s:%s",
+		RunService:IsStudio() and "studio" or "solo",
+		tostring(game.JobId ~= "" and game.JobId or "local"),
+		HttpService:GenerateGUID(false)
+	)
+	partySession.hostUserId = player.UserId
+	partySession.expectedMembers = { [player.UserId] = true }
+	partySession.state = "Loading"
+	partySession.validated = true
+	partySession.studioSynthetic = RunService:IsStudio()
+	return true
+end
+
+local function validateLaunchTicket(player)
+	-- Studio cannot exercise TeleportService. Multiplayer Studio tests use one
+	-- synthetic party while production always fails closed on missing tickets.
+	if RunService:IsStudio() then
+		return createSyntheticParty(player)
+	end
+	if Config.Features.Lobby ~= true then
+		return createSyntheticParty(player)
+	end
+	local lobbyPlaceId = tonumber(partyConfig.LobbyPlaceId) or 0
+	if lobbyPlaceId <= 0 or game.PrivateServerId == "" or game.PrivateServerOwnerId ~= 0 then
+		return false, "This house only accepts private parties launched by the lobby."
+	end
+	local joinData = player:GetJoinData()
+	local teleportData = type(joinData) == "table" and joinData.TeleportData or nil
+	if tonumber(joinData and joinData.SourcePlaceId) ~= lobbyPlaceId or type(teleportData) ~= "table" then
+		return false, "The private-party handoff was missing. Return to the lobby and try again."
+	end
+	-- TeleportData is client-visible and therefore only a structured hint. The
+	-- protocol parser bounds every field before the opaque ids are cross-checked
+	-- against the server-only ticket and session manifest below.
+	local parsedTeleport, teleportError = Protocol.validateHouseTeleportData(
+		teleportData,
+		player.UserId,
+		unixNow()
+	)
+	if not parsedTeleport then
+		return false, teleportError or "That party launch ticket is invalid or out of date."
+	end
+	local sessionId = parsedTeleport.sessionId
+	local ticketId = parsedTeleport.ticketId
+	-- Validate the server-only session before consuming the one-use arrival
+	-- ticket. A transient manifest read failure must not burn a good ticket.
+	local manifestOk, manifest = pcall(sessionMap.GetAsync, sessionMap, "session:" .. sessionId)
+	local manifestHostUserId = type(manifest) == "table" and tonumber(manifest.hostUserId) or nil
+	local manifestExpiresAt = type(manifest) == "table" and tonumber(manifest.expiresAt) or nil
+	local manifestSet = nil
+	if type(manifest) == "table" then
+		local _
+		_, manifestSet = normalizePartyMembers(manifest.members)
+	end
+	local _, teleportMemberSet = normalizePartyMembers(parsedTeleport.memberUserIds)
+	if not manifestOk or type(manifest) ~= "table"
+		or tonumber(manifest.v) ~= partyConfig.ProtocolVersion
+		or manifest.sessionId ~= sessionId
+		or manifest.partyId ~= parsedTeleport.partyId
+		or manifestHostUserId ~= parsedTeleport.hostUserId
+		or not manifestExpiresAt or manifestExpiresAt < unixNow()
+		or (manifest.state ~= "Launching" and manifest.state ~= "InHouse" and manifest.state ~= "HostGrace")
+		or type(manifest.reservedServerPrivateId) ~= "string"
+		or manifest.reservedServerPrivateId == ""
+		or manifest.reservedServerPrivateId ~= game.PrivateServerId
+		or not manifestSet or not teleportMemberSet
+		or not sameMemberSet(manifestSet, teleportMemberSet)
+	then
+		return false, "The party session expired. Return to the lobby to launch again."
+	end
+	if player.UserId == manifestHostUserId
+		and type(manifest.hostGraceExpiresAt) == "number"
+		and manifest.hostGraceExpiresAt > 0
+		and manifest.hostGraceExpiresAt <= unixNow()
+	then
+		return false, "The host reconnect window has ended."
+	end
+	local rejection = "That party launch ticket is no longer valid."
+	local claimNonce = Protocol.newOpaqueId("claim")
+	local ok, result = pcall(function()
+		return ticketMap:UpdateAsync("ticket:" .. ticketId, function(ticket)
+			local ticketExpiresAt = type(ticket) == "table" and tonumber(ticket.expiresAt) or nil
+			if type(ticket) ~= "table"
+				or tonumber(ticket.v) ~= partyConfig.ProtocolVersion
+				or ticket.sessionId ~= sessionId
+				or tonumber(ticket.userId) ~= player.UserId
+				or tonumber(ticket.hostUserId) ~= parsedTeleport.hostUserId
+				or not ticketExpiresAt or ticketExpiresAt < unixNow()
+			then
+				return nil
+			end
+			local members, memberSet = normalizePartyMembers(ticket.members)
+			local hostUserId = tonumber(ticket.hostUserId)
+			if not members
+				or not sameMemberSet(memberSet, teleportMemberSet)
+				or not memberSet[player.UserId] or not memberSet[hostUserId]
+			then
+				return nil
+			end
+			-- Every per-player launch ticket is one-use, including within the same
+			-- reserved job. Rejoins are issued a fresh ticket by the lobby instead of
+			-- replaying the original handoff.
+			if ticket.consumedByJobId ~= nil or ticket.consumedAt ~= nil then
+				rejection = "That party launch ticket was already used."
+				return nil
+			end
+			ticket.consumedByJobId = game.JobId
+			ticket.consumedAt = unixNow()
+			ticket.consumedClaimNonce = claimNonce
+			return ticket
+		end, partyConfig.LaunchTicketLifetimeSeconds)
+	end)
+	if not ok or type(result) ~= "table"
+		or result.consumedClaimNonce ~= claimNonce
+		or result.consumedByJobId ~= game.JobId
+		or tonumber(result.userId) ~= player.UserId
+		or result.sessionId ~= sessionId
+	then
+		return false, rejection
+	end
+	local acceptedMembers, acceptedMemberSet = normalizePartyMembers(result.members)
+	local acceptedHostUserId = tonumber(result.hostUserId)
+	if not acceptedMembers or not acceptedMemberSet
+		or acceptedHostUserId ~= manifestHostUserId
+		or not sameMemberSet(manifestSet, acceptedMemberSet)
+	then
+		return false, "The party manifest did not match the launch ticket."
+	end
+	if partySession.validated then
+		if partySession.state == "Closing" then
+			return false, "That private party is already closing."
+		end
+		if partySession.id ~= sessionId
+			or partySession.hostUserId ~= acceptedHostUserId
+			or not sameMemberSet(partySession.expectedMembers, acceptedMemberSet)
+		then
+			return false, "That ticket belongs to a different private party."
+		end
+	else
+		partySession.id = sessionId
+		partySession.hostUserId = acceptedHostUserId
+		partySession.expectedMembers = acceptedMemberSet
+		partySession.state = "Loading"
+		partySession.validated = true
+	end
+	return true
+end
+
+local function partyIsMember(player)
+	return player ~= nil
+		and player.Parent == Players
+		and partySession.expectedMembers[player.UserId] == true
+		and partySession.activePlayers[player.UserId] == player
+end
+
+local function partyIsHost(player)
+	return partyIsMember(player) and player.UserId == partySession.hostUserId
+end
+
+local function partyCanProgress()
+	if not partySession.validated or partySession.state ~= "Active" then
+		return false
+	end
+	local activeHost = partySession.activePlayers[partySession.hostUserId]
+	local activeHostProfile = profilesByUserId[partySession.hostUserId]
+	if not activeHost or activeHost.Parent ~= Players
+		or not activeHostProfile or activeHostProfile.player ~= activeHost
+		or not activeHostProfile.loaded or activeHostProfile.releasing
+		or activeHostProfile.leaseLost
+		or (dataStore ~= nil and activeHostProfile.leaseOwned ~= true)
+	then
+		return false
+	end
+	-- A player already standing in the server is "present" for the shared
+	-- reward contract. Briefly pause progression while any admitted member is
+	-- still hydrating so nobody can miss a task payout because DataStore was
+	-- slower for them than for the host. Iterate the actual Players service, not
+	-- only activePlayers: PlayerAdded can run a task callback in the tiny window
+	-- before validateLaunchTicket has published that player's active slot.
+	for _, player in ipairs(Players:GetPlayers()) do
+		local userId = player.UserId
+		local profile = profilesByUserId[userId]
+		if partySession.expectedMembers[userId] ~= true
+			or partySession.activePlayers[userId] ~= player
+			or player.Parent ~= Players or not profile or profile.player ~= player
+			or not profile.loaded or profile.releasing or profile.leaseLost
+		then
+			return false
+		end
+	end
+	return true
+end
+
+local function hostProfile()
+	local profile = profilesByUserId[partySession.hostUserId]
+	return profile and profile.loaded and not profile.releasing and not profile.leaseLost
+		and (dataStore == nil or profile.leaseOwned == true) and profile or nil
+end
+
+local function presentProfiles()
+	local result = {}
+	for userId, player in pairs(partySession.activePlayers) do
+		local profile = profilesByUserId[userId]
+		if player.Parent == Players and profile and profile.player == player
+			and profile.loaded and not profile.releasing
+		then
+			table.insert(result, profile)
+		end
+	end
+	table.sort(result, function(left, right)
+		return left.player.UserId < right.player.UserId
+	end)
+	return result
 end
 
 local function formatCountdown(seconds)
@@ -309,7 +704,10 @@ local function sanitizeData(raw)
 	-- paid-but-uninstalled setups as the durable delivery marker on reconnect.
 	local chemistrySetupPlaced = raw.chemistrySetupPlaced == true
 	local chemistrySetupPurchased = raw.chemistrySetupPurchased == true or chemistrySetupPlaced
-	local candyDeliveryActive = chemistrySetupPlaced and raw.candyDeliveryActive == true
+	-- Milestone 1 lets a guest use the host's installed chemistry lab while the
+	-- resulting batch remains the guest's personal product. Do not erase a valid
+	-- batch merely because that guest does not own a lab in their own house.
+	local candyDeliveryActive = raw.candyDeliveryActive == true
 	local candyDeliveryToken = candyDeliveryActive
 		and type(raw.candyDeliveryToken) == "string"
 		and #raw.candyDeliveryToken >= 8
@@ -319,8 +717,7 @@ local function sanitizeData(raw)
 	-- Reaction completion and physical collection are distinct durable states.
 	-- If a legacy/corrupt profile contains both, the later delivery contract wins;
 	-- otherwise a ready batch retains (or repairs) its one-time collection token.
-	local candyBatchReady = chemistrySetupPlaced
-		and not candyDeliveryActive
+	local candyBatchReady = not candyDeliveryActive
 		and raw.candyBatchReady == true
 	local candyBatchToken = candyBatchReady
 		and type(raw.candyBatchToken) == "string"
@@ -620,12 +1017,12 @@ local function createMissyCarryTool(player, plushKind)
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	if not backpack or not humanoid or humanoid.Health <= 0 then
-		return false
+		return nil
 	end
 	local sourceName = plushKind == "Rabbit" and "MissyDetailedRabbit" or "MissyDetailedTeddyBear"
 	local source = environment:FindFirstChild(sourceName, true)
 	if not source or not source:IsA("Model") then
-		return false
+		return nil
 	end
 
 	destroyExistingMissyCarry(player)
@@ -679,7 +1076,11 @@ local function createMissyCarryTool(player, plushKind)
 
 	tool.Parent = backpack
 	humanoid:EquipTool(tool)
-	return tool.Parent == character or tool.Parent == backpack
+	if tool.Parent == character or tool.Parent == backpack then
+		return tool
+	end
+	tool:Destroy()
+	return nil
 end
 
 local function machineProgress(stage)
@@ -713,14 +1114,18 @@ local function setAllowance(profile, amount, shouldMarkDirty)
 	end
 end
 
-local function syncBoomboxPlacedAttribute(profile)
-	local player = profile and profile.player
-	if player and player.Parent == Players then
-		player:SetAttribute("CooperBoomboxPlaced", profile.data.boomboxPlaced == true)
+local function syncBoomboxPlacedAttribute(_profile)
+	local worldProfile = hostProfile()
+	local placed = worldProfile ~= nil and worldProfile.data.boomboxPlaced == true
+	for _, player in ipairs(Players:GetPlayers()) do
+		if partyIsMember(player) then
+			player:SetAttribute("CooperBoomboxPlaced", placed)
+		end
 	end
 end
 
-local function secretBunkerSnapshot(profile)
+local function secretBunkerSnapshot(profile, viewerProfile)
+	viewerProfile = viewerProfile or profile
 	local purchased = profile ~= nil and profile.data.secretBunkerPurchased == true
 	local readyAt = purchased
 		and finiteInteger(profile.data.secretBunkerReadyAt, 1, 1, 4_102_444_800)
@@ -742,24 +1147,27 @@ local function secretBunkerSnapshot(profile)
 		remaining = remaining,
 		unlocked = unlocked,
 		status = status,
-		canOrder = profile ~= nil and profile.loaded == true and not profile.releasing and not purchased,
+		canOrder = profile ~= nil and profile.loaded == true and not profile.releasing
+			and viewerProfile ~= nil and partyIsHost(viewerProfile.player)
+			and partyCanProgress() and not purchased,
 	}
 end
 
-local function syncSecretBunkerAttributes(profile)
-	local player = profile and profile.player
-	if not player or player.Parent ~= Players then
-		return
+local function syncSecretBunkerAttributes(_profile)
+	local bunkerState = secretBunkerSnapshot(hostProfile())
+	for _, player in ipairs(Players:GetPlayers()) do
+		if partyIsMember(player) then
+			player:SetAttribute("CooperSecretBunkerId", bunkerState.id)
+			player:SetAttribute("CooperSecretBunkerPurchased", bunkerState.purchased)
+			player:SetAttribute("CooperSecretBunkerReadyAt", bunkerState.readyAt)
+			player:SetAttribute("CooperSecretBunkerUnlocked", bunkerState.unlocked)
+			player:SetAttribute("CooperSecretBunkerStatus", bunkerState.status)
+		end
 	end
-	local bunkerState = secretBunkerSnapshot(profile)
-	player:SetAttribute("CooperSecretBunkerId", bunkerState.id)
-	player:SetAttribute("CooperSecretBunkerPurchased", bunkerState.purchased)
-	player:SetAttribute("CooperSecretBunkerReadyAt", bunkerState.readyAt)
-	player:SetAttribute("CooperSecretBunkerUnlocked", bunkerState.unlocked)
-	player:SetAttribute("CooperSecretBunkerStatus", bunkerState.status)
 end
 
-local function chemistrySetupSnapshot(profile)
+local function chemistrySetupSnapshot(profile, viewerProfile)
+	viewerProfile = viewerProfile or profile
 	local purchased = profile ~= nil and profile.data.chemistrySetupPurchased == true
 	local placed = profile ~= nil and profile.data.chemistrySetupPlaced == true
 	local deliveryStatus = purchased and not placed
@@ -770,16 +1178,16 @@ local function chemistrySetupSnapshot(profile)
 		elseif placed
 		then "Installed"
 		else deliveryStatus or "WaitingDelivery"
-	local bunkerState = secretBunkerSnapshot(profile)
+	local bunkerState = secretBunkerSnapshot(profile, viewerProfile)
 	local hasOtherDelivery = profile ~= nil and (
 		profile.data.pendingPartStage > 0
 		or (profile.data.boomboxPurchased and not profile.data.boomboxPlaced)
 		or profile.data.pendingTaskUpgradeId ~= ""
-		or (profile.task ~= nil
-			and profile.task.id == "GeorgeBeer"
-			and (profile.task.step == "WaitingDelivery"
-				or profile.task.step == "Collect"
-				or profile.task.step == "Deliver"))
+		or (partySession.task ~= nil
+			and partySession.task.id == "GeorgeBeer"
+			and (partySession.task.step == "WaitingDelivery"
+				or partySession.task.step == "Collect"
+				or partySession.task.step == "Deliver"))
 	)
 	return {
 		id = chemistrySetupConfig.Id,
@@ -797,29 +1205,30 @@ local function chemistrySetupSnapshot(profile)
 		canOrder = profile ~= nil
 			and profile.loaded == true
 			and not profile.releasing
+			and viewerProfile ~= nil
+			and partyIsHost(viewerProfile.player)
+			and partyCanProgress()
 			and bunkerState.unlocked == true
 			and not purchased
 			and not hasOtherDelivery,
 	}
 end
 
-local function syncChemistrySetupAttributes(profile)
-	local player = profile and profile.player
-	if not player or player.Parent ~= Players then
-		return
+local function syncChemistrySetupAttributes(_profile)
+	local chemistryState = chemistrySetupSnapshot(hostProfile())
+	for _, player in ipairs(Players:GetPlayers()) do
+		if partyIsMember(player) then
+			player:SetAttribute("CooperChemistrySetupPurchased", chemistryState.purchased)
+			player:SetAttribute("CooperChemistrySetupPlaced", chemistryState.placed)
+			player:SetAttribute("CooperChemistrySetupStatus", chemistryState.status)
+		end
 	end
-	local chemistryState = chemistrySetupSnapshot(profile)
-	player:SetAttribute("CooperChemistrySetupPurchased", chemistryState.purchased)
-	player:SetAttribute("CooperChemistrySetupPlaced", chemistryState.placed)
-	player:SetAttribute("CooperChemistrySetupStatus", chemistryState.status)
 end
 
 local function candyDeliverySnapshot(profile)
 	local active = profile ~= nil
-		and profile.data.chemistrySetupPlaced == true
 		and profile.data.candyDeliveryActive == true
 	local batchReady = profile ~= nil
-		and profile.data.chemistrySetupPlaced == true
 		and not active
 		and profile.data.candyBatchReady == true
 	return {
@@ -895,7 +1304,7 @@ local function requestSecretBunkerPresentation(profile, reason)
 end
 
 local function taskDescription(profile)
-	local record = profile.task
+	local record = partySession.task
 	if not record then
 		return nil
 	end
@@ -918,7 +1327,7 @@ local function taskDescription(profile)
 			targetHint = "DeliveryDropZone"
 		elseif record.step == "Collect" then
 			description = "Pick up George's beer crate from the driveway."
-			targetHint = "Delivery_" .. tostring(profile.player.UserId)
+			targetHint = "Delivery_" .. tostring(record.carrierUserId or partySession.hostUserId)
 		elseif record.step == "Deliver" then
 			description = "Carry the beer crate to the kitchen refrigerator."
 			targetHint = "GeorgeBeerDropAnchor"
@@ -960,12 +1369,32 @@ local function taskDescription(profile)
 		end
 	end
 
+	local viewerUserId = profile and profile.player and profile.player.UserId or 0
+	local carrierUserId = tonumber(record.carrierUserId)
+	local carrierOwnsCurrentStep = carrierUserId ~= nil
+		and carrierUserId ~= viewerUserId
+		and ((record.id == "MaryTrash" and record.step == "Deliver")
+			or (record.id == "MissyPlush" and record.step == "Return")
+			or (record.id == "GeorgeBeer" and (record.step == "Collect" or record.step == "Deliver")))
+	if carrierOwnsCurrentStep then
+		description = "A teammate is carrying the task item. Help clear the way while they finish this step."
+		targetHint = nil
+		guidance = false
+	elseif record.id == BANK_TASK_ID
+		and record.bankActorUserId ~= nil
+		and tonumber(record.bankActorUserId) ~= viewerUserId
+	then
+		description = "A teammate is using BANKLINK. Their memory-game result will advance the shared task for everyone."
+		targetHint = nil
+		guidance = false
+	end
+
 	return {
 		id = definition.id,
 		title = definition.title,
 		requester = definition.requester,
 		reward = record.id == BANK_TASK_ID
-			and finiteInteger(record.bankReward, bankHackReward(profile), 0, 2_000_000_000)
+			and finiteInteger(record.bankReward, bankHackReward(hostProfile() or profile), 0, 2_000_000_000)
 			or definition.reward,
 		description = description,
 		guidance = guidance,
@@ -976,13 +1405,18 @@ local function taskDescription(profile)
 		automated = record.automated == true,
 		automationUpgradeId = record.automationUpgradeId,
 		automationCompletesAt = record.automationCompletesAt,
+		carrierUserId = record.carrierUserId,
+		actorUserId = record.bankActorUserId,
+		token = record.token,
 	}
 end
 
 local function bankHackSnapshot(profile)
-	local record = profile.task
+	local record = partySession.task
 	local active = record ~= nil and record.id == BANK_TASK_ID
 	local session = profile.bankHackSession
+	local actorUserId = active and tonumber(record.bankActorUserId) or nil
+	local occupiedByOther = actorUserId ~= nil and actorUserId ~= profile.player.UserId
 	local currentTime = serverNow()
 	local retryReadyAt = active and tonumber(record.bankRetryReadyAt) or nil
 	local retryRemaining = retryReadyAt and math.max(0, retryReadyAt - currentTime) or 0
@@ -1002,9 +1436,11 @@ local function bankHackSnapshot(profile)
 	end
 	return {
 		taskActive = active,
-		canStart = ready and session == nil,
+		canStart = ready and session == nil and not occupiedByOther and partyCanProgress(),
 		activeSession = session ~= nil,
-		status = status,
+		status = occupiedByOther and "InUse" or status,
+		actorUserId = actorUserId,
+		occupiedByOther = occupiedByOther,
 		cycle = active
 			and finiteInteger(record.bankCycle, bankHackSuccessCount(profile) + 1, 1, 1_000_001)
 			or bankHackSuccessCount(profile) + 1,
@@ -1026,7 +1462,7 @@ local function bankHackSnapshot(profile)
 end
 
 local function hiddenSnapshot(profile)
-	local record = profile.task
+	local record = partySession.task
 	if not record then
 		return nil
 	end
@@ -1040,15 +1476,17 @@ local function hiddenSnapshot(profile)
 	return nil
 end
 
-local function boomboxSnapshot(profile)
+local function boomboxSnapshot(profile, viewerProfile)
+	viewerProfile = viewerProfile or profile
 	local purchased = profile.data.boomboxPurchased == true
 	local placed = profile.data.boomboxPlaced == true
 	local autoplayPurchased = purchased and profile.data.boomboxAutoplayPurchased == true
-	local playback = profile.boomboxPlayback
+	local playback = viewerProfile and viewerProfile.boomboxPlayback or nil
 	local globalPlaybackProfile = boomboxPlaybackOwner and profiles[boomboxPlaybackOwner] or nil
 	local globalPlayback = globalPlaybackProfile and globalPlaybackProfile.boomboxPlayback or nil
 	local globallyPlaying = globalPlayback ~= nil
-	local occupiedByOther = globallyPlaying and boomboxPlaybackOwner ~= profile.player
+	local occupiedByOther = globallyPlaying
+		and (not viewerProfile or boomboxPlaybackOwner ~= viewerProfile.player)
 	local remaining = math.max(0, profile.data.boomboxNextPlayAt - unixNow())
 	local deliveryStatus = purchased and not placed
 		and (profile.boomboxDeliveryStep or "WaitingDelivery")
@@ -1059,11 +1497,13 @@ local function boomboxSnapshot(profile)
 		status = "Available"
 	elseif not placed then
 		status = deliveryStatus
-		targetHint = if deliveryStatus == "Install"
-			then "BoomboxSetupAnchor"
-			elseif deliveryStatus == "Collect"
-				then "Delivery_Boombox_" .. tostring(profile.player.UserId)
-				else "DeliveryDropZone"
+		if viewerProfile and partyIsHost(viewerProfile.player) then
+			targetHint = if deliveryStatus == "Install"
+				then "BoomboxSetupAnchor"
+				elseif deliveryStatus == "Collect"
+					then "Delivery_Boombox_" .. tostring(profile.player.UserId)
+					else "DeliveryDropZone"
+		end
 	elseif globallyPlaying then
 		status = "Playing"
 	elseif remaining > 0 then
@@ -1094,19 +1534,25 @@ local function boomboxSnapshot(profile)
 		targetHint = targetHint,
 		nextPlayAt = profile.data.boomboxNextPlayAt,
 		cooldownRemaining = remaining,
-		canOrder = not purchased
+		canOrder = viewerProfile ~= nil and partyIsHost(viewerProfile.player)
+			and partyCanProgress() and not purchased
 			and profile.data.pendingPartStage == 0
 			and profile.data.pendingTaskUpgradeId == ""
 			and (not profile.data.chemistrySetupPurchased or profile.data.chemistrySetupPlaced),
-		canUpgradeAutoplay = purchased and placed and not autoplayPurchased,
-		canPlay = placed and not globallyPlaying and remaining <= 0,
+		canUpgradeAutoplay = viewerProfile ~= nil and partyIsHost(viewerProfile.player)
+			and partyCanProgress()
+			and purchased and placed and not autoplayPurchased,
+		canPlay = viewerProfile ~= nil and partyIsHost(viewerProfile.player)
+			and partyCanProgress()
+			and placed and not globallyPlaying and remaining <= 0,
 	}
 end
 
-local function automationSnapshot(profile)
+local function automationSnapshot(profile, viewerProfile)
+	viewerProfile = viewerProfile or profile
 	local installed = profile and profile.data.taskAutomationInstalled or {}
 	local pendingId = profile and profile.data.pendingTaskUpgradeId or ""
-	local activeRecord = profile and profile.task or nil
+	local activeRecord = partySession.task
 	local activeRuns = {}
 	for runId, record in pairs(profile and profile.automationRuns or {}) do
 		local definition = record and automationById[record.automationUpgradeId] or nil
@@ -1153,6 +1599,9 @@ local function automationSnapshot(profile)
 			installed = isInstalled,
 			pending = isPending,
 			canOrder = profile ~= nil
+				and viewerProfile ~= nil
+				and partyIsHost(viewerProfile.player)
+				and partyCanProgress()
 				and not isInstalled
 					and pendingId == ""
 					and profile.data.pendingPartStage == 0
@@ -1180,7 +1629,10 @@ local function automationSnapshot(profile)
 	}
 end
 
-local function deliverySnapshot(profile)
+local function deliverySnapshot(profile, viewerProfile)
+	viewerProfile = viewerProfile or profile
+	local viewerIsHost = viewerProfile ~= nil and partyIsHost(viewerProfile.player)
+	local ownerUserId = profile.player and profile.player.UserId or partySession.hostUserId
 	if profile.data.pendingPartStage > 0 then
 		local definition = Config.MachineStages[profile.data.pendingPartStage]
 		return {
@@ -1188,11 +1640,13 @@ local function deliverySnapshot(profile)
 			stage = profile.data.pendingPartStage,
 			name = definition and definition.name or "Time Machine Component",
 			status = profile.partDeliveryStep or "WaitingDelivery",
-			targetHint = if profile.partDeliveryStep == "Install"
+			targetHint = viewerIsHost and (if profile.partDeliveryStep == "Install"
 				then "MachineInstallBay"
 				else (profile.partDeliveryStep == "Collect"
 					and ("Delivery_" .. tostring(profile.player.UserId))
-					or "DeliveryDropZone"),
+					or "DeliveryDropZone")) or nil,
+			hostOnly = true,
+			ownerUserId = ownerUserId,
 		}
 	elseif profile.data.boomboxPurchased and not profile.data.boomboxPlaced then
 		local deliveryStatus = profile.boomboxDeliveryStep or "WaitingDelivery"
@@ -1201,11 +1655,13 @@ local function deliverySnapshot(profile)
 			stage = 0,
 			name = "Cooper Party Boombox",
 			status = deliveryStatus,
-			targetHint = if deliveryStatus == "Install"
+			targetHint = viewerIsHost and (if deliveryStatus == "Install"
 				then "BoomboxSetupAnchor"
 				elseif deliveryStatus == "Collect"
 					then "Delivery_Boombox_" .. tostring(profile.player.UserId)
-					else "DeliveryDropZone",
+					else "DeliveryDropZone") or nil,
+			hostOnly = true,
+			ownerUserId = ownerUserId,
 		}
 	elseif profile.data.pendingTaskUpgradeId ~= "" then
 		local upgradeId = profile.data.pendingTaskUpgradeId
@@ -1216,11 +1672,13 @@ local function deliverySnapshot(profile)
 			upgradeId = upgradeId,
 			name = definition and definition.name or "Task Automation Upgrade",
 			status = deliveryStatus,
-			targetHint = if deliveryStatus == "Install"
+			targetHint = viewerIsHost and (if deliveryStatus == "Install"
 				then (definition and definition.installTarget or nil)
 				elseif deliveryStatus == "Collect"
 					then "Delivery_TaskUpgrade_" .. tostring(profile.player.UserId)
-					else "DeliveryDropZone",
+					else "DeliveryDropZone") or nil,
+			hostOnly = true,
+			ownerUserId = ownerUserId,
 		}
 	elseif profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced then
 		local deliveryStatus = profile.chemistryDeliveryStep or "WaitingDelivery"
@@ -1229,11 +1687,13 @@ local function deliverySnapshot(profile)
 			stage = 0,
 			name = chemistrySetupConfig.Name,
 			status = deliveryStatus,
-			targetHint = if deliveryStatus == "Install"
+			targetHint = viewerIsHost and (if deliveryStatus == "Install"
 				then "Delivery_ChemistrySetup_" .. tostring(profile.player.UserId)
 				elseif deliveryStatus == "Collect"
 					then "Delivery_ChemistrySetup_" .. tostring(profile.player.UserId)
-					else "DeliveryDropZone",
+					else "DeliveryDropZone") or nil,
+			hostOnly = true,
+			ownerUserId = ownerUserId,
 		}
 	end
 	return nil
@@ -1241,7 +1701,8 @@ end
 
 local function snapshotFor(player)
 	local profile = profiles[player]
-	if not profile or not profile.loaded then
+	local worldProfile = hostProfile()
+	if not profile or not profile.loaded or not worldProfile then
 		return {
 			revision = globalRevision,
 			loaded = player == nil,
@@ -1305,47 +1766,70 @@ local function snapshotFor(player)
 				startingLength = finiteInteger(bankHackConfig.StartingLength, 2, 1, 100),
 				previewStepSeconds = tonumber(bankHackConfig.BasePreviewStepSeconds) or 0.78,
 			},
+			party = {
+				sessionId = partySession.id,
+				hostUserId = partySession.hostUserId,
+				isHost = player ~= nil and player.UserId == partySession.hostUserId,
+				canManageHouse = false,
+				personalAllowance = true,
+				memberCount = #Players:GetPlayers(),
+				state = partySession.state,
+				reconnectRemaining = math.max(0, partySession.hostGraceDeadline - serverNow()),
+				cycleIndex = math.floor(partySession.completedTasks / #Config.TaskOrder) + 1,
+			},
 		}
 	end
-	syncBoomboxPlacedAttribute(profile)
-	syncSecretBunkerAttributes(profile)
-	syncChemistrySetupAttributes(profile)
+	syncBoomboxPlacedAttribute(worldProfile)
+	syncSecretBunkerAttributes(worldProfile)
+	syncChemistrySetupAttributes(worldProfile)
 	syncCandyDeliveryAttributes(profile)
 	local currentTask = taskDescription(profile)
-	local nextPart = nextMachinePart(profile)
+	local nextPart = nextMachinePart(worldProfile)
 	return {
 		revision = globalRevision,
 		serverTime = serverNow(),
 		serverUnixTime = unixNow(),
 		loaded = true,
 		allowance = profile.data.allowance,
-		machineStage = profile.data.machineStage,
-		machineProgress = machineProgress(profile.data.machineStage),
-		machineStageName = profile.data.machineStage > 0
-			and Config.MachineStages[profile.data.machineStage].name
+		machineStage = worldProfile.data.machineStage,
+		machineProgress = machineProgress(worldProfile.data.machineStage),
+		machineStageName = worldProfile.data.machineStage > 0
+			and Config.MachineStages[worldProfile.data.machineStage].name
 			or "Blueprint Pending",
 		nextMachinePart = nextPart and {
 			stage = nextPart.stage,
 			name = nextPart.name,
 			progress = nextPart.progress,
 			cost = nextPart.cost,
-			canOrder = profile.data.pendingPartStage == 0
-				and (not profile.data.boomboxPurchased or profile.data.boomboxPlaced)
-				and profile.data.pendingTaskUpgradeId == ""
-				and (not profile.data.chemistrySetupPurchased or profile.data.chemistrySetupPlaced),
+			canOrder = partyIsHost(player) and partyCanProgress()
+				and worldProfile.data.pendingPartStage == 0
+				and (not worldProfile.data.boomboxPurchased or worldProfile.data.boomboxPlaced)
+				and worldProfile.data.pendingTaskUpgradeId == ""
+				and (not worldProfile.data.chemistrySetupPurchased or worldProfile.data.chemistrySetupPlaced),
 		} or nil,
 		tasks = currentTask and { currentTask } or {},
 		task = currentTask,
 		hidden = hiddenSnapshot(profile),
-		delivery = deliverySnapshot(profile),
-		boombox = boomboxSnapshot(profile),
-		secretBunker = secretBunkerSnapshot(profile),
-		chemistrySetup = chemistrySetupSnapshot(profile),
+		delivery = deliverySnapshot(worldProfile, profile),
+		boombox = boomboxSnapshot(worldProfile, profile),
+		secretBunker = secretBunkerSnapshot(worldProfile, profile),
+		chemistrySetup = chemistrySetupSnapshot(worldProfile, profile),
 		candyDelivery = candyDeliverySnapshot(profile),
-		automation = automationSnapshot(profile),
+		automation = automationSnapshot(worldProfile, profile),
 		bankHack = bankHackSnapshot(profile),
 		introNeeded = not profile.data.tutorialSeen,
 		totalTasks = profile.data.totalTasks,
+		party = {
+			sessionId = partySession.id,
+			hostUserId = partySession.hostUserId,
+			isHost = partyIsHost(player),
+			canManageHouse = partyIsHost(player) and partyCanProgress(),
+			personalAllowance = true,
+			memberCount = #presentProfiles(),
+			state = partySession.state,
+			reconnectRemaining = math.max(0, partySession.hostGraceDeadline - serverNow()),
+			cycleIndex = math.floor(partySession.completedTasks / #Config.TaskOrder) + 1,
+		},
 	}
 end
 
@@ -1357,17 +1841,13 @@ end
 
 local function broadcastState()
 	globalRevision += 1
-	local maximumStage = 0
-	for _, profile in pairs(profiles) do
-		if profile.loaded then
-			maximumStage = math.max(maximumStage, profile.data.machineStage)
-		end
-	end
+	local worldProfile = hostProfile()
+	local hostStage = worldProfile and worldProfile.data.machineStage or 0
 	state:SetAttribute("SchemaVersion", Config.SchemaVersion)
 	state:SetAttribute("ServerTime", serverNow())
 	-- This is an additive snapshot extension, so retain the established V4
 	-- foundation contract while advertising task automation explicitly below.
-	state:SetAttribute("FoundationContract", "PersonalV4")
+	state:SetAttribute("FoundationContract", "PartyV1")
 	state:SetAttribute("SupportsPaidPartOrdering", true)
 	state:SetAttribute("SupportsBoombox", true)
 	state:SetAttribute("SupportsIncomeBoombox", true)
@@ -1384,10 +1864,17 @@ local function broadcastState()
 	state:SetAttribute("FeaturePostgameEnabled", Config.Features.Postgame == true)
 	state:SetAttribute("FeatureStudioScenarioToolsEnabled", Config.Features.StudioScenarioTools == true)
 	state:SetAttribute("ReleasePlayerCap", Config.ReleasePlayerCap)
-	state:SetAttribute("MachineStage", maximumStage)
-	state:SetAttribute("MachineProgress", machineProgress(maximumStage))
+	state:SetAttribute("PartySessionId", partySession.id)
+	state:SetAttribute("PartyHostUserId", partySession.hostUserId)
+	state:SetAttribute("PartyState", partySession.state)
+	state:SetAttribute("PartyMemberCount", #presentProfiles())
+	state:SetAttribute("HostGraceDeadline", partySession.hostGraceDeadline)
+	state:SetAttribute("MachineStage", hostStage)
+	state:SetAttribute("MachineProgress", machineProgress(hostStage))
 	state:SetAttribute("TaskRevision", globalRevision)
 	for _, player in ipairs(Players:GetPlayers()) do
+		setPartyPlayerAttributes(player)
+		player:SetAttribute("MachineStage", hostStage)
 		sendSnapshot(player)
 	end
 end
@@ -1530,7 +2017,7 @@ local function saveProfile(player, releasing)
 end
 
 local function pickHiddenLocation(profile)
-	local previous = profile.lastHiddenMarker
+	local previous = partySession.lastHiddenMarker
 	local choices = {}
 	for _, definition in ipairs(Config.HiddenLocations) do
 		if definition.name ~= previous and taskLocation(definition.name) then
@@ -1541,7 +2028,7 @@ local function pickHiddenLocation(profile)
 		choices = Config.HiddenLocations
 	end
 	local chosen = choices[randomizer:NextInteger(1, #choices)]
-	profile.lastHiddenMarker = chosen.name
+	partySession.lastHiddenMarker = chosen.name
 	return chosen
 end
 
@@ -1552,6 +2039,9 @@ end
 local completeTask
 local stockAutomatedBeer
 local cancelBankHackSession
+local returnSavedPartyToLobby
+local closePartyAndReturn
+local recoverHostWorldState
 local automationRunSerial = 0
 
 local function armTaskAutomation(record, definition)
@@ -1568,7 +2058,7 @@ local function armTaskAutomation(record, definition)
 end
 
 local function launchTaskAutomation(profile, record, definition)
-	if not profile or profile.task ~= record or not definition
+	if not profile or partySession.task ~= record or not definition
 		or record.automated ~= true or record.automationUpgradeId ~= definition.id
 	then
 		return false
@@ -1628,23 +2118,42 @@ local function launchTaskAutomation(profile, record, definition)
 		profile.automationRuns[runId] = nil
 		return false
 	end
-	task.delay(definition.duration, function()
-		if profiles[profile.player] == profile
-			and profile.loaded
-			and not profile.releasing
+	record.automationVisualRemaining = definition.duration
+	record.automationVisualLastTick = serverNow()
+	task.spawn(function()
+		while profile.loaded and not profile.releasing
+			and profiles[profile.player] == profile
 			and profile.automationRuns[runId] == record
-		then
-			profile.automationRuns[runId] = nil
-			if definition.id == "BeerBot" then
-				stockAutomatedBeer()
+		do
+			task.wait(0.15)
+			local now = serverNow()
+			local lastTick = tonumber(record.automationVisualLastTick)
+			if not lastTick or lastTick ~= lastTick or lastTick == math.huge or lastTick == -math.huge then
+				lastTick = now
 			end
-			feedback(profile.player, "TaskAutomationFinished", {
-				title = definition.name,
-				upgradeId = definition.id,
-				taskId = record.id,
-				text = string.format("%s finished its physical task and returned home.", definition.name),
-			})
-			broadcastState()
+			local elapsed = math.max(0, now - lastTick)
+			record.automationVisualLastTick = now
+			if partyCanProgress() and hostProfile() == profile then
+				record.automationVisualRemaining = math.max(
+					0,
+					(tonumber(record.automationVisualRemaining) or 0) - elapsed
+				)
+			end
+			record.automationCompletesAt = now + (tonumber(record.automationVisualRemaining) or 0)
+			if (tonumber(record.automationVisualRemaining) or 0) <= 0 then
+				profile.automationRuns[runId] = nil
+				if definition.id == "BeerBot" then
+					stockAutomatedBeer()
+				end
+				feedback(profile.player, "TaskAutomationFinished", {
+					title = definition.name,
+					upgradeId = definition.id,
+					taskId = record.id,
+					text = string.format("%s finished its physical task and returned home.", definition.name),
+				})
+				broadcastState()
+				return
+			end
 		end
 	end)
 	return true
@@ -1660,11 +2169,13 @@ local function automationRunIsActive(profile, upgradeId)
 end
 
 local function startNextTask(profile)
-	if profile.task or not profile.loaded then
+	if not profile or not profile.loaded or not partyIsHost(profile.player)
+		or not partyCanProgress() or partySession.task
+	then
 		return
 	end
 	local order = Config.TaskOrder
-	local nextCursor = (profile.taskCursor % #order) + 1
+	local nextCursor = (partySession.taskCursor % #order) + 1
 	local id = order[nextCursor]
 	if not id or not taskById[id] or not taskCanStart(id) then
 		return
@@ -1676,14 +2187,18 @@ local function startNextTask(profile)
 	then
 		-- Never stack a second job onto the same physical robot. Keep this exact
 		-- task at the head of the rotation until the first run has returned home.
-		profile.nextTaskAt = serverNow() + 1
+		partySession.nextTaskAt = serverNow() + 1
 		return
 	end
-	profile.taskCursor = nextCursor
+	partySession.taskCursor = nextCursor
+	partySession.taskSerial += 1
 	local record = {
+		token = string.format("%s:%d", partySession.id, partySession.taskSerial),
 		id = id,
 		step = "Start",
 		startedAt = serverNow(),
+		status = "Active",
+		rewardedUserIds = {},
 	}
 	if id == "GeorgeBeer" then
 		record.step = "Order"
@@ -1693,8 +2208,8 @@ local function startNextTask(profile)
 		local location = pickHiddenLocation(profile)
 		record.step = "Search"
 		record.markerName = location.name
-		record.plushKind = profile.nextPlushKind == "Rabbit" and "Rabbit" or "Teddy Bear"
-		profile.nextPlushKind = record.plushKind == "Rabbit" and "Teddy" or "Rabbit"
+		record.plushKind = partySession.nextPlushKind == "Rabbit" and "Rabbit" or "Teddy Bear"
+		partySession.nextPlushKind = record.plushKind == "Rabbit" and "Teddy" or "Rabbit"
 	elseif id == BANK_TASK_ID then
 		record.step = "Ready"
 		record.bankCycle = bankHackSuccessCount(profile) + 1
@@ -1707,8 +2222,8 @@ local function startNextTask(profile)
 	then
 		armTaskAutomation(record, automationDefinition)
 	end
-	profile.task = record
-	feedback(profile.player, "TaskStarted", {
+	partySession.task = record
+	feedback(nil, "TaskStarted", {
 		title = taskById[id].title,
 		requester = taskById[id].requester,
 		text = taskDescription(profile).description,
@@ -1720,7 +2235,7 @@ local function startNextTask(profile)
 end
 
 local function scheduleNextTask(profile)
-	profile.nextTaskAt = serverNow() + randomizer:NextNumber(
+	partySession.nextTaskAt = serverNow() + randomizer:NextNumber(
 		Config.TaskDirector.MinimumDelay,
 		Config.TaskDirector.MaximumDelay
 	)
@@ -1739,8 +2254,10 @@ stockAutomatedBeer = function()
 end
 
 completeTask = function(profile, expectedRecord)
-	local record = expectedRecord or profile.task
-	if not record or profile.task ~= record then
+	local record = expectedRecord or partySession.task
+	if not profile or not partyCanProgress() or not record
+		or partySession.task ~= record or record.status ~= "Active"
+	then
 		return false
 	end
 	local definition = record and taskById[record.id] or nil
@@ -1752,48 +2269,67 @@ completeTask = function(profile, expectedRecord)
 		-- Manual play needs the exact final-key validation bit. Automated play has
 		-- a different proof: an installed HackerBot and the exact authoritative run
 		-- id created by launchTaskAutomation. Neither path can impersonate the other.
-		local automatedBankProof = record.automated == true
+		local automationProfile = hostProfile()
+		local automatedBankProof = automationProfile ~= nil and record.automated == true
 			and record.automationUpgradeId == "HackerBot"
-			and profile.data.taskAutomationInstalled.HackerBot == true
+			and automationProfile.data.taskAutomationInstalled.HackerBot == true
 			and type(record.bankAutomationRunId) == "string"
 			and record.bankAutomationRunId == record.automationRunId
-			and profile.automationRuns[record.automationRunId] == record
+			and automationProfile.automationRuns[record.automationRunId] == record
 		local manualBankProof = record.automated ~= true and record.bankHackValidated == true
 		if (not automatedBankProof and not manualBankProof) or record.bankSuccessCounted == true then
 			return false
 		end
 		record.bankSuccessCounted = true
 		reward = finiteInteger(record.bankReward, bankHackReward(profile), 0, 2_000_000_000)
-		profile.data.bankHackSuccesses = bankHackSuccessCount(profile) + 1
 	end
-	setAllowance(profile, profile.data.allowance + reward)
-	profile.data.totalTasks += 1
-	profile.data.cycleIndex = math.floor(profile.data.totalTasks / #Config.TaskOrder) + 1
-	profile.data.cycleTaskIndex = (profile.data.totalTasks % #Config.TaskOrder) + 1
-	profile.task = nil
-	markDirty(profile)
+	-- Consume the shared token synchronously before any deferred save, robot
+	-- callback, or duplicate world prompt can observe it as payable.
+	record.status = "Completing"
+	local recipients = presentProfiles()
+	for _, recipient in ipairs(recipients) do
+		local userId = recipient.player.UserId
+		if record.rewardedUserIds[userId] ~= true then
+			record.rewardedUserIds[userId] = true
+			setAllowance(recipient, recipient.data.allowance + reward)
+			recipient.data.totalTasks += 1
+			recipient.data.cycleIndex = math.floor(recipient.data.totalTasks / #Config.TaskOrder) + 1
+			recipient.data.cycleTaskIndex = (recipient.data.totalTasks % #Config.TaskOrder) + 1
+			if record.id == BANK_TASK_ID then
+				recipient.data.bankHackSuccesses = bankHackSuccessCount(recipient) + 1
+			end
+			markDirty(recipient)
+		end
+	end
+	partySession.completedTasks += 1
+	partySession.task = nil
 	if record.automated == true then
-		profile.nextTaskAt = serverNow() + math.max(
+		partySession.nextTaskAt = serverNow() + math.max(
 			0.5,
 			tonumber(Config.TaskDirector.AutomatedNextDelay) or 3
 		)
 	else
 		scheduleNextTask(profile)
 	end
-	feedback(profile.player, "TaskComplete", {
-		taskId = definition.id,
-		title = definition.title,
-		reward = reward,
-		automated = record.automated == true,
-		automationUpgradeId = record.automationUpgradeId,
-		text = record.automated == true
-			and string.format("%s accepted the chore. You earned $%d, and the next request is coming while it works.", tostring(record.automationUpgradeId or "Robot"), reward)
-			or string.format("Task complete! You earned $%d allowance.", reward),
-	})
+	for _, recipient in ipairs(recipients) do
+		feedback(recipient.player, "TaskComplete", {
+			taskId = definition.id,
+			taskToken = record.token,
+			title = definition.title,
+			reward = reward,
+			automated = record.automated == true,
+			automationUpgradeId = record.automationUpgradeId,
+			text = record.automated == true
+				and string.format("%s accepted the shared chore. Everyone present earned $%d.", tostring(record.automationUpgradeId or "Robot"), reward)
+				or string.format("Shared task complete! You earned $%d allowance.", reward),
+		})
+	end
 	broadcastState()
 	-- Task income is real progression. Persist it immediately just like paid
 	-- purchases so a sudden server shutdown cannot discard a completed chore.
-	task.defer(saveProfile, profile.player, false)
+	for _, recipient in ipairs(recipients) do
+		task.defer(saveProfile, recipient.player, false)
+	end
 	return true
 end
 
@@ -1816,7 +2352,8 @@ local function bankSessionIsCurrent(profile, session)
 		and profile.loaded
 		and not profile.releasing
 		and profile.bankHackSession == session
-		and profile.task == session.record
+		and partySession.task == session.record
+		and session.record.bankActorUserId == profile.player.UserId
 		and session.record.id == BANK_TASK_ID
 end
 
@@ -1827,9 +2364,10 @@ cancelBankHackSession = function(profile, reason, notifyPlayer)
 	end
 	profile.bankHackSession = nil
 	bankInputNextAt[profile.player] = nil
-	if profile.task == session.record and session.record.id == BANK_TASK_ID then
+	if partySession.task == session.record and session.record.id == BANK_TASK_ID then
 		session.record.step = "Ready"
 		session.record.bankRetryReadyAt = nil
+		session.record.bankActorUserId = nil
 	end
 	if notifyPlayer ~= false then
 		bankPacket(profile.player, "BankHackCancelled", {
@@ -1851,6 +2389,7 @@ local function failBankHackSession(profile, session, reason)
 	end
 	profile.bankHackSession = nil
 	bankInputNextAt[profile.player] = nil
+	session.record.bankActorUserId = nil
 	local retrySeconds = math.max(0, tonumber(bankHackConfig.RetryCooldownSeconds) or 1.25)
 	local retryReadyAt = serverNow() + retrySeconds
 	session.record.step = "RetryCooldown"
@@ -1872,7 +2411,7 @@ local function failBankHackSession(profile, session, reason)
 		if profiles[profile.player] == profile
 			and profile.loaded
 			and not profile.releasing
-			and profile.task == session.record
+			and partySession.task == session.record
 			and profile.bankHackSession == nil
 			and session.record.step == "RetryCooldown"
 			and tonumber(session.record.bankRetryReadyAt) == retryReadyAt
@@ -1895,6 +2434,7 @@ local function succeedBankHackSession(profile, session)
 	-- delayed deadlines, and duplicate callbacks all fail the identity check.
 	profile.bankHackSession = nil
 	bankInputNextAt[profile.player] = nil
+	session.record.bankActorUserId = nil
 	session.phase = "Succeeded"
 	session.record.bankHackValidated = true
 	session.record.step = "Complete"
@@ -1990,18 +2530,21 @@ beginBankHackRound = function(profile, session, roundNumber)
 end
 
 local function startBankHack(profile)
-	if not profile or not profile.loaded or profile.releasing then
+	if not profile or not profile.loaded or profile.releasing or not partyCanProgress() then
 		return false, "Your profile is not ready."
 	end
 	if not validComputerSession(profile.player) then
 		return false, "Use Sheldon's computer before starting HACK MEDFORD BANK."
 	end
-	local record = profile.task
+	local record = partySession.task
 	if not record or record.id ~= BANK_TASK_ID then
 		return false, "The Medford Bank hack is not the active task right now."
 	end
 	if profile.bankHackSession then
 		return false, "A Medford Bank connection is already active."
+	end
+	if record.bankActorUserId ~= nil and record.bankActorUserId ~= profile.player.UserId then
+		return false, "Another party member is using BANKLINK right now."
 	end
 	local now = serverNow()
 	local retryReadyAt = tonumber(record.bankRetryReadyAt) or 0
@@ -2059,6 +2602,7 @@ local function startBankHack(profile)
 	record.bankSuccessCounted = nil
 	record.bankRetryReadyAt = nil
 	record.step = "Starting"
+	record.bankActorUserId = profile.player.UserId
 	profile.bankHackSession = session
 	bankInputNextAt[profile.player] = nil
 	bankPacket(profile.player, "BankHackStarted", {
@@ -2193,14 +2737,16 @@ local function queueDelivery(profile, kind, stage, upgradeId)
 	requestDelivery:Fire(profile.player, request)
 	-- BindableEvents do not retain messages if TaskWorld is still starting. Retry
 	-- until its Spawned acknowledgement clears the flag; TaskWorld de-duplicates
-	-- these requests by owner/kind/stage.
+	-- these requests by owner/kind/stage. Do not abandon the request after a fixed
+	-- startup window: a host-grace pause or slow streamed environment can validly
+	-- last longer than thirty seconds, while the durable purchase/task still needs
+	-- a physical delivery afterward.
 	task.spawn(function()
-		for _ = 1, DELIVERY_RETRY_ATTEMPTS do
-			task.wait(2)
-			if profiles[profile.player] ~= profile or not profile.deliveryQueued[kind] then
-				return
+		while profiles[profile.player] == profile and profile.deliveryQueued[kind] do
+			task.wait(DELIVERY_RETRY_INTERVAL_SECONDS)
+			if profiles[profile.player] == profile and profile.deliveryQueued[kind] then
+				requestDelivery:Fire(profile.player, request)
 			end
-			requestDelivery:Fire(profile.player, request)
 		end
 	end)
 end
@@ -2208,9 +2754,24 @@ end
 -- The only server path that creates a component order.  Cost validation,
 -- allowance debit, pending-stage mutation, and delivery queueing happen as one
 -- trusted operation so no client can install free parts.
-local function orderMachinePart(profile, expectedStage)
+-- M1_HOST_ONLY_PURCHASE_GUARD
+local function hostMutationAllowed(profile)
 	if not profile or not profile.loaded or profile.releasing then
 		return false, "Profile is not loaded"
+	end
+	if not partyCanProgress() then
+		return false, "Party progression is paused while the host reconnects."
+	end
+	if not partyIsHost(profile.player) or hostProfile() ~= profile then
+		return false, "Only the party host can change this house's permanent upgrades."
+	end
+	return true
+end
+
+local function orderMachinePart(profile, expectedStage)
+	local allowed, denial = hostMutationAllowed(profile)
+	if not allowed then
+		return false, denial
 	end
 	if profile.data.pendingPartStage > 0 then
 		return false, "You already have a component delivery in progress."
@@ -2253,8 +2814,9 @@ end
 -- are committed without yielding before the delivery request is emitted, so a
 -- repeated client click can never create a free or duplicate order.
 local function orderBoombox(profile)
-	if not profile or not profile.loaded or profile.releasing then
-		return false, "Profile is not loaded"
+	local allowed, denial = hostMutationAllowed(profile)
+	if not allowed then
+		return false, denial
 	end
 	if profile.data.boomboxPurchased then
 		return false, profile.data.boomboxPlaced
@@ -2301,8 +2863,9 @@ end
 -- occur without yielding, so repeated or forged client requests cannot create
 -- a free upgrade or charge the same profile twice.
 local function upgradeBoomboxAutoplay(profile)
-	if not profile or not profile.loaded or profile.releasing then
-		return false, "Profile is not loaded"
+	local allowed, denial = hostMutationAllowed(profile)
+	if not allowed then
+		return false, denial
 	end
 	if not profile.data.boomboxPurchased or not profile.data.boomboxPlaced then
 		return false, "Buy, deliver, and set up the boombox before upgrading it."
@@ -2340,8 +2903,9 @@ end
 -- and requeued after reconnects, so a lost crate or shutdown cannot lose the
 -- player's purchase.
 local function orderTaskUpgrade(profile, requestedUpgradeId)
-	if not profile or not profile.loaded or profile.releasing then
-		return false, "Profile is not loaded"
+	local allowed, denial = hostMutationAllowed(profile)
+	if not allowed then
+		return false, denial
 	end
 	local upgradeId = type(requestedUpgradeId) == "string" and requestedUpgradeId or ""
 	local definition = automationById[upgradeId]
@@ -2365,7 +2929,7 @@ local function orderTaskUpgrade(profile, requestedUpgradeId)
 	if profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced then
 		return false, "Finish installing your advanced chemistry setup first."
 	end
-	local activeTask = profile.task
+	local activeTask = partySession.task
 	if activeTask and activeTask.id == "GeorgeBeer"
 		and (activeTask.step == "WaitingDelivery" or activeTask.step == "Collect" or activeTask.step == "Deliver")
 	then
@@ -2405,8 +2969,9 @@ end
 -- yielding; the construction controller receives presentation work only after
 -- that authoritative transaction is complete.
 local function orderSecretBunker(profile)
-	if not profile or not profile.loaded or profile.releasing then
-		return false, "Profile is not loaded"
+	local allowed, denial = hostMutationAllowed(profile)
+	if not allowed then
+		return false, denial
 	end
 	if profile.data.secretBunkerPurchased == true then
 		local bunkerState = secretBunkerSnapshot(profile)
@@ -2461,8 +3026,9 @@ end
 -- as every house upgrade. Only the research terminal may request it, but all
 -- entitlement, allowance, and delivery state remains authoritative here.
 local function orderChemistrySetup(profile)
-	if not profile or not profile.loaded or profile.releasing then
-		return false, "Profile is not loaded"
+	local allowed, denial = hostMutationAllowed(profile)
+	if not allowed then
+		return false, denial
 	end
 	local bunkerState = secretBunkerSnapshot(profile)
 	if bunkerState.unlocked ~= true then
@@ -2482,7 +3048,7 @@ local function orderChemistrySetup(profile)
 	if profile.data.pendingTaskUpgradeId ~= "" then
 		return false, "Finish installing your task automation upgrade first."
 	end
-	local activeTask = profile.task
+	local activeTask = partySession.task
 	if activeTask and activeTask.id == "GeorgeBeer"
 		and (activeTask.step == "WaitingDelivery" or activeTask.step == "Collect" or activeTask.step == "Deliver")
 	then
@@ -2546,8 +3112,10 @@ local function completeSecretBunkerIfReady(profile)
 end
 
 local function createCandyBatch(profile, metadata)
+	local worldProfile = hostProfile()
 	if not profile or not profile.loaded or profile.releasing
-		or profile.data.chemistrySetupPlaced ~= true
+		or not partyCanProgress()
+		or not worldProfile or worldProfile.data.chemistrySetupPlaced ~= true
 	then
 		return false
 	end
@@ -2582,8 +3150,10 @@ local function createCandyBatch(profile, metadata)
 end
 
 local function beginCandyDelivery(profile, metadata)
+	local worldProfile = hostProfile()
 	if not profile or not profile.loaded or profile.releasing
-		or profile.data.chemistrySetupPlaced ~= true
+		or not partyCanProgress()
+		or not worldProfile or worldProfile.data.chemistrySetupPlaced ~= true
 	then
 		return false
 	end
@@ -2629,6 +3199,7 @@ end
 
 local function completeCandyDelivery(profile, metadata)
 	if not profile or not profile.loaded or profile.releasing
+		or not partyCanProgress()
 		or profile.data.candyDeliveryActive ~= true
 	then
 		return false
@@ -2660,13 +3231,46 @@ local function completeCandyDelivery(profile, metadata)
 	return true, payout
 end
 
+local hostWorldActionEvents = {
+	TaskUpgradeDeliverySpawned = true,
+	TaskUpgradeCratePicked = true,
+	TaskUpgradeInstalled = true,
+	TaskUpgradeCarryLost = true,
+	ChemistryDeliverySpawned = true,
+	ChemistryCratePicked = true,
+	ChemistrySetupPlaced = true,
+	ChemistryCarryLost = true,
+	BoomboxPlaybackFailed = true,
+	BoomboxDeliverySpawned = true,
+	BoomboxCratePicked = true,
+	BoomboxPlaced = true,
+	BoomboxCarryLost = true,
+	MachineDeliverySpawned = true,
+	MachineCratePicked = true,
+	MachinePartInstalled = true,
+}
+
+local sharedCarryRollbackEvents = {
+	BeerCarryLost = true,
+	TrashCarryLost = true,
+	MissyPlushCarryLost = true,
+}
+
 local function reportPlayerAction(eventKey, player, metadata)
 	local profile = profiles[player]
-	if not profile or not profile.loaded or profile.releasing or type(eventKey) ~= "string" then
+	local graceRollbackAllowed = type(eventKey) == "string"
+		and sharedCarryRollbackEvents[eventKey] == true
+		and partySession.state == "HostGrace"
+	if not profile or not profile.loaded or profile.releasing or type(eventKey) ~= "string"
+		or not partyIsMember(player) or (not partyCanProgress() and not graceRollbackAllowed)
+	then
+		return false
+	end
+	if hostWorldActionEvents[eventKey] and not partyIsHost(player) then
 		return false
 	end
 	metadata = type(metadata) == "table" and metadata or {}
-	local record = profile.task
+	local record = partySession.task
 	local reportedUpgradeId = type(metadata.upgradeId) == "string" and metadata.upgradeId or ""
 	local pendingUpgradeId = profile.data.pendingTaskUpgradeId
 	local pendingUpgrade = automationById[pendingUpgradeId]
@@ -2725,7 +3329,7 @@ local function reportPlayerAction(eventKey, player, metadata)
 			name = pendingUpgrade.name,
 			text = pendingUpgrade.name .. " installed! Its matching task will now run automatically.",
 		})
-		local activeRecord = profile.task
+		local activeRecord = partySession.task
 		if activeRecord and activeRecord.id == pendingUpgrade.taskId and activeRecord.automated ~= true then
 			destroyManualCarryForAutomation(player, activeRecord.id)
 			if armTaskAutomation(activeRecord, pendingUpgrade) then
@@ -2880,17 +3484,33 @@ local function reportPlayerAction(eventKey, player, metadata)
 		broadcastState()
 		return true
 	elseif eventKey == "MachineDeliverySpawned" and profile.data.pendingPartStage > 0 then
+		local reportedStage = finiteInteger(metadata.stage, 0, 0, #Config.MachineStages)
+		if reportedStage ~= profile.data.pendingPartStage then
+			return false
+		end
+		if profile.partDeliveryStep ~= "WaitingDelivery" then
+			return profile.partDeliveryStep == "Collect" or profile.partDeliveryStep == "Install"
+		end
 		profile.deliveryQueued.MachinePart = false
 		profile.partDeliveryStep = "Collect"
 		feedback(player, "DeliveryArrived", { text = "Your Time Machine component has arrived in the driveway." })
 		broadcastState()
 		return true
 	elseif eventKey == "MachineCratePicked" and profile.data.pendingPartStage > 0 then
+		local reportedStage = finiteInteger(metadata.stage, 0, 0, #Config.MachineStages)
+		if reportedStage ~= profile.data.pendingPartStage then
+			return false
+		end
+		if profile.partDeliveryStep ~= "Collect" then
+			return profile.partDeliveryStep == "Install"
+		end
 		profile.partDeliveryStep = "Install"
 		feedback(player, "DeliveryPicked", { text = "Carry the component crate to the garage installation bay." })
 		broadcastState()
 		return true
-	elseif eventKey == "MachinePartInstalled" and profile.data.pendingPartStage > 0 then
+	elseif eventKey == "MachinePartInstalled" and profile.data.pendingPartStage > 0
+		and profile.partDeliveryStep == "Install"
+	then
 		local requestedStage = finiteInteger(metadata.stage, 0, 0, #Config.MachineStages)
 		if requestedStage ~= profile.data.pendingPartStage or requestedStage ~= profile.data.machineStage + 1 then
 			return false
@@ -2933,45 +3553,82 @@ local function reportPlayerAction(eventKey, player, metadata)
 	if eventKey == "DishesCompleted" and record.id == "MaryDishes" then
 		return completeTask(profile)
 	elseif eventKey == "TrashPicked" and record.id == "MaryTrash" and record.step == "Pickup" then
+		if record.carrierUserId ~= nil and record.carrierUserId ~= player.UserId then
+			return false
+		end
+		record.carrierUserId = player.UserId
 		record.step = "Deliver"
 		feedback(player, "TaskProgress", { text = "Now follow the arrow to the garage-side garbage can outside." })
 		broadcastState()
 		return true
-	elseif eventKey == "TrashDelivered" and record.id == "MaryTrash" and record.step == "Deliver" then
+	elseif eventKey == "TrashDelivered" and record.id == "MaryTrash" and record.step == "Deliver"
+		and record.carrierUserId == player.UserId
+	then
 		return completeTask(profile)
 	elseif eventKey == "MissyPlushCollected" and record.id == "MissyPlush" and record.step == "Search" then
+		if record.carrierUserId ~= nil and record.carrierUserId ~= player.UserId then
+			return false
+		end
+		record.carrierUserId = player.UserId
 		record.step = "Return"
 		feedback(player, "TaskProgress", { text = "You found it! Return the stuffed animal to Missy's bed." })
 		broadcastState()
 		return true
-	elseif eventKey == "MissyPlushReturned" and record.id == "MissyPlush" and record.step == "Return" then
+	elseif eventKey == "MissyPlushReturned" and record.id == "MissyPlush" and record.step == "Return"
+		and record.carrierUserId == player.UserId
+	then
 		return completeTask(profile)
-	elseif eventKey == "BeerDeliverySpawned" and record.id == "GeorgeBeer" and record.step == "WaitingDelivery" then
+	elseif eventKey == "BeerDeliverySpawned" and record.id == "GeorgeBeer" and record.step == "WaitingDelivery"
+		and record.carrierUserId == player.UserId
+	then
 		profile.deliveryQueued.Beer = false
 		record.step = "Collect"
 		feedback(player, "DeliveryArrived", { text = "George's beer delivery has arrived in the driveway." })
 		broadcastState()
 		return true
-	elseif eventKey == "BeerCratePicked" and record.id == "GeorgeBeer" and record.step == "Collect" then
+	elseif eventKey == "BeerCratePicked" and record.id == "GeorgeBeer" and record.step == "Collect"
+		and record.carrierUserId == player.UserId
+	then
 		record.step = "Deliver"
 		feedback(player, "TaskProgress", { text = "Carry the beer crate to the kitchen refrigerator." })
 		broadcastState()
 		return true
-	elseif eventKey == "BeerDelivered" and record.id == "GeorgeBeer" and record.step == "Deliver" then
+	elseif eventKey == "BeerDelivered" and record.id == "GeorgeBeer" and record.step == "Deliver"
+		and record.carrierUserId == player.UserId
+	then
 		return completeTask(profile)
-	elseif eventKey == "BeerCarryLost" and record.id == "GeorgeBeer" and record.step == "Deliver" then
+	elseif eventKey == "BeerCarryLost" and record.id == "GeorgeBeer" and record.step == "Deliver"
+		and record.carrierUserId == player.UserId
+	then
 		profile.deliveryQueued.Beer = false
-		record.step = "WaitingDelivery"
-		queueDelivery(profile, "Beer", 0)
-		feedback(player, "TaskProgress", { text = "The lost beer crate is being redelivered. Watch for the truck." })
+		if partySession.state == "HostGrace" then
+			-- Delivery workers correctly refuse to run during host grace. Returning to
+			-- Order avoids retaining a delivery owned by the destroyed character and
+			-- lets any present member place a fresh order as soon as the host returns.
+			record.carrierUserId = nil
+			record.step = "Order"
+			feedback(player, "TaskProgress", {
+				text = "The beer crate was lost. Order a replacement after the party host reconnects.",
+			})
+		else
+			record.step = "WaitingDelivery"
+			queueDelivery(profile, "Beer", 0)
+			feedback(player, "TaskProgress", { text = "The lost beer crate is being redelivered. Watch for the truck." })
+		end
 		broadcastState()
 		return true
-	elseif eventKey == "TrashCarryLost" and record.id == "MaryTrash" and record.step == "Deliver" then
+	elseif eventKey == "TrashCarryLost" and record.id == "MaryTrash" and record.step == "Deliver"
+		and record.carrierUserId == player.UserId
+	then
+		record.carrierUserId = nil
 		record.step = "Pickup"
 		feedback(player, "TaskProgress", { text = "Pick up a replacement bag from the kitchen garbage can." })
 		broadcastState()
 		return true
-	elseif eventKey == "MissyPlushCarryLost" and record.id == "MissyPlush" and record.step == "Return" then
+	elseif eventKey == "MissyPlushCarryLost" and record.id == "MissyPlush" and record.step == "Return"
+		and record.carrierUserId == player.UserId
+	then
+		record.carrierUserId = nil
 		record.step = "Search"
 		feedback(player, "TaskProgress", { text = "Missy's toy slipped away. Follow the glowing arrow to find it again." })
 		broadcastState()
@@ -2997,11 +3654,7 @@ local function adjustAllowance(subject, rawDelta, reason)
 		end
 		table.insert(recipients, profile)
 	elseif subject == nil then
-		for _, profile in pairs(profiles) do
-			if profile.loaded and not profile.releasing then
-				table.insert(recipients, profile)
-			end
-		end
+		recipients = presentProfiles()
 	else
 		return false, "Invalid allowance recipient"
 	end
@@ -3039,6 +3692,7 @@ end
 
 local function announceBoomboxReady(profile, automatic)
 	if not profile or not profile.loaded or profile.releasing
+		or not partyIsHost(profile.player)
 		or not profile.data.boomboxPurchased or not profile.data.boomboxPlaced
 		or profile.boomboxPlayback
 	then
@@ -3068,6 +3722,10 @@ local function beginBoomboxPlayback(player, requestedSource)
 	local profile = typeof(player) == "Instance" and player:IsA("Player") and profiles[player] or nil
 	if not profile or not profile.loaded or profile.releasing then
 		return boomboxFailure("Profile is not loaded.")
+	end
+	local allowed, denial = hostMutationAllowed(profile)
+	if not allowed then
+		return boomboxFailure(denial)
 	end
 	if automatic and profile.data.boomboxAutoplayPurchased ~= true then
 		return boomboxFailure("The boombox autoplay upgrade is not installed.")
@@ -3161,6 +3819,9 @@ local function boomboxPayoutTick(player, sessionId)
 	local profile = typeof(player) == "Instance" and player:IsA("Player") and profiles[player] or nil
 	if not profile or not profile.loaded or profile.releasing then
 		return boomboxFailure("Profile is not loaded.")
+	end
+	if not partyCanProgress() or not partyIsHost(player) or hostProfile() ~= profile then
+		return boomboxFailure("Boombox payouts pause until the party host is active.")
 	end
 	local playback = profile.boomboxPlayback
 	if type(sessionId) ~= "string" or not playback or playback.sessionId ~= sessionId
@@ -3323,7 +3984,15 @@ bankHackEvent.OnServerEvent:Connect(function(player, action, payload)
 		return
 	end
 	local profile = profiles[player]
-	if not profile or not profile.loaded or profile.releasing then
+	if not profile or not profile.loaded or profile.releasing or not partyIsMember(player) then
+		return
+	end
+	if action ~= "Cancel" and not partyCanProgress() then
+		bankPacket(player, "BankHackError", {
+			text = "BANKLINK is paused while the party host reconnects.",
+			reason = "Party paused",
+			serverTime = serverNow(),
+		})
 		return
 	end
 	if action == "Start" then
@@ -3405,7 +4074,7 @@ requestEvent.OnServerEvent:Connect(function(player, action, payload)
 		return
 	end
 	local profile = profiles[player]
-	if not profile or not profile.loaded or profile.releasing then
+	if not profile or not profile.loaded or profile.releasing or not partyIsMember(player) then
 		return
 	end
 	if (action == "OrderBeer"
@@ -3436,7 +4105,12 @@ requestEvent.OnServerEvent:Connect(function(player, action, payload)
 		player:SetAttribute("CooperBunkerComputerSessionUntil", nil)
 		feedback(player, "BunkerTerminalClose", { text = "Research terminal closed" })
 	elseif action == "OrderBeer" then
-		local record = profile.task
+		if not partyCanProgress() then
+			feedback(player, "Error", { text = "Tasks are paused while the party host reconnects." })
+			return
+		end
+		local record = partySession.task
+		local worldProfile = hostProfile()
 		if record and record.automated then
 			feedback(player, "Error", { text = "BeerBot is already handling George's beer automatically." })
 			return
@@ -3445,20 +4119,22 @@ requestEvent.OnServerEvent:Connect(function(player, action, payload)
 			feedback(player, "Error", { text = "George has not asked for a beer order right now." })
 			return
 		end
-		if profile.data.pendingPartStage > 0
-			or (profile.data.boomboxPurchased and not profile.data.boomboxPlaced)
-			or profile.data.pendingTaskUpgradeId ~= ""
-			or (profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced)
+		if not worldProfile
+			or worldProfile.data.pendingPartStage > 0
+			or (worldProfile.data.boomboxPurchased and not worldProfile.data.boomboxPlaced)
+			or worldProfile.data.pendingTaskUpgradeId ~= ""
+			or (worldProfile.data.chemistrySetupPurchased and not worldProfile.data.chemistrySetupPlaced)
 		then
 			feedback(player, "Error", { text = "Finish the current truck delivery before ordering George's beer." })
 			return
 		end
+		record.carrierUserId = player.UserId
 		record.step = "WaitingDelivery"
 		queueDelivery(profile, "Beer", 0)
 		feedback(player, "OrderPlaced", { text = "Beer order placed. The delivery truck is on its way." })
 		broadcastState()
 	elseif action == "OrderMachinePart" then
-		local definition = nextMachinePart(profile)
+		local definition = nextMachinePart(hostProfile() or profile)
 		local ordered, reason = orderMachinePart(profile, definition and definition.stage or nil)
 		if not ordered then
 			feedback(player, "Error", { text = tostring(reason or "That component could not be ordered.") })
@@ -3514,7 +4190,10 @@ requestEvent.OnServerEvent:Connect(function(player, action, payload)
 			})
 		end
 	elseif action == "HiddenSeen" then
-		local record = profile.task
+		if not partyCanProgress() then
+			return
+		end
+		local record = partySession.task
 		local markerName = type(payload) == "table" and tostring(payload.markerName or "") or ""
 		local marker = taskLocation(markerName)
 		if not record or record.step ~= "Search" or record.markerName ~= markerName
@@ -3523,8 +4202,12 @@ requestEvent.OnServerEvent:Connect(function(player, action, payload)
 			return
 		end
 		if record.id == "MissyPlush" then
-			if createMissyCarryTool(player, record.plushKind) then
-				reportPlayerAction("MissyPlushCollected", player, { markerName = markerName })
+			local plush = createMissyCarryTool(player, record.plushKind)
+			if plush then
+				local accepted = reportPlayerAction("MissyPlushCollected", player, { markerName = markerName })
+				if accepted ~= true and plush.Parent then
+					plush:Destroy()
+				end
 			else
 				feedback(player, "Error", { text = "The stuffed animal could not be picked up. Try again." })
 			end
@@ -3573,88 +4256,10 @@ local function setupLeaderstats(player, profile)
 	setAllowance(profile, profile.data.allowance, false)
 end
 
-local function loadPlayer(player)
-	if shuttingDown then
-		return
+local function attachCharacterWatch(player, profile)
+	if profile.characterAddedConnection then
+		profile.characterAddedConnection:Disconnect()
 	end
-	-- Bunker presentation uses this explicit hydration boundary to distinguish a
-	-- restored owned lab from a brand-new delivery/install transition.
-	player:SetAttribute("CooperGameProfileLoaded", false)
-	local profile = {
-		player = player,
-		data = sanitizeData(nil),
-		loaded = false,
-		dirty = false,
-		saving = false,
-		releasing = false,
-		leaseToken = HttpService:GenerateGUID(false),
-		leaseOwned = false,
-		leaseLost = false,
-		leaseExpiresAt = 0,
-		revision = 0,
-		task = nil,
-		taskCursor = nil,
-		nextTaskAt = serverNow() + Config.TaskDirector.InitialDelay,
-		nextPlushKind = "Teddy",
-		partDeliveryStep = nil,
-		boomboxDeliveryStep = nil,
-		taskUpgradeDeliveryStep = nil,
-		chemistryDeliveryStep = nil,
-		boomboxPlayback = nil,
-		boomboxReadyNoticeKey = nil,
-		bankHackSession = nil,
-		secretBunkerCompletionAnnounced = false,
-		automationRuns = {},
-		deliveryQueued = {},
-	}
-	profiles[player] = profile
-	hydratingProfiles[profile] = true
-	if dataStore then
-		-- Loading and claiming are one atomic UpdateAsync transaction. GetAsync
-		-- followed by a later write would leave a window where two live servers
-		-- both believe they own the same progression record.
-		local acquired, result, leaseExpiresAt, lastFailure, liveConflict = acquireProfileLease(profile)
-		if not acquired then
-			hydratingProfiles[profile] = nil
-			warn("[CooperGame] Profile load failed closed for " .. player.Name .. ": " .. tostring(lastFailure))
-			if profiles[player] == profile then
-				profiles[player] = nil
-			end
-			if player.Parent == Players then
-				player:Kick(liveConflict
-					and "Your saved game is still closing in another server. Please wait a moment, then rejoin."
-					or "Your saved game data could not be loaded. Please rejoin so your progress stays safe.")
-			end
-			return
-		end
-		profile.leaseOwned = true
-		profile.leaseExpiresAt = leaseExpiresAt
-		if profiles[player] ~= profile or player.Parent ~= Players or shuttingDown then
-			-- PlayerRemoving can run while UpdateAsync is yielding. Do not strand a
-			-- freshly claimed lease for its full crash-recovery duration.
-			releaseProfileLease(profile, RELEASE_SAVE_ATTEMPTS)
-			hydratingProfiles[profile] = nil
-			return
-		end
-		local sanitizedData, didNormalize = sanitizeData(result)
-		profile.data = sanitizedData
-		if didNormalize then
-			-- Rewrite every sanitizer repair, including malformed current-schema
-			-- entitlements, pending ids, and candy tokens. Version-only detection
-			-- left those repairs transient until another economy mutation occurred.
-			profile.dirty = true
-		end
-	end
-	hydratingProfiles[profile] = nil
-	if player.Parent ~= Players then
-		if profile.leaseOwned then
-			releaseProfileLease(profile, RELEASE_SAVE_ATTEMPTS)
-		end
-		profiles[player] = nil
-		return
-	end
-	profile.taskCursor = profile.data.totalTasks % #Config.TaskOrder
-	profile.loaded = true
 	local function watchCharacterDeath(character)
 		task.defer(function()
 			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -3672,87 +4277,435 @@ local function loadPlayer(player)
 	if player.Character then
 		watchCharacterDeath(player.Character)
 	end
-	setupLeaderstats(player, profile)
-	player:SetAttribute("CooperGameSchemaVersion", Config.SchemaVersion)
-	player:SetAttribute("MachineStage", profile.data.machineStage)
-	syncBoomboxPlacedAttribute(profile)
-	local loadedBunkerState = secretBunkerSnapshot(profile)
-	profile.secretBunkerCompletionAnnounced = loadedBunkerState.unlocked
-	syncSecretBunkerAttributes(profile)
-	syncChemistrySetupAttributes(profile)
-	syncCandyDeliveryAttributes(profile)
-	if loadedBunkerState.purchased then
+end
+
+closePartyAndReturn = function(reason)
+	if partySession.closingStarted then
+		return false
+	end
+	partySession.closingStarted = true
+	partySession.closeSerial += 1
+	local closeSerial = partySession.closeSerial
+	partySession.hostGraceSerial += 1
+	partySession.state = "Closing"
+	partySession.hostGraceDeadline = 0
+	partySession.hostGraceUnixExpiresAt = 0
+	for profile in pairs(hydratingProfiles) do
+		profile.closeRequested = true
+	end
+	for _, profile in ipairs(presentProfiles()) do
+		if profile.bankHackSession then
+			cancelBankHackSession(profile, "The private house session is closing.", true)
+		end
+	end
+	syncSessionManifest("Closed", 0)
+	feedback(nil, "PartyClosing", {
+		title = "RETURNING TO LOBBY",
+		text = tostring(reason or "The private house session ended. Progress is being saved."),
+	})
+	broadcastState()
+	task.spawn(function()
+		-- Let in-flight atomic profile claims finish so each one can either be
+		-- released by its loader or included in the final save set below.
+		local hydrateDeadline = os.clock() + 20
+		while next(hydratingProfiles) ~= nil and os.clock() < hydrateDeadline do
+			for profile in pairs(hydratingProfiles) do
+				profile.closeRequested = true
+			end
+			task.wait(0.1)
+		end
+		if partySession.closeSerial ~= closeSerial then
+			return
+		end
+
+		local savedPlayers = {}
+		local entries = {}
+		for key, candidate in pairs(profiles) do
+			table.insert(entries, { key = key, profile = candidate })
+		end
+		for _, entry in ipairs(entries) do
+			local key = entry.key
+			local candidate = entry.profile
+			local saved = false
+			if candidate.loaded then
+				saved = saveProfile(key, true)
+			elseif candidate.leaseOwned then
+				saved = releaseProfileLease(candidate, RELEASE_SAVE_ATTEMPTS)
+			else
+				saved = true
+			end
+			if saved then
+				local livePlayer = candidate.player
+				if livePlayer and livePlayer.Parent == Players then
+					table.insert(savedPlayers, livePlayer)
+				end
+				if profiles[key] == candidate then
+					profiles[key] = nil
+				end
+				local userId = candidate.player and candidate.player.UserId or 0
+				if profilesByUserId[userId] == candidate then
+					profilesByUserId[userId] = nil
+				end
+			else
+				warn("[CooperGame] Refusing to teleport an unsaved profile while closing the party")
+				local livePlayer = candidate.player
+				if livePlayer and livePlayer.Parent == Players then
+					livePlayer:Kick("Your save could not be confirmed. Please rejoin after a moment so your progress stays safe.")
+				end
+			end
+		end
+		if returnSavedPartyToLobby then
+			returnSavedPartyToLobby(savedPlayers)
+		end
+	end)
+	return true
+end
+
+recoverHostWorldState = function(profile, player)
+	if not profile or profiles[player] ~= profile or not partyIsHost(player)
+		or not profile.loaded or profile.releasing or profile.leaseLost
+	then
+		return false
+	end
+	-- The world controller removes owner-bound crates/queues when a Player
+	-- leaves. Rebuild every still-paid pending route from durable host data, and
+	-- forget only the ephemeral dedupe flags tied to the old Player instance.
+	profile.deliveryQueued = {}
+	local bunkerState = secretBunkerSnapshot(profile)
+	profile.secretBunkerCompletionAnnounced = bunkerState.unlocked
+	if bunkerState.purchased then
 		task.delay(0.75, function()
-			if profiles[player] == profile and player.Parent == Players and profile.loaded and not profile.releasing then
+			if profiles[player] == profile and player.Parent == Players and profile.loaded
+				and not profile.releasing and partySession.state ~= "Closing"
+			then
 				requestSecretBunkerPresentation(
 					profile,
-					loadedBunkerState.unlocked and "ProfileLoadedUnlocked" or "ProfileLoadedResume"
+					bunkerState.unlocked and "ProfileLoadedUnlocked" or "ProfileLoadedResume"
 				)
 			end
 		end)
 	end
+
+	local function queueWhenPartyReady(kind, stage, extra)
+		task.spawn(function()
+			task.wait(3)
+			local deadline = os.clock() + partyConfig.HostReconnectGraceSeconds
+			repeat
+				if profiles[player] ~= profile or player.Parent ~= Players
+					or not profile.loaded or profile.releasing or partySession.state == "Closing"
+				then
+					return
+				end
+				if partyCanProgress() then
+					queueDelivery(profile, kind, stage, extra)
+					return
+				end
+				task.wait(0.35)
+			until os.clock() >= deadline
+			warn("[CooperGame] Paid " .. tostring(kind) .. " delivery remained paused waiting for party hydration")
+		end)
+	end
+
 	if profile.data.pendingPartStage == profile.data.machineStage + 1
 		and profile.data.pendingPartStage <= #Config.MachineStages
 	then
 		profile.partDeliveryStep = "WaitingDelivery"
-		task.delay(3, function()
-			if profiles[player] == profile and player.Parent == Players then
-				queueDelivery(profile, "MachinePart", profile.data.pendingPartStage)
-			end
-		end)
+		queueWhenPartyReady("MachinePart", profile.data.pendingPartStage)
 	elseif profile.data.pendingPartStage ~= 0 then
 		profile.data.pendingPartStage = 0
 		markDirty(profile)
 	end
 	if profile.data.boomboxPurchased and not profile.data.boomboxPlaced then
 		profile.boomboxDeliveryStep = "WaitingDelivery"
-		-- A corrupt/legacy save may contain both durable purchases. Preserve both
-		-- payments, finish the machine delivery first, then queue this one from the
-		-- MachinePartInstalled lifecycle branch.
 		if profile.data.pendingPartStage == 0 then
-			task.delay(3, function()
-				if profiles[player] == profile and player.Parent == Players
-					and profile.data.boomboxPurchased and not profile.data.boomboxPlaced
-				then
-					queueDelivery(profile, "Boombox", 0)
-				end
-			end)
+			queueWhenPartyReady("Boombox", 0)
 		end
 	end
 	if profile.data.pendingTaskUpgradeId ~= "" then
 		profile.taskUpgradeDeliveryStep = "WaitingDelivery"
-		-- Legacy/corrupt profiles can contain more than one already-paid pending
-		-- item. Never erase one: serialize machine, boombox, then task-upgrade
-		-- delivery so each purchase can still be installed safely.
 		if profile.data.pendingPartStage == 0
 			and (not profile.data.boomboxPurchased or profile.data.boomboxPlaced)
 		then
-			task.delay(3, function()
-				if profiles[player] == profile and player.Parent == Players
-					and profile.data.pendingTaskUpgradeId ~= ""
-				then
-					queueDelivery(profile, "TaskUpgrade", 0, profile.data.pendingTaskUpgradeId)
-				end
-			end)
+			queueWhenPartyReady("TaskUpgrade", 0, profile.data.pendingTaskUpgradeId)
 		end
 	end
 	if profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced then
 		profile.chemistryDeliveryStep = "WaitingDelivery"
-		-- Preserve the existing serialized order for impossible/legacy profiles
-		-- containing several already-paid pending items. Chemistry is the final
-		-- bunker-phase delivery after house equipment has been resolved.
 		if profile.data.pendingPartStage == 0
 			and (not profile.data.boomboxPurchased or profile.data.boomboxPlaced)
 			and profile.data.pendingTaskUpgradeId == ""
 		then
-			task.delay(3, function()
-				if profiles[player] == profile and player.Parent == Players
-					and profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced
-				then
-					queueDelivery(profile, "ChemistrySetup", 0)
-				end
+			queueWhenPartyReady("ChemistrySetup", 0)
+		end
+	end
+	for runId, record in pairs(profile.automationRuns or {}) do
+		local definition = record and automationById[record.automationUpgradeId] or nil
+		local remaining = record and tonumber(record.automationVisualRemaining) or 0
+		if definition and type(runId) == "string" and remaining and remaining > 0 then
+			task.spawn(function()
+				local deadline = os.clock() + partyConfig.HostReconnectGraceSeconds
+				repeat
+					if profiles[player] ~= profile or profile.automationRuns[runId] ~= record
+						or player.Parent ~= Players or profile.releasing or partySession.state == "Closing"
+					then
+						return
+					end
+					if partyCanProgress() then
+						local now = serverNow()
+						record.automationVisualLastTick = now
+						record.automationCompletesAt = now + remaining
+						runTaskAutomation:Fire(player, definition.id, {
+							runId = runId,
+							taskId = record.id,
+							markerName = record.markerName,
+							plushKind = record.plushKind,
+							duration = remaining,
+							installTarget = definition.installTarget,
+							modelName = definition.modelName,
+							previousStep = record.automationPreviousStep,
+							startedAt = now,
+							completesAt = now + remaining,
+							bankCycle = record.bankCycle,
+							bankReward = record.bankReward,
+						})
+						return
+					end
+					task.wait(0.25)
+				until os.clock() >= deadline
+				warn("[CooperGame] Paused " .. definition.id .. " visual could not resume before party hydration timed out")
 			end)
 		end
+	end
+	return true
+end
+
+local function rejectHouseAdmission(player, reason)
+	local message = tostring(reason or "That private party could not be verified.")
+	local lobbyPlaceId = tonumber(partyConfig.LobbyPlaceId) or 0
+	if not RunService:IsStudio() and lobbyPlaceId > 0 then
+		local ok = pcall(function()
+			TeleportService:TeleportAsync(lobbyPlaceId, { player })
+		end)
+		if ok then
+			-- TeleportAsync accepting the request is not proof that the client reached
+			-- the lobby. Do not let a failed transfer leave an unadmitted Player in the
+			-- reserved house indefinitely (which would also pause the present-member
+			-- reward barrier). A successful transfer removes the Player before this fires.
+			task.delay(10, function()
+				if player.Parent == Players and partySession.activePlayers[player.UserId] ~= player then
+					player:Kick(message)
+				end
+			end)
+			return
+		end
+	end
+	if player.Parent == Players then
+		player:Kick(message)
+	end
+end
+
+local function loadPlayer(player)
+	if shuttingDown then
+		return
+	end
+	local admitted, admissionReason = validateLaunchTicket(player)
+	if not admitted then
+		rejectHouseAdmission(player, admissionReason)
+		return
+	end
+	if partySession.state == "Closing" then
+		rejectHouseAdmission(player, "That private party is already closing.")
+		return
+	end
+	local occupiedSlot = partySession.activePlayers[player.UserId]
+	if occupiedSlot and occupiedSlot ~= player and occupiedSlot.Parent == Players then
+		rejectHouseAdmission(player, "That party member is already connected to this house.")
+		return
+	end
+	local retained = profilesByUserId[player.UserId]
+	if retained then
+		if player.UserId ~= partySession.hostUserId
+			or retained.detached ~= true
+			or retained.loaded ~= true
+			or retained.releasing == true
+			or retained.leaseLost == true
+			or (dataStore ~= nil and retained.leaseOwned ~= true)
+			or partySession.state ~= "HostGrace"
+			or serverNow() > partySession.hostGraceDeadline
+		then
+			rejectHouseAdmission(player, "That profile is already active in this party server.")
+			return
+		end
+		partySession.activePlayers[player.UserId] = player
+		setPartyPlayerAttributes(player)
+		player:SetAttribute("CooperGameProfileLoaded", false)
+		local previousPlayer = retained.player
+		if previousPlayer then
+			profiles[previousPlayer] = nil
+			bankInputNextAt[previousPlayer] = nil
+			requestNextAt[previousPlayer] = nil
+			snapshotNextAt[previousPlayer] = nil
+		end
+		retained.player = player
+		retained.detached = false
+		retained.releasing = false
+		retained.allowanceValue = nil
+		profiles[player] = retained
+		profilesByUserId[player.UserId] = retained
+		setupLeaderstats(player, retained)
+		attachCharacterWatch(player, retained)
+		local pausedFor = math.max(0, serverNow() - partySession.pausedAt)
+		if partySession.nextTaskAt < math.huge then
+			partySession.nextTaskAt += pausedFor
+		end
+		partySession.state = "Active"
+		partySession.hostGraceDeadline = 0
+		partySession.hostGraceUnixExpiresAt = 0
+		partySession.pausedAt = 0
+		syncSessionManifest("InHouse", 0)
+		player:SetAttribute("CooperGameSchemaVersion", Config.SchemaVersion)
+		player:SetAttribute("CooperGameProfileLoaded", true)
+		setPartyPlayerAttributes(player)
+		syncBoomboxPlacedAttribute(retained)
+		syncSecretBunkerAttributes(retained)
+		syncChemistrySetupAttributes(retained)
+		syncCandyDeliveryAttributes(retained)
+		recoverHostWorldState(retained, player)
+		feedback(nil, "HostReconnected", {
+			title = "HOST RECONNECTED",
+			text = "The host is back. Shared tasks and house progression have resumed.",
+		})
+		broadcastState()
+		return
+	end
+	partySession.activePlayers[player.UserId] = player
+	setPartyPlayerAttributes(player)
+	-- Bunker presentation uses this explicit hydration boundary to distinguish a
+	-- restored owned lab from a brand-new delivery/install transition.
+	player:SetAttribute("CooperGameProfileLoaded", false)
+	if not partySession.loadingWatchStarted then
+		partySession.loadingWatchStarted = true
+		task.delay(partyConfig.HostReconnectGraceSeconds, function()
+			if not shuttingDown and partySession.state == "Loading" and not hostProfile() then
+				closePartyAndReturn("The party host did not finish joining the house. Returning safely to the lobby.")
+			end
+		end)
+	end
+	local profile = {
+		player = player,
+		data = sanitizeData(nil),
+		loaded = false,
+		dirty = false,
+		saving = false,
+		releasing = false,
+		leaseToken = HttpService:GenerateGUID(false),
+		leaseOwned = false,
+		leaseLost = false,
+		leaseExpiresAt = 0,
+		revision = 0,
+		partDeliveryStep = nil,
+		boomboxDeliveryStep = nil,
+		taskUpgradeDeliveryStep = nil,
+		chemistryDeliveryStep = nil,
+		boomboxPlayback = nil,
+		boomboxReadyNoticeKey = nil,
+		bankHackSession = nil,
+		secretBunkerCompletionAnnounced = false,
+		automationRuns = {},
+		deliveryQueued = {},
+		detached = false,
+		closeRequested = false,
+	}
+	profiles[player] = profile
+	profilesByUserId[player.UserId] = profile
+	hydratingProfiles[profile] = true
+	if dataStore then
+		-- Loading and claiming are one atomic UpdateAsync transaction. GetAsync
+		-- followed by a later write would leave a window where two live servers
+		-- both believe they own the same progression record.
+		local acquired, result, leaseExpiresAt, lastFailure, liveConflict = acquireProfileLease(profile)
+		if not acquired then
+			hydratingProfiles[profile] = nil
+			warn("[CooperGame] Profile load failed closed for " .. player.Name .. ": " .. tostring(lastFailure))
+			if profiles[player] == profile then
+				profiles[player] = nil
+			end
+			if profilesByUserId[player.UserId] == profile then
+				profilesByUserId[player.UserId] = nil
+			end
+			if partySession.activePlayers[player.UserId] == player then
+				partySession.activePlayers[player.UserId] = nil
+			end
+			if player.UserId == partySession.hostUserId then
+				closePartyAndReturn("The host's saved profile could not be loaded. Returning the party safely to the lobby.")
+			end
+			if player.Parent == Players then
+				player:Kick(liveConflict
+					and "Your saved game is still closing in another server. Please wait a moment, then rejoin."
+					or "Your saved game data could not be loaded. Please rejoin so your progress stays safe.")
+			end
+			return
+		end
+		profile.leaseOwned = true
+		profile.leaseExpiresAt = leaseExpiresAt
+		if profiles[player] ~= profile or player.Parent ~= Players or shuttingDown
+			or profile.closeRequested or partySession.state == "Closing"
+		then
+			-- PlayerRemoving can run while UpdateAsync is yielding. Do not strand a
+			-- freshly claimed lease for its full crash-recovery duration.
+			releaseProfileLease(profile, RELEASE_SAVE_ATTEMPTS)
+			hydratingProfiles[profile] = nil
+			return
+		end
+		local sanitizedData, didNormalize = sanitizeData(result)
+		profile.data = sanitizedData
+		if didNormalize then
+			-- Rewrite every sanitizer repair, including malformed current-schema
+			-- entitlements, pending ids, and candy tokens. Version-only detection
+			-- left those repairs transient until another economy mutation occurred.
+			profile.dirty = true
+		end
+	end
+	hydratingProfiles[profile] = nil
+	if player.Parent ~= Players or profile.closeRequested or partySession.state == "Closing" then
+		if profile.leaseOwned then
+			releaseProfileLease(profile, RELEASE_SAVE_ATTEMPTS)
+		end
+		profiles[player] = nil
+		if profilesByUserId[player.UserId] == profile then
+			profilesByUserId[player.UserId] = nil
+		end
+		if partySession.activePlayers[player.UserId] == player then
+			partySession.activePlayers[player.UserId] = nil
+		end
+		if player.Parent == Players then
+			rejectHouseAdmission(player, "The private house session closed while your profile was loading.")
+		end
+		return
+	end
+	profile.loaded = true
+	attachCharacterWatch(player, profile)
+	if partyIsHost(player) then
+		partySession.taskCursor = profile.data.totalTasks % #Config.TaskOrder
+		partySession.completedTasks = profile.data.totalTasks
+		partySession.nextTaskAt = serverNow() + Config.TaskDirector.InitialDelay
+		partySession.state = "Active"
+		partySession.hostGraceDeadline = 0
+		partySession.hostGraceUnixExpiresAt = 0
+		syncSessionManifest("InHouse", 0)
+	end
+	setupLeaderstats(player, profile)
+	player:SetAttribute("CooperGameSchemaVersion", Config.SchemaVersion)
+	local loadedWorldProfile = hostProfile()
+	player:SetAttribute("MachineStage", loadedWorldProfile and loadedWorldProfile.data.machineStage or 0)
+	syncBoomboxPlacedAttribute(profile)
+	local loadedBunkerState = secretBunkerSnapshot(loadedWorldProfile)
+	profile.secretBunkerCompletionAnnounced = partyIsHost(player) and loadedBunkerState.unlocked or false
+	syncSecretBunkerAttributes(profile)
+	syncChemistrySetupAttributes(profile)
+	syncCandyDeliveryAttributes(profile)
+	if partyIsHost(player) then
+		recoverHostWorldState(profile, player)
 	end
 	if profile.data.candyDeliveryActive then
 		task.delay(2, function()
@@ -3777,7 +4730,11 @@ local function loadPlayer(player)
 		end)
 	end
 	player:SetAttribute("CooperGameProfileLoaded", true)
-	feedback(player, "ProfileLoaded", { text = "Allowance, Time Machine, and bunker progress loaded." })
+	feedback(player, "ProfileLoaded", {
+		text = partyIsHost(player)
+			and "Your allowance and host-owned Cooper house progress loaded."
+			or "Your allowance and personal statistics loaded. This party uses the host's Cooper house.",
+	})
 	broadcastState()
 	if profile.dirty then
 		-- Canonical migrations and current-schema repairs should not wait for the
@@ -3790,8 +4747,180 @@ Players.PlayerAdded:Connect(function(player)
 	task.spawn(loadPlayer, player)
 end)
 
+local function resetSharedActorForDeparture(userId)
+	local record = partySession.task
+	if not record or tonumber(record.carrierUserId) ~= userId then
+		return
+	end
+	record.carrierUserId = nil
+	if record.id == "GeorgeBeer" then
+		record.step = "Order"
+	elseif record.id == "MaryTrash" then
+		record.step = "Pickup"
+	elseif record.id == "MissyPlush" then
+		record.step = "Search"
+	end
+	feedback(nil, "TaskProgress", {
+		text = "The task item was safely reset so another party member can continue.",
+	})
+end
+
+local function clearLeavingPlayerAttributes(player)
+	for _, attributeName in ipairs({
+		"CooperBoomboxPlaced",
+		"CooperSecretBunkerId",
+		"CooperSecretBunkerPurchased",
+		"CooperSecretBunkerReadyAt",
+		"CooperSecretBunkerUnlocked",
+		"CooperSecretBunkerStatus",
+		"CooperChemistrySetupPurchased",
+		"CooperChemistrySetupPlaced",
+		"CooperChemistrySetupStatus",
+		"CooperGameProfileLoaded",
+		"CooperPartyMember",
+		"CooperPartySessionId",
+		"CooperPartyHostUserId",
+		"CooperPartyIsHost",
+		"CooperPartyState",
+	}) do
+		player:SetAttribute(attributeName, nil)
+	end
+end
+
+returnSavedPartyToLobby = function(playersToReturn)
+	if #playersToReturn == 0 then
+		return
+	end
+	if RunService:IsStudio() then
+		for _, player in ipairs(playersToReturn) do
+			if player.Parent == Players then
+				player:SetAttribute("CooperReturnToLobbyRequested", true)
+			end
+		end
+		return
+	end
+	local lobbyPlaceId = tonumber(partyConfig.LobbyPlaceId) or 0
+	if lobbyPlaceId <= 0 then
+		for _, player in ipairs(playersToReturn) do
+			if player.Parent == Players then
+				player:Kick("The party host did not reconnect. Please rejoin through the lobby.")
+			end
+		end
+		return
+	end
+	local ok, failure = pcall(function()
+		TeleportService:TeleportAsync(lobbyPlaceId, playersToReturn)
+	end)
+	if not ok then
+		warn("[CooperGame] Party return teleport failed: " .. tostring(failure))
+		for _, player in ipairs(playersToReturn) do
+			if player.Parent == Players then
+				player:Kick("Your progress was saved, but the lobby transfer failed. Please rejoin.")
+			end
+		end
+	end
+end
+
+-- M1_HOST_RECONNECT_GRACE_CONTRACT
+local function beginHostReconnectGrace(profile, leavingPlayer)
+	partySession.state = "HostGrace"
+	partySession.hostGraceSerial += 1
+	local graceSerial = partySession.hostGraceSerial
+	partySession.pausedAt = serverNow()
+	partySession.hostGraceDeadline = partySession.pausedAt + partyConfig.HostReconnectGraceSeconds
+	partySession.hostGraceUnixExpiresAt = unixNow() + partyConfig.HostReconnectGraceSeconds
+	profile.detached = true
+	profile.allowanceValue = nil
+	for _, activeProfile in ipairs(presentProfiles()) do
+		if activeProfile.bankHackSession then
+			cancelBankHackSession(
+				activeProfile,
+				"The bank connection paused because the party host disconnected.",
+				true
+			)
+		end
+	end
+	saveProfile(leavingPlayer, false)
+	syncSessionManifest("HostGrace", partySession.hostGraceUnixExpiresAt)
+	feedback(nil, "HostReconnectGrace", {
+		title = "WAITING FOR HOST",
+		seconds = partyConfig.HostReconnectGraceSeconds,
+		deadline = partySession.hostGraceDeadline,
+		text = "Shared progression is paused for 60 seconds while the host reconnects.",
+	})
+	broadcastState()
+	task.spawn(function()
+		-- Poll the authoritative deadline rather than trusting one delayed callback.
+		-- This remains correct across an early scheduler wake, a long server stall, or
+		-- a host rejoin that invalidates this grace serial at the exact boundary.
+		while not shuttingDown and partySession.state == "HostGrace"
+			and partySession.hostGraceSerial == graceSerial
+		do
+			local remaining = partySession.hostGraceDeadline - serverNow()
+			if remaining <= 0 then
+				break
+			end
+			task.wait(math.min(1, remaining))
+		end
+		if shuttingDown or partySession.state ~= "HostGrace"
+			or partySession.hostGraceSerial ~= graceSerial
+			or serverNow() < partySession.hostGraceDeadline
+		then
+			return
+		end
+		closePartyAndReturn("The host did not reconnect within 60 seconds. Your progress was saved.")
+	end)
+end
+
+local function retainFailedProfileRelease(player, profile)
+	-- A transient DataStore failure during PlayerRemoving must not orphan a dirty
+	-- profile and its still-owned lease. Keep the old Player instance as a private
+	-- save key and retry until the write/release succeeds or another server proves
+	-- it owns the lease. profilesByUserId is cleared by the caller, so a genuine
+	-- rejoin may wait on (then acquire) the lease without being mistaken for a
+	-- duplicate live party member.
+	task.spawn(function()
+		local retryNumber = 0
+		while profiles[player] == profile and profile.leaseLost ~= true do
+			retryNumber += 1
+			task.wait(math.min(2 + retryNumber, 10))
+			if profiles[player] ~= profile then
+				return
+			end
+			if saveProfile(player, true) then
+				if profiles[player] == profile then
+					profiles[player] = nil
+				end
+				return
+			end
+			if dataStore ~= nil and profile.leaseOwned ~= true then
+				break
+			end
+		end
+		if profiles[player] == profile then
+			profiles[player] = nil
+		end
+		warn("[CooperGame] Stopped retrying a departed profile after its writable lease was lost for "
+			.. tostring(player.Name))
+	end)
+end
+
 Players.PlayerRemoving:Connect(function(player)
 	local profile = profiles[player]
+	local wasActivePartyPlayer = partySession.activePlayers[player.UserId] == player
+	local wasHost = player.UserId == partySession.hostUserId
+	if wasActivePartyPlayer then
+		partySession.activePlayers[player.UserId] = nil
+	end
+	-- A rejected duplicate/forged join shares a UserId with the real member but
+	-- never owned this slot or profile. Its teardown must not disturb the party.
+	if not profile and not wasActivePartyPlayer then
+		clearLeavingPlayerAttributes(player)
+		requestNextAt[player] = nil
+		snapshotNextAt[player] = nil
+		bankInputNextAt[player] = nil
+		return
+	end
 	if profile and profile.characterAddedConnection then
 		profile.characterAddedConnection:Disconnect()
 		profile.characterAddedConnection = nil
@@ -3804,22 +4933,48 @@ Players.PlayerRemoving:Connect(function(player)
 	elseif boomboxPlaybackOwner == player then
 		boomboxPlaybackOwner = nil
 	end
-	player:SetAttribute("CooperBoomboxPlaced", nil)
-	player:SetAttribute("CooperSecretBunkerId", nil)
-	player:SetAttribute("CooperSecretBunkerPurchased", nil)
-	player:SetAttribute("CooperSecretBunkerReadyAt", nil)
-	player:SetAttribute("CooperSecretBunkerUnlocked", nil)
-	player:SetAttribute("CooperSecretBunkerStatus", nil)
-	player:SetAttribute("CooperGameProfileLoaded", nil)
+	resetSharedActorForDeparture(player.UserId)
+	clearLeavingPlayerAttributes(player)
+	local hasRemainingPartyMember = next(partySession.activePlayers) ~= nil
+	local healthyRetainedHost = profile and profile.loaded and not profile.releasing
+		and not profile.leaseLost and (dataStore == nil or profile.leaseOwned == true)
+	if healthyRetainedHost and wasHost and hasRemainingPartyMember and not shuttingDown then
+		beginHostReconnectGrace(profile, player)
+		requestNextAt[player] = nil
+		snapshotNextAt[player] = nil
+		bankInputNextAt[player] = nil
+		return
+	end
+	if wasHost and hasRemainingPartyMember and not shuttingDown then
+		closePartyAndReturn("The host disconnected before their save profile was ready. Returning safely to the lobby.")
+	end
+	if wasHost and not hasRemainingPartyMember and not shuttingDown then
+		partySession.state = "Closing"
+		partySession.hostGraceDeadline = 0
+		partySession.hostGraceUnixExpiresAt = 0
+		syncSessionManifest("Closed", 0)
+	elseif not hasRemainingPartyMember and partySession.state == "HostGrace" and not shuttingDown then
+		closePartyAndReturn("Nobody remains in the house party. Closing the saved session.")
+	end
 	local saved = saveProfile(player, true)
 	if not saved and profiles[player] then
 		warn("[CooperGame] Exhausted release persistence attempts for " .. player.Name
-			.. "; the latest revision or lease cleanup may still be pending")
+			.. "; retaining the dirty profile for background save/release retries")
 	end
-	profiles[player] = nil
+	if profile and profilesByUserId[player.UserId] == profile then
+		profilesByUserId[player.UserId] = nil
+	end
+	if saved then
+		profiles[player] = nil
+	elseif profile and profiles[player] == profile then
+		retainFailedProfileRelease(player, profile)
+	end
 	requestNextAt[player] = nil
 	snapshotNextAt[player] = nil
 	bankInputNextAt[player] = nil
+	if not shuttingDown then
+		broadcastState()
+	end
 end)
 
 for _, player in ipairs(Players:GetPlayers()) do
@@ -3828,6 +4983,12 @@ end
 
 game:BindToClose(function()
 	shuttingDown = true
+	if partySession.validated and not partySession.studioSynthetic then
+		partySession.state = "Closing"
+		partySession.hostGraceDeadline = 0
+		partySession.hostGraceUnixExpiresAt = 0
+		syncSessionManifest("Closed", 0)
+	end
 	local pendingSaves = 0
 	for player, profile in pairs(profiles) do
 		if profile.loaded or profile.leaseOwned then
@@ -3863,27 +5024,30 @@ task.spawn(function()
 	local nextAutoSave = os.clock() + Config.AutoSaveSeconds
 	while script.Parent and not shuttingDown do
 		local currentTime = serverNow()
-		for _, profile in pairs(profiles) do
-			if profile.loaded and not profile.task and currentTime >= profile.nextTaskAt then
-				startNextTask(profile)
+		local sharedHostProfile = hostProfile()
+		if partyCanProgress() and sharedHostProfile then
+			if not partySession.task and currentTime >= partySession.nextTaskAt then
+				startNextTask(sharedHostProfile)
 			end
-			if profile.loaded then
-				completeSecretBunkerIfReady(profile)
-			end
-			if profile.loaded
-				and not profile.boomboxPlayback
-				and profile.data.boomboxPurchased
-				and profile.data.boomboxPlaced
-				and profile.data.boomboxNextPlayAt > 0
-				and unixNow() >= profile.data.boomboxNextPlayAt
+			completeSecretBunkerIfReady(sharedHostProfile)
+			if not sharedHostProfile.boomboxPlayback
+				and sharedHostProfile.data.boomboxPurchased
+				and sharedHostProfile.data.boomboxPlaced
+				and sharedHostProfile.data.boomboxNextPlayAt > 0
+				and unixNow() >= sharedHostProfile.data.boomboxNextPlayAt
 			then
-				announceBoomboxReady(profile, profile.data.boomboxAutoplayPurchased == true)
+				announceBoomboxReady(
+					sharedHostProfile,
+					sharedHostProfile.data.boomboxAutoplayPurchased == true
+				)
 			end
+		end
+		for _, profile in ipairs(presentProfiles()) do
 			local bankSession = profile.bankHackSession
-			if bankSession and (profile.task ~= bankSession.record or not validComputerSession(profile.player)) then
+			if bankSession and (partySession.task ~= bankSession.record or not validComputerSession(profile.player)) then
 				cancelBankHackSession(
 					profile,
-					profile.task ~= bankSession.record
+					partySession.task ~= bankSession.record
 						and "The active task changed, so the bank connection was closed."
 						or "The bank connection was lost when you left the computer.",
 					true
@@ -3923,6 +5087,25 @@ task.spawn(function()
 			end
 		end
 		task.wait(0.35)
+	end
+end)
+
+task.spawn(function()
+	local heartbeatSeconds = math.clamp(
+		tonumber(partyConfig.SessionHeartbeatSeconds) or 120,
+		30,
+		math.max(30, math.floor(partyConfig.SessionLifetimeSeconds / 2))
+	)
+	while script.Parent and not shuttingDown do
+		task.wait(heartbeatSeconds)
+		if partySession.validated and not partySession.studioSynthetic
+			and (partySession.state == "Active" or partySession.state == "HostGrace")
+		then
+			syncSessionManifest(
+				partySession.state == "HostGrace" and "HostGrace" or "InHouse",
+				partySession.state == "HostGrace" and partySession.hostGraceUnixExpiresAt or 0
+			)
+		end
 	end
 end)
 

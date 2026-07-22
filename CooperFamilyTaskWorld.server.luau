@@ -10,6 +10,21 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
+-- CooperMovement is the sole owner of Humanoid.WalkSpeed in Milestone 1.
+-- Carried deliveries compose a named multiplier through its server API.
+local movementAPI = ServerScriptService:WaitForChild("CooperMovementAPI", 30)
+local movementSetSpeedMultiplier = movementAPI and movementAPI:WaitForChild("SetSpeedMultiplier", 10)
+local movementReleaseSource = movementAPI and movementAPI:WaitForChild("ReleaseSource", 10)
+assert(
+	movementSetSpeedMultiplier and movementSetSpeedMultiplier:IsA("BindableFunction"),
+	"CooperMovementAPI.SetSpeedMultiplier is missing"
+)
+assert(
+	movementReleaseSource and movementReleaseSource:IsA("BindableEvent"),
+	"CooperMovementAPI.ReleaseSource is missing"
+)
+local CARRY_MOVEMENT_SOURCE = "DeliveryCarry"
+
 local ROOT_TIMEOUT = 30
 local environment = workspace:WaitForChild("CooperHouseEnvironment", ROOT_TIMEOUT)
 local gameRoot = ReplicatedStorage:WaitForChild("CooperGame", ROOT_TIMEOUT)
@@ -248,13 +263,7 @@ local function clearCarryPenalty(player, expectedTool)
 	if active.ancestryConnection then
 		active.ancestryConnection:Disconnect()
 	end
-	local humanoid = active.humanoid
-	-- Restore only when our own carried-item speed is still active.
-	if humanoid and humanoid.Parent
-		and math.abs(humanoid.WalkSpeed - active.appliedSpeed) < 0.05
-	then
-		humanoid.WalkSpeed = active.baseSpeed
-	end
+	movementReleaseSource:Fire(player, CARRY_MOVEMENT_SOURCE)
 end
 
 local function attachCarryPenalty(player, tool, kind)
@@ -264,20 +273,22 @@ local function attachCarryPenalty(player, tool, kind)
 	if not humanoid or not tool or tool.Parent ~= character then
 		return
 	end
-	local baseSpeed = math.max(0, finiteNumber(humanoid.WalkSpeed, 16))
 	local factor = carrySpeedFactor(kind)
-	local appliedSpeed = baseSpeed * factor
+	local ok, accepted = pcall(function()
+		return movementSetSpeedMultiplier:Invoke(player, CARRY_MOVEMENT_SOURCE, factor)
+	end)
+	if not ok or accepted ~= true then
+		warn("[CooperTaskWorld] Could not apply the delivery carry movement multiplier")
+		return
+	end
 	local active = {
 		tool = tool,
-		humanoid = humanoid,
 		kind = kind,
-		baseSpeed = baseSpeed,
-		appliedSpeed = appliedSpeed,
+		factor = factor,
 	}
 	activeCarryByPlayer[player] = active
 	tool:SetAttribute("CooperCarryKind", kind)
 	tool:SetAttribute("CooperCarrySpeedFactor", factor)
-	humanoid.WalkSpeed = appliedSpeed
 	active.ancestryConnection = tool.AncestryChanged:Connect(function()
 		task.defer(function()
 			if activeCarryByPlayer[player] == active
@@ -381,6 +392,11 @@ end
 
 local function activeTask(player, id, step)
 	local current = snapshot(player)
+	if not current or current.loaded ~= true or not current.party
+		or current.party.state ~= "Active"
+	then
+		return nil
+	end
 	local taskData = current and current.task
 	if not taskData or taskData.id ~= id or taskData.automated == true then
 		return nil
@@ -3581,7 +3597,8 @@ task.spawn(function()
 				if now >= (autoplayRetryAt[candidate] or 0) then
 					local current = snapshot(candidate)
 					local boombox = current and current.boombox
-					if boombox
+					local party = current and current.party
+					if party and party.isHost == true and boombox
 						and boombox.placed == true
 						and boombox.autoplayPurchased == true
 						and boombox.canPlay == true
@@ -3837,6 +3854,9 @@ end
 
 local function candyContract(player)
 	local current = snapshot(player)
+	if not current or not current.party or current.party.state ~= "Active" then
+		return nil
+	end
 	local contract = current and current.candyDelivery
 	return type(contract) == "table" and contract or nil
 end
@@ -4455,41 +4475,42 @@ end
 local function requestIsStillValid(player, request)
 	local current = snapshot(player)
 	if not current then
-		return false
+		return false, nil
 	end
+	local valid = false
 	if request.kind == "Beer" then
-		return current.task ~= nil
+		valid = current.task ~= nil
 			and current.task.id == "GeorgeBeer"
 			and current.task.step == "WaitingDelivery"
 	elseif request.kind == "MachinePart" then
-		return current.delivery ~= nil
+		valid = current.delivery ~= nil
 			and current.delivery.kind == "MachinePart"
 			and tonumber(current.delivery.stage) == tonumber(request.stage)
 			and (current.delivery.status == "WaitingDelivery"
 				or current.delivery.status == "Collect"
 				or current.delivery.status == "Install")
 	elseif request.kind == "Boombox" then
-		return current.delivery ~= nil
+		valid = current.delivery ~= nil
 			and current.delivery.kind == "Boombox"
 			and (current.delivery.status == "WaitingDelivery"
 				or current.delivery.status == "Collect"
 				or current.delivery.status == "Setup"
 				or current.delivery.status == "Install")
 	elseif request.kind == "TaskUpgrade" then
-		return current.delivery ~= nil
+		valid = current.delivery ~= nil
 			and current.delivery.kind == "TaskUpgrade"
 			and current.delivery.upgradeId == request.upgradeId
 			and (current.delivery.status == "WaitingDelivery"
 				or current.delivery.status == "Collect"
 				or current.delivery.status == "Install")
 	elseif request.kind == "ChemistrySetup" then
-		return current.delivery ~= nil
+		valid = current.delivery ~= nil
 			and current.delivery.kind == "ChemistrySetup"
 			and (current.delivery.status == "WaitingDelivery"
 				or current.delivery.status == "Collect"
 				or current.delivery.status == "Install")
 	end
-	return false
+	return valid, current
 end
 
 local function spawnDeliveryCrate(player, request)
@@ -4615,7 +4636,14 @@ local function spawnDeliveryCrate(player, request)
 	local spawnedMetadata = if isTaskUpgrade
 		then { upgradeId = upgradeId }
 		else { stage = stage }
-	report(spawnedEvent, player, spawnedMetadata)
+	-- A paid delivery becomes a world object only after the profile accepts the
+	-- matching transition. This prevents a host-grace pause or closing session
+	-- from leaving an orphaned, deduplicated crate in the driveway.
+	local accepted = invokeFamily("ReportAction", player, spawnedEvent, spawnedMetadata)
+	if accepted ~= true then
+		clearDeliveryRecord(record, true)
+		return nil
+	end
 	task.defer(refreshCompatibilityTarget, player)
 	return tool
 end
@@ -4651,7 +4679,17 @@ runDeliveryQueue = function()
 				deliveryInFlightKeys[entry.key] = true
 
 				local itemOk, itemFailure = xpcall(function()
-					if not player or player.Parent ~= Players or not requestIsStillValid(player, entry.request) then
+					if not player or player.Parent ~= Players then
+						return
+					end
+					local requestValid, current = requestIsStillValid(player, entry.request)
+					if not requestValid then
+						return
+					end
+					if not current.party or current.party.state ~= "Active" then
+						table.insert(deliveryQueue, entry)
+						entryRequeued = true
+						retryDelay = math.max(retryDelay, 0.5)
 						return
 					end
 					local reservedSpawnOffset, reservedSlotLane = allocateDeliverySpawnOffset(
@@ -4679,8 +4717,17 @@ runDeliveryQueue = function()
 					truck:PivotTo(start)
 					animateTruck(start, approach, 4.6)
 					animateTruck(approach, stop, 1.8)
-					if player.Parent == Players then
+					requestValid, current = requestIsStillValid(player, entry.request)
+					if requestValid and current.party and current.party.state == "Active"
+						and player.Parent == Players
+					then
 						spawnedCrate = spawnDeliveryCrate(player, entry.request)
+					elseif requestValid and player.Parent == Players then
+						-- The host disconnected while the truck was approaching. Keep the
+						-- paid request queued and leave without exposing an unusable crate.
+						table.insert(deliveryQueue, entry)
+						entryRequeued = true
+						retryDelay = math.max(retryDelay, 0.5)
 					end
 					-- Stay parked long enough for the player to see and grab the crate.
 					task.wait(spawnedCrate and 4.5 or 1.5)
@@ -4802,7 +4849,8 @@ enqueueDelivery = function(player, request)
 		stage = stage,
 		upgradeId = if kind == "TaskUpgrade" then upgradeId else nil,
 	}
-	if not requestIsStillValid(player, sanitized) then
+	local requestValid, current = requestIsStillValid(player, sanitized)
+	if not requestValid or not current.party or current.party.state ~= "Active" then
 		return false
 	end
 	local key = deliveryKey(player.UserId, kind)
@@ -5368,6 +5416,9 @@ end)
 
 local function createTrashBag(player)
 	local backpack = player:FindFirstChildOfClass("Backpack")
+	if not backpack then
+		return nil
+	end
 	if backpack then
 		for _, child in ipairs(backpack:GetChildren()) do
 			if child:IsA("Tool") and child:GetAttribute("FamilyTrashBag") == true then
@@ -5461,20 +5512,25 @@ ProximityPromptService.PromptTriggered:Connect(function(prompt, player)
 			and serverNow() - session.startedAt + DISH_HOLD_TOLERANCE >= prompt.HoldDuration
 		dishHoldSessions[player] = nil
 		if heldLongEnough and activeTask(player, "MaryDishes") then
-			report("DishesCompleted", player)
+			invokeFamily("ReportAction", player, "DishesCompleted", {})
 		end
 	elseif action == "TrashPickup" then
 		if activeTask(player, "MaryTrash", "Pickup") then
-			createTrashBag(player)
-			report("TrashPicked", player)
+			local bag = createTrashBag(player)
+			if bag and invokeFamily("ReportAction", player, "TrashPicked", {}) ~= true then
+				clearCarryPenalty(player, bag)
+				bag:Destroy()
+			end
 		end
 	elseif action == "TrashDrop" then
 		local bag = heldTool(player, function(tool)
 			return tool:GetAttribute("FamilyTrashBag") == true and tool:GetAttribute("OwnerUserId") == player.UserId
 		end)
 		if bag and activeTask(player, "MaryTrash", "Deliver") then
-			bag:Destroy()
-			report("TrashDelivered", player)
+			if invokeFamily("ReportAction", player, "TrashDelivered", {}) == true then
+				clearCarryPenalty(player, bag)
+				bag:Destroy()
+			end
 		end
 	elseif action == "MissyReturn" then
 		local taskData = activeTask(player, "MissyPlush", "Return")
@@ -5496,12 +5552,20 @@ ProximityPromptService.PromptTriggered:Connect(function(prompt, player)
 				and typeof(homeCFrame) == "CFrame"
 				and homeHandle and homeHandle:IsA("BasePart")
 			then
-				homeHandle.Anchored = true
-				homeHandle.AssemblyLinearVelocity = Vector3.zero
-				homeHandle.AssemblyAngularVelocity = Vector3.zero
-				homeToy:PivotTo(homeCFrame)
-				plush:Destroy()
-				report("MissyPlushReturned", player, { plushKind = taskData.plushKind })
+				local accepted = invokeFamily(
+					"ReportAction",
+					player,
+					"MissyPlushReturned",
+					{ plushKind = taskData.plushKind }
+				)
+				if accepted == true then
+					clearCarryPenalty(player, plush)
+					homeHandle.Anchored = true
+					homeHandle.AssemblyLinearVelocity = Vector3.zero
+					homeHandle.AssemblyAngularVelocity = Vector3.zero
+					homeToy:PivotTo(homeCFrame)
+					plush:Destroy()
+				end
 			end
 		end
 	elseif action == "DeliveryPickup" then
@@ -5515,6 +5579,9 @@ ProximityPromptService.PromptTriggered:Connect(function(prompt, player)
 		end
 		local kind = tool:GetAttribute("DeliveryKind")
 		local current = snapshot(player)
+		if not current or not current.party or current.party.state ~= "Active" then
+			return
+		end
 		if kind == "Beer" then
 			if deliveryRecord.kind ~= "Beer"
 				or not current or not current.task or current.task.id ~= "GeorgeBeer" or current.task.step ~= "Collect"
@@ -5561,6 +5628,8 @@ ProximityPromptService.PromptTriggered:Connect(function(prompt, player)
 		else
 			return
 		end
+		local handle = tool:FindFirstChild("Handle")
+		local previousCFrame = handle and handle:IsA("BasePart") and handle.CFrame or nil
 		if giveTool(player, tool) then
 			deliveryRecord.status = "Carried"
 			local pickedEvent = if kind == "Beer"
@@ -5575,8 +5644,30 @@ ProximityPromptService.PromptTriggered:Connect(function(prompt, player)
 			local pickedMetadata = if kind == "TaskUpgrade"
 				then { upgradeId = deliveryRecord.upgradeId }
 				else { stage = deliveryRecord.stage }
-			report(pickedEvent, player, pickedMetadata)
-			task.defer(refreshCompatibilityTarget, player)
+			local accepted = invokeFamily("ReportAction", player, pickedEvent, pickedMetadata)
+			if accepted == true then
+				task.defer(refreshCompatibilityTarget, player)
+			else
+				-- The party may have paused between validation and commit. Restore
+				-- the exact same paid crate to the driveway for a later retry.
+				clearCarryPenalty(player, tool)
+				deliveryRecord.status = "World"
+				local restoreHandle = tool:FindFirstChild("Handle")
+				if restoreHandle and restoreHandle:IsA("BasePart") then
+					restoreHandle.Anchored = true
+					restoreHandle.CanCollide = true
+					restoreHandle.Massless = false
+					if previousCFrame then
+						restoreHandle.CFrame = previousCFrame
+					end
+					local restorePrompt = restoreHandle:FindFirstChildOfClass("ProximityPrompt")
+					if restorePrompt then
+						restorePrompt.Enabled = true
+					end
+				end
+				tool.Parent = deliveryWorld
+				task.defer(refreshCompatibilityTarget, player)
+			end
 		end
 	elseif action == "BeerDrop" then
 		local tool = heldTool(player, function(candidate)
@@ -5586,16 +5677,16 @@ ProximityPromptService.PromptTriggered:Connect(function(prompt, player)
 		end)
 		if tool and activeTask(player, "GeorgeBeer", "Deliver") then
 			local fridge = environment:FindFirstChild("WhiteHotpointRefrigerator", true)
-			if fridge then
+			if fridge and invokeFamily("ReportAction", player, "BeerDelivered", {}) == true then
 				local capacity = 12
 				local count = math.max(0, math.floor(tonumber(fridge:GetAttribute("CooperBeerCount")) or 0))
 				fridge:SetAttribute("CooperBeerCapacity", capacity)
 					fridge:SetAttribute("CooperBeerCount", math.min(capacity, count + 6))
+				clearCarryPenalty(player, tool)
+				clearDeliveryRecord(recordForTool(tool), false)
+				tool:Destroy()
+				task.defer(refreshCompatibilityTarget, player)
 			end
-			clearDeliveryRecord(recordForTool(tool), false)
-			tool:Destroy()
-			report("BeerDelivered", player)
-			task.defer(refreshCompatibilityTarget, player)
 		end
 	elseif action == "MachineInstall" then
 		local tool = heldTool(player, function(candidate)

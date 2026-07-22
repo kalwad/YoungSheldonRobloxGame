@@ -10,6 +10,19 @@ local TweenService = game:GetService("TweenService")
 local HOUSE_PATH_TIMEOUT = 20
 local CHILD_TIMEOUT = 8
 
+-- Milestone 1 owns Humanoid.WalkSpeed in one server-authoritative controller.
+-- Timed fixture interactions compose a named movement lock through that API.
+local movementAPI = ServerScriptService:WaitForChild("CooperMovementAPI", 30)
+local movementSetLock = movementAPI and movementAPI:WaitForChild("SetLock", 10)
+assert(movementSetLock and movementSetLock:IsA("BindableFunction"), "CooperMovementAPI.SetLock is missing")
+
+local function setTimedActionMovementLock(player, locked)
+	local ok, accepted = pcall(function()
+		return movementSetLock:Invoke(player, "InteriorTimedAction", locked == true)
+	end)
+	return ok and accepted == true
+end
+
 local function waitFor(parent, name, className, timeout)
 	if not parent then
 		return nil
@@ -1209,10 +1222,13 @@ local function restoreActionCharacter(state)
 		rootPart.Anchored = state.rootWasAnchored
 	end
 	if humanoid and humanoid.Parent then
-		humanoid.WalkSpeed = state.walkSpeed
 		humanoid.AutoRotate = state.autoRotate
 		humanoid.JumpPower = state.jumpPower
 		humanoid.JumpHeight = state.jumpHeight
+	end
+	if state.movementLocked then
+		setTimedActionMovementLock(state.player, false)
+		state.movementLocked = false
 	end
 end
 
@@ -1277,7 +1293,6 @@ local function startTimedAction(player, key, fixtureKey, label, duration, anchor
 		anchor = anchor,
 		endsAt = now() + duration,
 		rootWasAnchored = rootPart.Anchored,
-		walkSpeed = humanoid.WalkSpeed,
 		autoRotate = humanoid.AutoRotate,
 		jumpPower = humanoid.JumpPower,
 		jumpHeight = humanoid.JumpHeight,
@@ -1287,7 +1302,11 @@ local function startTimedAction(player, key, fixtureKey, label, duration, anchor
 	fixtureOwners[fixtureKey] = state
 
 	humanoid.Sit = false
-	humanoid.WalkSpeed = 0
+	if not setTimedActionMovementLock(player, true) then
+		finishTimedAction(player, state, false, "That interaction could not safely lock movement.")
+		return false
+	end
+	state.movementLocked = true
 	humanoid.AutoRotate = false
 	humanoid.JumpPower = 0
 	humanoid.JumpHeight = 0
@@ -1825,6 +1844,7 @@ local function terminalResponse(player, raw)
 		return
 	elseif verb == "EXIT" then
 		terminalSessions[player] = nil
+		player:SetAttribute("CooperComputerSessionUntil", nil)
 		clientEvent:FireClient(player, "TerminalClose", {})
 		return
 	elseif verb == "DATE" then
@@ -2001,6 +2021,7 @@ local function beginCubeSession(player, container)
 	end
 	closeCubeSession(player, false)
 	terminalSessions[player] = nil
+	player:SetAttribute("CooperComputerSessionUntil", nil)
 	if player.Parent == Players then
 		clientEvent:FireClient(player, "TerminalClose", {})
 	end
@@ -2298,6 +2319,7 @@ requestEvent.OnServerEvent:Connect(function(player, action, payload)
 		end
 	elseif action == "TerminalClose" then
 		terminalSessions[player] = nil
+		player:SetAttribute("CooperComputerSessionUntil", nil)
 	elseif action == "CubeMove" then
 		handleCubeMove(player, payload)
 	elseif action == "CubeReshuffle" then
@@ -2405,6 +2427,7 @@ task.spawn(function()
 			if player.Parent ~= Players or currentTime - openedAt > 300 or not playerIsNear(player, computerAnchor, 22) then
 				terminalSessions[player] = nil
 				if player.Parent == Players then
+					player:SetAttribute("CooperComputerSessionUntil", nil)
 					clientEvent:FireClient(player, "TerminalClose", {})
 				end
 			end
