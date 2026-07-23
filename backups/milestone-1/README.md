@@ -70,6 +70,21 @@ Neither export was published to Roblox.
 | `2026-07-22_19-20-37_EDT_pre-launch-repair-lobby.rbxm` | Pre-repair lobby environment + active lobby sources/config | 44146 | `84dba61ee9b8e4913b60ca35438a2de3fc9413a2eb1ddbcc511d08de6457bad8` |
 | `2026-07-22_19-38-16_EDT_milestone-1-launch-repair-verified-lobby.rbxm` | Repaired Ready/Start + scoped 1980s lobby/UI | 58895 | `78bceda4afb4af2b4b61bad0936eb23b1b7520f89a5695b0901d275d20b23d7e` |
 
+### Verified Studio lobby-to-house handoff — 20:39:16 EDT
+
+This local-only export adds the production-guarded, in-place Studio house
+preview to the repaired lobby. It contains the inert verified house package,
+bridge, lobby runtime/client/protocol, and lobby environment. The exact
+Create Party → Ready → Start path opened the normal house runtime; 63 edit and
+108 runtime audit checks passed, both previously truncated client sources were
+replaced, all required house RemoteEvents were present before controllers
+started, and movement was confirmed after the ordinary first-play tutorial.
+Nothing in this export was published or used to overwrite another place.
+
+| File | Scope | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `2026-07-22_20-39-16_EDT_studio-house-launch-verified.rbxm` | Studio-only house package + bridge + repaired lobby sources/environment | 627701 | `4743727549aada2b2669b03f8d74ae23c42bab10708f3fc34302e05cb0f24a62` |
+
 All original seven verified hashes and both closure hashes above were re-read from the stored files with
 SHA-256. The house was published before the final lobby publication; no house
 version number or publication timestamp was supplied for this manifest.

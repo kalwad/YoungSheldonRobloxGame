@@ -20,8 +20,9 @@ local Config = {
 	RequestCooldownSeconds = 0.25,
 	StatePollSeconds = 1.5,
 
-	-- Studio cannot exercise TeleportService. This adapter previews party UI and
-	-- launch validation only; it never creates a session or grants house authority.
+	-- Studio cannot exercise TeleportService. The lobby therefore hands a valid
+	-- ready party to a local, inert house-preview package. That preview is never
+	-- a production session and never grants saved progression or live authority.
 	StudioPreview = true,
 }
 

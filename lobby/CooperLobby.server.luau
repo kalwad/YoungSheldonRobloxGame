@@ -7,6 +7,7 @@ local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
 local TeleportService = game:GetService("TeleportService")
 
 local lobbyFolder = ReplicatedStorage:WaitForChild("CooperLobby")
@@ -1306,7 +1307,47 @@ local function launchParty(player: Player): (boolean, string?, string?)
 	end
 
 	if isStudio then
-		emitLobbyDiagnostic("party_snapshot_locked", "STUDIO_PARTY_VALIDATED", {
+		-- TeleportService cannot cross places in Studio. Hand the already
+		-- validated, server-authored party snapshot to the Studio-only in-place
+		-- bridge instead of reporting a fake launch success and leaving the player
+		-- in the lobby.
+		local bridge = ServerScriptService:FindFirstChild("StudioHousePreview")
+		local bridgeLaunch = bridge and bridge:FindFirstChild("Launch")
+		if not bridgeLaunch or not bridgeLaunch:IsA("BindableFunction") then
+			return rejectLaunch(
+				"STUDIO_HOUSE_BRIDGE_UNAVAILABLE",
+				"The Studio Cooper House preview is not installed. Stop the playtest and restore its verified preview package.",
+				{
+					memberCount = #party.memberUserIds,
+					partyId = party.partyId,
+					partyRevision = partyRevision(party),
+					studio = true,
+				}
+			)
+		end
+		local invokeOk, bridgeResult = pcall(function()
+			return bridgeLaunch:Invoke({
+				hostUserId = party.hostUserId,
+				memberUserIds = table.clone(party.memberUserIds),
+				partyId = party.partyId,
+				partyRevision = partyRevision(party),
+			})
+		end)
+		if not invokeOk or type(bridgeResult) ~= "table" or bridgeResult.ok ~= true then
+			local message = if invokeOk and type(bridgeResult) == "table" and type(bridgeResult.message) == "string"
+				then bridgeResult.message
+				else "The Studio Cooper House preview failed to start. Check Output and try a fresh playtest."
+			local reasonCode = if invokeOk and type(bridgeResult) == "table" and type(bridgeResult.reasonCode) == "string"
+				then bridgeResult.reasonCode
+				else "STUDIO_HOUSE_BRIDGE_FAILED"
+			return rejectLaunch(reasonCode, message, {
+				memberCount = #party.memberUserIds,
+				partyId = party.partyId,
+				partyRevision = partyRevision(party),
+				studio = true,
+			})
+		end
+		emitLobbyDiagnostic("party_snapshot_locked", "STUDIO_HOUSE_STARTED", {
 			action = "Launch",
 			memberCount = #party.memberUserIds,
 			operationId = operationId,
@@ -1315,8 +1356,9 @@ local function launchParty(player: Player): (boolean, string?, string?)
 			studio = true,
 			userId = player.UserId,
 		})
-		pushParty(party, "Studio party validation passed. Teleports and house authority stay disabled in Studio preview.")
-		return true, "Studio preview passed; launch was safely skipped.", "STUDIO_PARTY_VALIDATED"
+		return true,
+			type(bridgeResult.message) == "string" and bridgeResult.message or "Entering the playable Cooper House…",
+			"STUDIO_HOUSE_STARTED"
 	end
 
 	local sessionId = Protocol.newOpaqueId("session")

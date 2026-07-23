@@ -86,8 +86,10 @@ The repair contract is:
 - Only the host can launch. Every currently locked party member must be ready; solo play launches without unnecessary ready-up friction.
 - Disabled Start UI always gives a plain-language reason: host only, member not ready, party changing, storage unavailable, or launch already in progress.
 - Start double-clicks produce one locked party snapshot, one session manifest, and one admission ticket per member.
-- Studio preview runs validation through test adapters and reports **PARTY VALIDATED — LIVE TELEPORT NOT RUN**. It must not leave an unchanged screen that resembles a failed launch.
+- Studio cannot prove a live reserved-server teleport. After the same authoritative Ready/Start validation, the Studio-only bridge must instead replace the lobby with an inert, verified in-place Cooper House preview, start the normal house UI/controllers, restore camera and PlayerModule controls, and let the tester walk and interact. The bridge, package, synthetic party state, and scenario privileges must be unavailable in production; a successful Studio preview is still not evidence for published teleport, ticket, MemoryStore, or DataStore rows.
 - Published launch checkpoints are logged from ready receipt through house admission. A failure returns the lobby to a retryable state without duplicate sessions, tickets, or charges.
+
+**2026-07-22 Studio launch evidence:** the exact Create Party → Ready → Start flow opened the Cooper House in the same playtest, removed the lobby GUI/world, loaded all twelve verified house LocalScripts plus normal HUD/NPC/runtime systems, and restored a `16` WalkSpeed character. After dismissing the ordinary first-play `START BUILDING` tutorial, a real held-W input moved the character about 26 studs. `verify_studio_house_preview.luau` passed 63 edit checks and 108 active-runtime checks. Game logs contained no project warning or error; the only warning was an external Studio MCP version mismatch. No place was created, overwritten, or published for this repair.
 
 ---
 
@@ -789,7 +791,7 @@ These tests are additional to the original 348 requirements.
 | M1X-008 | P0 | Solo Play | No unnecessary Ready step; one launch | Published E2E |
 | M1X-009 | P0 | Double-click Start | One manifest, reservation, ticket per member, and teleport request | Concurrency |
 | M1X-010 | P0 | Reservation/ticket/teleport/admission failure | Retryable lobby state; no duplicate session/ticket | Fault injection/E2E |
-| M1X-011 | P0 | Studio Start preview | Reports validation and explicitly says live teleport not run | Studio scenario |
+| M1X-011 | P0 | Studio Start preview | Opens the verified in-place house, removes the lobby, restores camera/controls, loads normal HUD/controllers, and permits movement; explicitly remains non-evidence for live teleport | Studio scenario |
 | M1X-012 | P0 | Published solo/2/4-player Start | Every player reaches grounded authorized house; no lobby stall/void | Published E2E |
 | M1X-013 | P0 | Phone/tablet taps Ready/Start | One activation per tap; controls do not overlap | Physical hardware |
 | M1X-014 | P1 | Long names/full party/errors/host grace | Responsive UI remains legible and operable | Visual/device |

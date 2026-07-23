@@ -46,14 +46,22 @@ of the row and does not satisfy its remaining live or topology requirement.
 - The lobby environment is now a warm 1980s suburban rec room. Its updater is
   scoped and idempotent and cannot clear Workspace, Terrain, replicated data,
   StarterGui, or runtime scripts.
-- No new version was published. Studio reports `PARTY VALIDATED — Studio safely
-  skipped the live teleport`; the published reserved-server rows remain open.
+- No new version was published. Studio now opens an inert, verified Cooper House
+  package inside the same playtest after authoritative party validation. The
+  published reserved-server rows remain open because this path never exercises
+  TeleportService, MemoryStore, live tickets, or production DataStores.
+- The final Create Party → Ready → Start run removed the lobby world/UI, loaded
+  the normal house HUD and all twelve verified LocalScripts, and passed 63 edit
+  plus 108 active-runtime preview checks. After the normal first-play `START
+  BUILDING` tutorial was dismissed, held-W input moved the character about 26
+  studs. Project logs had no errors or warnings; the only warning came from an
+  external Studio MCP plugin/server version mismatch.
 
 ## Automated contract checks
 
 | ID | Check | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| A01 | Compile every local `.luau` source | No compile errors | PASS | 2026-07-22 closure: `luau-compile` passed 80/80 local sources; all 64 active sources also passed |
+| A01 | Compile every local `.luau` source | No compile errors | PASS | 2026-07-22 Studio handoff closure: `luau-compile` passed 82/82 local sources; all 66 non-retired sources also passed |
 | A02 | `git diff --check` | No whitespace errors | PASS | 2026-07-22: exited 0 with no findings |
 | A03 | Run `verify_milestone1_foundation.luau` in house edit mode | PASS | PASS | 2026-07-22 final house: 530 read-only checks passed |
 | A04 | Run verifier in a one-player house runtime | PASS | PASS | 2026-07-22 final house runtime: 616 checks passed |
@@ -61,6 +69,7 @@ of the row and does not satisfy its remaining live or topology requirement.
 | A06 | Run verifier in a lobby runtime | PASS | PASS | 2026-07-22 clean runtime: 281 foundation checks plus 32 launch-repair checks passed |
 | A07 | Run every Milestone 0 gameplay regression suite | No regressions except intentional M1 source/cap contracts | NOT RUN | |
 | A08 | Client-authority scan | No client cash awards, task completion, host selection, or story forcing | PASS | 2026-07-22: all 13 active local client sources scanned; no forbidden authority pattern |
+| A09 | Studio in-place house verifier | Preview package and safety guards pass before launch; normal house/remotes/scripts/profile pass after launch | PASS | 63/63 edit checks and 108/108 active-runtime checks |
 
 ## Lobby UI and Studio interaction checks
 
@@ -69,15 +78,16 @@ handoff, Roblox friend invitation, or physical-device touch behavior.
 
 | ID | Check | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| L01 | Play Solo in Studio | Safe preview validates without production teleport or authority | PASS | Final lobby interaction test completed and success notice persisted |
+| L01 | Play Solo in Studio | Validated party opens a playable in-place house without production teleport or saved authority | PASS | Exact keyboard-activated Create Party → Ready → Start flow replaced lobby with verified house runtime |
 | L02 | Create Party | Host party is created and controls update | PASS | Final lobby interaction test |
 | L03 | Ready and cancel ready | Text/state toggles correctly in both directions | PASS | Reproduced and repaired; typed server state remained stable through rerenders, Ready/cancel worked, and zero-delay regression passed |
-| L04 | Host Launch in Studio | Safe-preview result only; no reserved server or MemoryStore authority | PASS | Clean final runtime returned `STUDIO_PARTY_VALIDATED`; UI persisted the truthful no-live-teleport result |
+| L04 | Host Launch in Studio | In-place house handoff only; no reserved server, MemoryStore, live ticket, or production DataStore authority | PASS | Runtime returned `STUDIO_HOUSE_STARTED`; lobby GUI/world disappeared and normal house systems loaded |
 | L05 | Leave Party | Party UI returns to the no-party state | PASS | Final lobby interaction test |
 | L06 | Responsive simulated layouts | Desktop, small phone portrait/landscape, modern phone, Android landscape, and tablet fit and scroll | PASS | Final captures: iPhone 7 portrait/landscape, iPhone 13 portrait, Galaxy A16 landscape, iPad 6 landscape, and desktop |
 | L07 | Lobby movement presentation | Scriptable movement prevents mobile joystick/jump controls covering UI | PASS | Confirmed in simulated mobile layouts |
 | L08 | Physical phone/tablet interaction | Touch, safe areas, keyboard opening, and rotation work on real hardware | NOT RUN | Simulator evidence is not a physical-device test |
 | L09 | Fresh lobby client initialization | Runtime stays stable without forcing global GUI selection; ordinary selectable buttons still work | PASS | Removed automatic `GuiService.SelectedObject` writes that crashed current Studio; fresh runtime stayed stable and every button flow passed; exported/published in v308 |
+| L10 | Movement after Studio handoff | First-play tutorial owns its intentional modal lock; closing it restores normal camera and movement | PASS | `START BUILDING` closed, PlayerModule controller enabled, WalkSpeed remained 16, and held-W moved about 26 studs |
 
 ## Party and teleport tests
 

@@ -508,7 +508,8 @@ local function updatePartyPauseBanner(snapshot)
 	local elapsed = math.max(0, os.clock() - currentSnapshotReceivedAt)
 	local remaining = math.max(0, math.ceil((tonumber(party.reconnectRemaining) or 0) - elapsed))
 	partyPauseBanner.Text = string.format(
-		"GAME PAUSED • HOST RECONNECTING\nShared tasks and purchases are safe. Lobby return in %d:%02d if the host does not return.",
+		"GAME PAUSED • HOST RECONNECTING" .. string.char(10)
+			.. "Shared tasks and purchases are safe. Lobby return in %d:%02d if the host does not return.",
 		math.floor(remaining / 60),
 		remaining % 60
 	)

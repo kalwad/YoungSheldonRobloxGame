@@ -5,6 +5,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local SocialService = game:GetService("SocialService")
+local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
@@ -255,7 +256,7 @@ studioBanner.Size = UDim2.new(1, -8, 0, 48)
 studioBanner.BackgroundColor3 = THEME.Teal
 studioBanner.BorderSizePixel = 0
 studioBanner.Font = Enum.Font.GothamBold
-studioBanner.Text = "STUDIO PARTY TEST  •  NO LIVE TELEPORT"
+studioBanner.Text = "STUDIO PARTY TEST  •  IN-PLACE HOUSE PREVIEW"
 studioBanner.TextColor3 = Color3.fromRGB(16, 35, 31)
 studioBanner.TextSize = 14
 studioBanner.TextWrapped = true
@@ -428,7 +429,7 @@ studioNote.LayoutOrder = 50
 studioNote.Size = UDim2.new(1, -8, 0, 54)
 studioNote.BackgroundTransparency = 1
 studioNote.Font = Enum.Font.Gotham
-studioNote.Text = "Studio validates the party rules here. A real reserved-house launch can only be tested in a published private build."
+studioNote.Text = "Studio opens the verified Cooper House inside this playtest. Published builds still use a secure reserved-house teleport."
 studioNote.TextColor3 = THEME.Muted
 studioNote.TextSize = 14
 studioNote.TextWrapped = true
@@ -446,6 +447,7 @@ local noticeHoldUntil = 0
 local studioValidationPassed = false
 local validatedPartyId: string? = nil
 local validatedPartyRevision: number? = nil
+local studioHouseActive = false
 
 local function setButtonEnabled(button: TextButton, enabled: boolean)
 	button.Active = enabled
@@ -528,9 +530,6 @@ local function launchReason(state: any): (string, Color3)
 	if busy then
 		return "Please wait while the last party action finishes.", THEME.Muted
 	end
-	if studioValidationPassed and validatedPartyId == state.partyId then
-		return "✓ PARTY VALIDATED — Studio safely skipped the live teleport.", THEME.Avocado
-	end
 	if state.canLaunch ~= true
 		and type(state.launchBlockMessage) == "string"
 		and state.launchBlockMessage ~= ""
@@ -556,7 +555,7 @@ local function launchReason(state: any): (string, Color3)
 		return "START LOCKED — the party is syncing with the host's lobby. Please wait.", THEME.Rust
 	end
 	if state.studioPreview == true then
-		return "READY TO TEST — this checks the party rules without a live teleport.", THEME.Teal
+		return "READY TO START — Studio will open a playable in-place Cooper House.", THEME.Teal
 	end
 	return "EVERYONE IS READY — the host can start the private house.", THEME.Avocado
 end
@@ -659,7 +658,7 @@ local function render(state: any)
 	leaveButton.Visible = hasParty and state.state == "Open"
 
 	readyButton.Text = if authoritativeSelfReady then "READY  ✓   (PRESS TO CANCEL)" else "I'M READY"
-	launchButton.Text = if isStudio then "TEST PARTY START" else "START PRIVATE HOUSE"
+	launchButton.Text = if isStudio then "START COOPER HOUSE" else "START PRIVATE HOUSE"
 	local reason, reasonColor = launchReason(state)
 	launchStatus.Text = reason
 	launchStatus.TextColor3 = reasonColor
@@ -675,7 +674,7 @@ local function render(state: any)
 end
 
 local function request(action: string, payload: any?, quiet: boolean?)
-	if busy then
+	if busy or studioHouseActive then
 		return
 	end
 	stateGeneration += 1
@@ -693,6 +692,10 @@ local function request(action: string, payload: any?, quiet: boolean?)
 	local ok, response = pcall(function()
 		return requestRemote:InvokeServer(action, payload)
 	end)
+	if studioHouseActive then
+		busy = false
+		return
+	end
 	if requestGeneration ~= stateGeneration then
 		if not quiet then
 			busy = false
@@ -764,6 +767,9 @@ leaveButton.Activated:Connect(function()
 end)
 
 stateRemote.OnClientEvent:Connect(function(state)
+	if studioHouseActive then
+		return
+	end
 	stateGeneration += 1
 	if type(state) == "table"
 		and state.studioPreview == true
@@ -783,7 +789,96 @@ stateRemote.OnClientEvent:Connect(function(state)
 	end
 end)
 
+local function restoreHouseControlsAndCamera()
+	local controlsOk, controls = pcall(function()
+		return require(player.PlayerScripts:WaitForChild("PlayerModule")):GetControls()
+	end)
+	if controlsOk and controls then
+		pcall(function()
+			controls:Enable()
+		end)
+	end
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	UserInputService.MouseIconEnabled = true
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.Sit = false
+		humanoid.PlatformStand = false
+		humanoid.AutoRotate = true
+	end
+	local camera = Workspace.CurrentCamera
+	if camera then
+		camera.CameraType = Enum.CameraType.Custom
+		if humanoid then
+			camera.CameraSubject = humanoid
+		end
+	end
+end
+
+local function installStudioHousePlayerScripts(folderName: string): (boolean, string?)
+	local templates = ReplicatedStorage:WaitForChild(folderName, 10)
+	if not templates or not templates:IsA("Folder") then
+		return false, "The verified Studio house player scripts did not arrive."
+	end
+	local playerScripts = player:WaitForChild("PlayerScripts", 10)
+	if not playerScripts or not playerScripts:IsA("PlayerScripts") then
+		return false, "Your Roblox PlayerScripts container was unavailable."
+	end
+	for _, template in ipairs(templates:GetChildren()) do
+		if template:IsA("LocalScript") and not playerScripts:FindFirstChild(template.Name) then
+			local clone = template:Clone()
+			clone.Enabled = false
+			clone.Parent = playerScripts
+			clone.Enabled = true
+		end
+	end
+	return true, nil
+end
+
 clientCommandRemote.OnClientEvent:Connect(function(command: unknown, launchData: unknown)
+	if command == "StudioHouseTransitionBegin" then
+		busy = true
+		noticeHoldUntil = math.huge
+		notice.Text = if type(launchData) == "table" and type(launchData.text) == "string"
+			then launchData.text
+			else "Opening the Cooper House…"
+		notice.TextColor3 = THEME.Mustard
+		if currentState then
+			render(currentState)
+		end
+		return
+	elseif command == "StudioHouseTransitionFailed" then
+		busy = false
+		noticeHoldUntil = os.clock() + 10
+		if currentState then
+			render(currentState)
+		end
+		notice.Text = if type(launchData) == "table" and type(launchData.text) == "string"
+			then launchData.text
+			else "The Studio Cooper House could not open. Check Output and try again."
+		notice.TextColor3 = THEME.Rust
+		return
+	elseif command == "StudioHouseTransitionComplete" then
+		local folderName = if type(launchData) == "table" and type(launchData.playerScriptsFolder) == "string"
+			then launchData.playerScriptsFolder
+			else "CooperStudioPlayerScripts"
+		local installed, installError = installStudioHousePlayerScripts(folderName)
+		if not installed then
+			busy = false
+			noticeHoldUntil = math.huge
+			notice.Text = installError or "The Studio house player scripts could not start."
+			notice.TextColor3 = THEME.Rust
+			warn("[CooperLobby] Studio house client activation failed: " .. notice.Text)
+			return
+		end
+		studioHouseActive = true
+		busy = false
+		stateGeneration += 1
+		restoreHouseControlsAndCamera()
+		gui:Destroy()
+		return
+	end
 	if command ~= "PromptInvite" or type(launchData) ~= "string" or #launchData > 200 then
 		return
 	end
@@ -872,6 +967,9 @@ end
 
 local cameraConnection: RBXScriptConnection? = nil
 local function frameRecRoomCamera(camera: Camera)
+	if studioHouseActive then
+		return
+	end
 	-- A menu lobby should present the authored rec-room composition consistently
 	-- instead of depending on avatar facing or third-person wall collision.
 	local focus = Vector3.new(-5, 7.2, -16)
@@ -882,6 +980,9 @@ local function frameRecRoomCamera(camera: Camera)
 end
 
 local function watchCamera()
+	if studioHouseActive then
+		return
+	end
 	if cameraConnection then
 		cameraConnection:Disconnect()
 		cameraConnection = nil
@@ -898,7 +999,7 @@ backdrop:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateResponsiveLayout
 watchCamera()
 
 task.spawn(function()
-	while gui.Parent do
+	while gui.Parent and not studioHouseActive do
 		request("Refresh", nil, true)
 		task.wait(Config.StatePollSeconds)
 	end

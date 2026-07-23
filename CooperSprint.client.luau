@@ -356,7 +356,7 @@ local function updateTouchButtonStyle(available: boolean, exhausted: boolean)
 	end
 	local title = button:FindFirstChild("ActionTitle")
 	if title and title:IsA("TextLabel") then
-		title.Text = if desiredIntent then "SPRINT\nON" else "SPRINT"
+		title.Text = if desiredIntent then "SPRINT" .. string.char(10) .. "ON" else "SPRINT"
 	end
 end
 
