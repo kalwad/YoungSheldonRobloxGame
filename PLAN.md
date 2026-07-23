@@ -36,7 +36,7 @@ The cozy game must remain enjoyable on its own. Horror is a reveal and pressure 
 | Milestone | Implementation status | Verification status | Release meaning |
 |---|---|---|---|
 | 0 — Safe pre-horror baseline | Complete | Complete under the approved 2026-07-22 scope lock | Authoritative rollback baseline |
-| 1 — Lobby and co-op foundation | Current closure candidate committed and exercised in a local Studio preview; not published or live-reserved-server verified | **Gate open** | Must not be called complete or used to unlock Milestone 2 |
+| 1 — Lobby and co-op foundation | Latest local closure working tree passes deterministic/static gates; its predecessor was exercised in a Studio preview; latest source is not yet synced, frozen, or published | **Gate open** | Must not be called complete or used to unlock Milestone 2 |
 | 2–9 | Not approved for activation | Not started under this bible | Corresponding feature flags remain disabled |
 
 Milestone 0 is backed by commits `8c16e85` and `813f93c`, dated `.rbxm` exports and SHA-256 hashes, 71/71 local source compilation, 637 edit-mode and 599 runtime baseline checks, migration double-pass checks, gameplay regression suites, responsive terminal captures, and a documented restoration procedure.
@@ -45,9 +45,11 @@ Milestone 1 implementation is backed by commits `e1d4b29` and `1343005`, 79/79 s
 
 The current Milestone 1 closure candidate is backed by commits `f31c0cd`
 (`test: harden milestone 1 persistence and launch gates`) and `14932d7`
-(`fix: clear Studio server register startup limit`). Its current evidence is
-recorded in section 2.3 and the milestone matrix. These commits supplement,
-rather than erase, the historical evidence above.
+(`fix: clear Studio server register startup limit`), with the latest uncommitted
+closure work based on `f823103`. Its current evidence is recorded in section
+2.3 and the milestone matrix. These revisions supplement, rather than erase,
+the historical evidence above. The latest working tree is not yet a frozen
+Studio or published candidate.
 
 Milestone 1 is **not release-verified**. Before the newly reported Ready/Start defect and the additional tests in this bible, its authoritative matrix stood at:
 
@@ -102,9 +104,16 @@ earlier run remains historical evidence only; the current-candidate results
 below supersede its audit counts. No place was created, overwritten, or
 published for that repair.
 
-### 2.3 Current candidate evidence addendum — `f31c0cd` + `14932d7`
+### 2.3 Carried-forward Studio evidence and current local closure candidate
 
-The exact current Studio flow was:
+The Studio observations in this subsection were collected from the
+`f31c0cd` + `14932d7` candidate. The newer working tree is based on
+`f823103` and includes additional launch and value-operation repairs that have
+passed the local gate but have **not** yet been synchronized into or executed
+in Studio. Historical Studio evidence must not be silently inherited by the
+newer source.
+
+The exact carried-forward Studio flow was:
 
 ```text
 CreateParty → SetReady true → Launch (zero delay)
@@ -119,10 +128,12 @@ new compiler-register gate passed the full `27/27` `O0`/`O1`/`O2` ×
 ended with `RuntimeStartupReadiness` **PASS**.
 Ordinary default compilation alone is not accepted as Roblox startup evidence.
 
-Current candidate evidence:
+Carried-forward Studio evidence plus current local evidence:
 
-- `120/120` local Luau sources passed default compilation.
-- The deterministic suite passed `82/82`.
+- The latest one-command local gate compiled `140/140` Luau sources.
+- The latest deterministic suite passed `130/130`, the compiler-register
+  matrix passed `27/27`, and all 13 active client sources passed the authority
+  scan.
 - The Milestone 1 lobby edit audit passed `316` checks.
 - A second fresh `PlaySolo` also returned `STUDIO_HOUSE_STARTED` with
   authoritative `selfReady = true` and `canLaunch = true`; startup readiness
@@ -152,17 +163,27 @@ Current candidate evidence:
   bytes with SHA-256
   `09dc971d4f534c34c369d82455a7bac026ec6bc7342d0d3ec2cbcf91a5a2fb7a`.
 
-The schema-12 operation journal currently protects shared task payouts and the
-six paid order operations documented in the implementation record. Global
-exactly-once closure is still incomplete: candy payout, boombox payout ticks,
-`AdjustCurrency`, `SpendAllowance`, and physical install transitions remain
-outside the operation-ID/reconciliation path.
+The latest local source extends the schema-12 operation journal across the
+enumerated Milestone 1 value paths: shared task payouts, the six paid orders,
+candy production/collection/sale, paid task-upgrade/chemistry/boombox/machine
+installs, indexed boombox ticks, and a stable completed-playback settlement.
+The settlement reconciles missing tick/save/race cases to exactly `$300`
+without overpaying on retry. Broad `AdjustCurrency` and `SpendAllowance`
+routes now fail closed as deprecated. This is local source and deterministic
+closure, not Roblox DataStore or concurrent-server release proof.
+
+The latest lobby source also handles an asynchronous
+`TeleportInitFailed` callback within the same bounded retry budget. Its single
+remaining retry reuses the original reservation, session manifest, admission
+tickets, `TeleportOptions`, and launch token, and stale callbacks cannot create
+a second launch. Synchronous and asynchronous retry contracts pass locally;
+real TeleportService execution remains untested.
 
 This addendum does **not** claim screenshot or physical-device/mobile visual
-acceptance, a published or reserved-server launch, live MemoryStore or
-DataStore behavior, multiplayer completion, or a full existing-feature
-regression. Milestone 1 therefore remains **GATE OPEN**, and Milestone 2
-production runtime remains **BLOCKED**.
+acceptance, a current-working-tree Studio sync or run, a published or
+reserved-server launch, live MemoryStore or DataStore behavior, multiplayer
+completion, or a full existing-feature regression. Milestone 1 therefore
+remains **GATE OPEN**, and Milestone 2 production runtime remains **BLOCKED**.
 
 ---
 

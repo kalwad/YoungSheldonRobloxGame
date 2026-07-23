@@ -46,6 +46,22 @@ local function contains(source, marker)
 	return type(source) == "string" and string.find(source, marker, 1, true) ~= nil
 end
 
+local function countPlain(source, marker)
+	if type(source) ~= "string" or marker == "" then
+		return 0
+	end
+	local count = 0
+	local cursor = 1
+	while true do
+		local at = string.find(source, marker, cursor, true)
+		if not at then
+			return count
+		end
+		count += 1
+		cursor = at + #marker
+	end
+end
+
 local function lacks(source, marker, label)
 	check(not contains(source, marker), (label or "Source") .. " unexpectedly contains " .. marker)
 end
@@ -77,9 +93,17 @@ local function functionSection(source, functionName)
 		return nil
 	end
 	local markerLength = #(startMarker or "")
-	local endAt = string.find(source, "\nlocal function ", startAt + markerLength, true)
-		or string.find(source, "\nreturn ", startAt + markerLength, true)
-		or (#source + 1)
+	local endAt = #source + 1
+	for _, boundary in ipairs({
+		"\nlocal function ",
+		"\nfunction ",
+		"\nreturn ",
+	}) do
+		local candidate = string.find(source, boundary, startAt + markerLength, true)
+		if candidate and candidate < endAt then
+			endAt = candidate
+		end
+	end
 	return string.sub(source, startAt, endAt - 1)
 end
 
@@ -411,9 +435,10 @@ if isHouse then
 		markers(transactionLedgerSource, "CooperTransactionLedger", {
 			"Ledger.VERSION = 1",
 			"Ledger.MAX_COMMITTED = 256",
-			"Ledger.MAX_PENDING = 32",
-			"Ledger.MAX_ROLLED_BACK = 64",
-			"function Ledger.sanitize(",
+				"Ledger.MAX_PENDING = 32",
+				"Ledger.MAX_ROLLED_BACK = 64",
+				"function Ledger.logicalKind(",
+				"function Ledger.sanitize(",
 			"function Ledger.begin(",
 			"function Ledger.commit(",
 			"function Ledger.markNeedsReconciliation(",
@@ -435,10 +460,18 @@ if isHouse then
 				and TransactionLedger.MAX_ROLLED_BACK > 0,
 			"TransactionLedger needs a separate bounded rollback tombstone history"
 		)
-		check(
-			type(TransactionLedger.MAX_PENDING) == "number" and TransactionLedger.MAX_PENDING > 0,
-			"TransactionLedger needs a bounded reconciliation queue"
-		)
+			check(
+				type(TransactionLedger.MAX_PENDING) == "number" and TransactionLedger.MAX_PENDING > 0,
+				"TransactionLedger needs a bounded reconciliation queue"
+			)
+			check(
+				TransactionLedger.logicalKind("CandySale", "batch-123") == "CandySale:batch-123",
+				"TransactionLedger logical operation identities are not stable"
+			)
+			check(
+				TransactionLedger.logicalKind("CandySale", "../client") == nil,
+				"TransactionLedger accepts client-shaped logical operation keys"
+			)
 	end
 	if Config then
 		check(Config.SchemaVersion == 12, "Milestone 1 transaction integration requires profile schema 12")
@@ -597,18 +630,30 @@ if isHouse then
 			"local recipient, unavailableReason = eligibleProfileForTask(record, userId)",
 			"forfeitTaskEligibility(record, userId, unavailableReason)",
 			"setAllowance(recipient, recipient.data.allowance + reward)",
-			"TransactionRuntime.commitProfileValueOperation(",
-			"TransactionRuntime.reserveProfileValueOperation(",
-			"TransactionRuntime.resumePersistedReconciliations(profile)",
+				"TransactionRuntime.commitProfileValueOperation(",
+				"TransactionRuntime.commitPersistentTransition(",
+				"TransactionRuntime.logicalOperationKind(",
+				"TransactionRuntime.reserveProfileValueOperation(",
+				"TransactionRuntime.resumePersistedReconciliations(profile)",
 			"profile.reconciliationScheduled[operationId] ~= nil",
 			"TransactionRuntime.purchaseStillAuthorized(profile, operationKind, price)",
-			"return false, false, \"SavePending\"",
+				"return true, false, \"SavePendingAccepted\"",
 			"TransactionLedger.markNeedsReconciliation(",
-			"TransactionLedger.sessionMatches(existing, activeSessionId)",
-			"expectedSessionId ~= activeSessionId",
-			"profile.transactionReconciliationBlocked = true",
-			"locked against another charge",
-			"partySession.completedTasks += 1",
+				"TransactionLedger.sessionMatches(existing, activeSessionId)",
+				"expectedSessionId ~= activeSessionId",
+				"profile.transactionReconciliationBlocked = true",
+				"locked against another charge",
+				'"CandyProduce"',
+				'"CandyCollect"',
+				'"CandySale"',
+				'"InstallTaskUpgrade"',
+				'"InstallChemistrySetup"',
+				'"InstallBoombox"',
+				'"InstallMachineStage"',
+				'"BoomboxTick"',
+				'operation == "AdjustCurrency" or operation == "SpendAllowance"',
+				"DeprecatedOperation: use a named authoritative value operation",
+				"partySession.completedTasks += 1",
 			"math.floor(partySession.completedTasks / #Config.TaskOrder) + 1",
 			"partySession.task = nil",
 			"local worldProfile = hostProfile()",
@@ -618,9 +663,10 @@ if isHouse then
 			"chemistrySetup = chemistrySetupSnapshot(worldProfile, profile)",
 			"automation = automationSnapshot(worldProfile, profile)",
 		})
-		lacks(gameServerSource, "rewardedUserIds", "CooperGame immutable task eligibility")
-		lacks(gameServerSource, "local recipients = presentProfiles()", "CooperGame task completion")
-		lacks(gameServerSource, "payload.operationId", "CooperGame client-supplied value operation id")
+			lacks(gameServerSource, "rewardedUserIds", "CooperGame immutable task eligibility")
+			lacks(gameServerSource, "local recipients = presentProfiles()", "CooperGame task completion")
+			lacks(gameServerSource, "payload.operationId", "CooperGame client-supplied value operation id")
+			lacks(gameServerSource, "local function adjustAllowance", "CooperGame legacy broad allowance authority")
 		markers(gameServerSource, "CooperGame guest route cap", {
 			"local function rejoinRouteExpiration(userId, sessionState, renewedExpiresAt, hostGraceExpiresAt)",
 			"and activeProfile.loaded and not activeProfile.releasing",
@@ -693,7 +739,7 @@ if isHouse then
 				)
 			end
 		end
-		local purchaseCommitSection = functionSection(gameServerSource, "TransactionRuntime.commitHostPurchase")
+			local purchaseCommitSection = functionSection(gameServerSource, "TransactionRuntime.commitHostPurchase")
 		check(purchaseCommitSection ~= nil, "Schema-12 purchase commit helper is missing")
 		if purchaseCommitSection then
 			check(
@@ -827,6 +873,83 @@ if isHouse then
 					"The party may have paused between validation and commit.",
 				})
 			end
+			local transitionCommitSection = functionSection(
+				gameServerSource,
+				"TransactionRuntime.commitPersistentTransition"
+			)
+			check(transitionCommitSection ~= nil, "Persistent value-transition helper is missing")
+			if transitionCommitSection then
+				markers(transitionCommitSection, "Persistent value-transition helper", {
+					"TransactionRuntime.findLogicalOperation(profile, kind)",
+					"existing and existing.id or nil",
+					"TransactionRuntime.commitProfileValueOperation(",
+					'"TransactionReconciliation"',
+				})
+			end
+			local installSection = functionSection(gameServerSource, "reportPlayerAction")
+			check(installSection ~= nil, "Persistent install action section is missing")
+			if installSection then
+				check(
+					countPlain(installSection, "TransactionRuntime.commitPersistentTransition(") == 4,
+					"Exactly four paid physical install transitions must be journaled"
+				)
+				check(
+					countPlain(installSection, "if appliedNow then") == 4,
+					"Paid install presentation must run only on the first application"
+				)
+				lacks(installSection, "setAllowance(", "Paid install transition")
+				lacks(installSection, "task.defer(saveProfile", "Paid install transition")
+			end
+			for _, candyFunction in ipairs({
+				"createCandyBatch",
+				"beginCandyDelivery",
+				"completeCandyDelivery",
+			}) do
+				local section = functionSection(gameServerSource, candyFunction)
+				check(section ~= nil, "Candy value transition is missing: " .. candyFunction)
+				if section then
+					check(
+						countPlain(section, "TransactionRuntime.commitPersistentTransition(") == 1,
+						candyFunction .. " must contain exactly one journaled transition"
+					)
+				end
+			end
+			local boomboxCreditSection = functionSection(
+				gameServerSource,
+				"TransactionRuntime.creditBoomboxTick"
+			)
+			check(boomboxCreditSection ~= nil, "Journaled boombox tick helper is missing")
+				if boomboxCreditSection then
+				markers(boomboxCreditSection, "Journaled boombox tick helper", {
+					'"BoomboxTick"',
+					"tostring(playback.sessionId) .. \":\" .. tostring(tickIndex)",
+					"TransactionRuntime.commitPersistentTransition(",
+					"playback.paidTicks == tickIndex - 1",
+					"return appliedNow and payout or 0, true, status",
+				})
+				check(
+					countPlain(boomboxCreditSection, "setAllowance(profile, profile.data.allowance + payout)") == 1,
+					"One boombox tick must contain exactly one allowance mutation"
+					)
+				end
+				local boomboxSettlementSection = functionSection(
+					gameServerSource,
+					"TransactionRuntime.settleCompletedBoombox"
+				)
+				check(boomboxSettlementSection ~= nil, "Completed-song boombox settlement helper is missing")
+				if boomboxSettlementSection then
+					markers(boomboxSettlementSection, "Completed-song boombox settlement", {
+						'"BoomboxSettle"',
+						"playback.settlementValue",
+						"setAllowance(profile, profile.data.allowance + settlementValue)",
+						"paidTicks = maximumTicks",
+						"TransactionRuntime.commitPersistentTransition(",
+					})
+					check(
+						countPlain(boomboxSettlementSection, "setAllowance(") == 1,
+						"Completed-song settlement must contain exactly one catch-up allowance mutation"
+					)
+				end
 		end
 	end
 
@@ -1046,8 +1169,10 @@ elseif isLobby then
 			"HttpService",
 			"MemoryStoreService",
 			"TeleportService",
-			"ReserveServerAsync",
-			"ReservedServerAccessCode",
+				"ReserveServerAsync",
+				"local TELEPORT_REQUEST_ATTEMPTS = 2",
+				"local TELEPORT_RETRY_DELAY_SECONDS = 0.35",
+				"ReservedServerAccessCode",
 			"makeHouseTeleportData",
 			"Protocol.MemoryStoreNames.Tickets",
 			"Protocol.MemoryStoreNames.Sessions",
@@ -1063,7 +1188,16 @@ elseif isLobby then
 			"expiresAt = now + arrivalTicketLifetime",
 			"expiresAt = now + rejoinRouteLifetime",
 			"userId = userId",
-			"TeleportService:TeleportAsync(Config.HousePlaceId, { member }, options)",
+			"type TeleportRetryContext = {",
+			"local teleportRetryContexts: { [number]: TeleportRetryContext } = {}",
+			"local function requestTeleportWithContext(player: Player, context: TeleportRetryContext): boolean",
+			"TeleportService:TeleportAsync(context.placeId, { player }, context.options)",
+			"local retryContext: TeleportRetryContext = {",
+			"placeId = Config.HousePlaceId",
+			"options = options",
+			"token = teleportToken",
+			"teleportRetryContexts[userId] = retryContext",
+			"requestTeleportWithContext(member, retryContext)",
 			'if action == "CreateParty" then',
 			'elseif action == "PlaySolo" then',
 			'elseif action == "SetReady" then',
@@ -1082,8 +1216,19 @@ elseif isLobby then
 			'emitLobbyDiagnostic("reserved_server_created", "RESERVED_SERVER_CREATED"',
 			'emitLobbyDiagnostic("session_manifest_written", "SESSION_MANIFEST_WRITTEN"',
 			'emitLobbyDiagnostic("member_ticket_written", "MEMBER_TICKET_WRITTEN"',
-			'emitLobbyDiagnostic("teleport_requested", "TELEPORT_REQUESTED"',
-			"local function renewLaunchOwnership",
+				'emitLobbyDiagnostic("teleport_requested", "TELEPORT_REQUESTED"',
+				'emitLobbyDiagnostic("teleport_retry_requested", "TELEPORT_REQUEST_RETRY"',
+				'emitLobbyDiagnostic("teleport_retry_requested", "TELEPORT_INIT_RETRY"',
+				"for attempt = 1, TELEPORT_REQUEST_ATTEMPTS do",
+				"retryContext.attempts < retryContext.maximumAttempts",
+				"teleporting[userId] == teleportToken",
+				"TeleportService.TeleportInitFailed:Connect(function(",
+				"returnedData.sessionId == retryContext.sessionId",
+				"returnedData.partyId == retryContext.partyId",
+				"returnedData.ticketId == retryContext.ticketId",
+				"retryContext.options = teleportOptions",
+				"requestTeleportWithContext(player, retryContext)",
+				"local function renewLaunchOwnership",
 			"and party.launchSessionId == sessionId",
 			"if type(current) == \"table\" and current.sessionId == sessionId then",
 		})

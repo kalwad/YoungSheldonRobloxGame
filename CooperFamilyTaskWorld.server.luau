@@ -3442,16 +3442,29 @@ local function runBoomboxPayouts(session)
 			if activeBoomboxSession ~= session or not boomboxSound.Playing then
 				break
 			end
-			local tickResult = invokeFamily("BoomboxPayoutTick", session.player, session.sessionId)
-			if type(tickResult) ~= "table" or tickResult.ok ~= true then
-				local retryAfter = type(tickResult) == "table" and finiteNumber(tickResult.retryAfter, 0) or 0
-				if retryAfter > 0 and retryAfter <= 0.35 then
-					task.wait(retryAfter + 0.02)
-					tickResult = invokeFamily("BoomboxPayoutTick", session.player, session.sessionId)
+			local tickAccepted = false
+			repeat
+				local tickResult = invokeFamily(
+					"BoomboxPayoutTick",
+					session.player,
+					session.sessionId,
+					tickIndex
+				)
+				tickAccepted = type(tickResult) == "table" and tickResult.ok == true
+				if not tickAccepted
+					and activeBoomboxSession == session
+					and boomboxSound.Playing
+				then
+					-- Profile reconciliation and short DataStore stalls are
+					-- recoverable. Keep retrying this exact indexed tick instead of
+					-- skipping the remainder of an otherwise complete song.
+					local retryAfter = type(tickResult) == "table"
+						and finiteNumber(tickResult.retryAfter, 0) or 0
+					task.wait(math.clamp(retryAfter > 0 and retryAfter + 0.02 or 0.2, 0.05, 0.5))
 				end
-				if type(tickResult) ~= "table" or tickResult.ok ~= true then
-					break
-				end
+			until tickAccepted or activeBoomboxSession ~= session or not boomboxSound.Playing
+			if not tickAccepted then
+				break
 			end
 		end
 	end)

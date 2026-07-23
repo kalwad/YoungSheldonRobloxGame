@@ -41,6 +41,18 @@ local function countPlain(source, token)
 	end
 end
 
+local function ordered(source, tokens, message)
+	local cursor = 1
+	for _, token in ipairs(tokens) do
+		local at = string.find(source, token, cursor, true)
+		check(at ~= nil, message .. ": missing or out-of-order " .. token)
+		if not at then
+			return
+		end
+		cursor = at + #token
+	end
+end
+
 local function section(source, firstToken, nextToken, label)
 	local first = string.find(source, firstToken, 1, true)
 	check(first ~= nil, label .. " start is missing")
@@ -166,7 +178,66 @@ check(
 	countPlain(chemistryOrderSource, "profile.data.chemistrySetupPurchased = true") == 1,
 	"Chemistry purchase must have exactly one entitlement mutation"
 )
+has(
+	chemistryOrderSource,
+	"TransactionRuntime.commitHostPurchase(",
+	"Chemistry purchase must use the durable operation journal"
+)
+has(chemistryOrderSource, '"PurchaseChemistrySetup"', "Chemistry purchase needs a stable logical operation kind")
+has(
+	chemistryOrderSource,
+	"if not purchased then",
+	"Chemistry delivery must not start unless its paid entitlement was committed"
+)
 check(not string.find(chemistryOrderSource, "task.wait", 1, true), "Atomic chemistry purchase path must not yield")
+
+local persistentTransitionSource = section(
+	mainServerSource,
+	"function TransactionRuntime.commitPersistentTransition",
+	"local function pickHiddenLocation",
+	"Persistent transition helper"
+)
+for _, marker in ipairs({
+	"local existing = TransactionRuntime.findLogicalOperation(profile, kind)",
+	"TransactionRuntime.commitProfileValueOperation(",
+	"existing and existing.id or nil",
+	"if accepted and not durable",
+	'"TransactionReconciliation"',
+}) do
+	has(
+		persistentTransitionSource,
+		marker,
+		"Chemistry transition durability/replay support is missing " .. marker
+	)
+end
+
+local chemistryInstallSource = section(
+	mainServerSource,
+	'elseif eventKey == "ChemistrySetupPlaced"',
+	'elseif eventKey == "ChemistryCarryLost"',
+	"Chemistry install transition"
+)
+has(chemistryInstallSource, "profile.data.chemistrySetupPurchased", "Only a purchased chemistry setup may be installed")
+has(chemistryInstallSource, '"InstallChemistrySetup"', "Chemistry installation needs a stable logical replay key")
+check(
+	countPlain(chemistryInstallSource, "TransactionRuntime.commitPersistentTransition(") == 1,
+	"Chemistry installation must use exactly one journaled persistent transition"
+)
+check(
+	countPlain(chemistryInstallSource, "profile.data.chemistrySetupPlaced = true") == 1,
+	"Chemistry installation must have exactly one entitlement mutation"
+)
+has(chemistryInstallSource, "profile.data.chemistrySetupPlaced ~= true", "A duplicate chemistry install must fail mutable authorization")
+has(chemistryInstallSource, 'profile.chemistryDeliveryStep == "Install"', "Chemistry installation must require its physical install phase")
+has(chemistryInstallSource, '"ChemistryInstallNotAuthorized"', "Chemistry installation is missing an authoritative denial result")
+has(chemistryInstallSource, "if not accepted then", "An undurable/rejected chemistry install must not consume presentation state")
+has(chemistryInstallSource, "if appliedNow then", "Replay must not duplicate chemistry installation feedback or assembly")
+check(
+	not string.find(chemistryInstallSource, "markDirty(", 1, true)
+		and not string.find(chemistryInstallSource, "saveProfile(", 1, true)
+		and not string.find(chemistryInstallSource, "task.defer(saveProfile", 1, true),
+	"Chemistry install must rely on commitPersistentTransition durability, not a deferred direct save"
+)
 
 for _, token in ipairs({
 	"Delivery_ChemistrySetup_",
@@ -177,6 +248,30 @@ for _, token in ipairs({
 }) do
 	has(taskWorldSource, token, "Task world is missing " .. token)
 end
+local physicalInstallSource = section(
+	taskWorldSource,
+	"local function tryInstallChemistrySetup",
+	"local chemistryInstallElapsed",
+	"Physical chemistry installation"
+)
+local reportInstallAt = string.find(
+	physicalInstallSource,
+	'invokeFamily("ReportAction", player, "ChemistrySetupPlaced", {})',
+	1,
+	true
+)
+local refreshSnapshotAt = string.find(physicalInstallSource, "local refreshed = snapshot(player)", 1, true)
+local consumeToolAt = string.find(physicalInstallSource, "tool:Destroy()", 1, true)
+check(
+	reportInstallAt ~= nil and refreshSnapshotAt ~= nil and consumeToolAt ~= nil
+		and reportInstallAt < refreshSnapshotAt and refreshSnapshotAt < consumeToolAt,
+	"The chemistry case must remain physical until the durable install is accepted and verified"
+)
+has(
+	physicalInstallSource,
+	"refreshed.chemistrySetup.placed ~= true",
+	"World installation must verify the journaled placed entitlement before consuming the paid case"
+)
 
 for _, token in ipairs({
 	"BunkerResearchTerminal",
@@ -296,6 +391,8 @@ has(bunkerServerSource, "candySmoke.Enabled = false", "Candy smoke emitter must 
 has(bunkerServerSource, "if chemistryRewardAvailable then", "New chemistry cycles must be blocked while candy awaits collection")
 for _, marker in ipairs({
 	"CandyBatchProduced",
+	"local productionKey = string.format(",
+	"productionKey = productionKey",
 	"candyPresentation.readyToken",
 	"candyPresentation.queuePlayer",
 	"candyPresentation.release",
@@ -312,7 +409,49 @@ end
 has(mainServerSource, "candyBatchReady", "Family persistence is missing finished-uncollected batch state")
 has(mainServerSource, "candyBatchToken", "Family persistence is missing the durable ready-batch token")
 has(mainServerSource, 'eventKey == "CandyBatchProduced"', "Reaction completion cannot create its durable batch through the server API")
-has(mainServerSource, "reportedToken ~= profile.data.candyBatchToken", "Collection does not require the exact durable ready token")
+for _, marker in ipairs({
+	'TransactionRuntime.logicalOperationKind("CandyProduce", productionKey)',
+	'TransactionRuntime.logicalOperationKind("CandyCollect", reportedToken)',
+	'TransactionRuntime.logicalOperationKind("CandySale", reportedToken)',
+}) do
+	has(mainServerSource, marker, "Candy persistence is missing stable logical transition key " .. marker)
+end
+local candyProduceSource = section(
+	mainServerSource,
+	"local function createCandyBatch",
+	"local function beginCandyDelivery",
+	"Candy production transition"
+)
+local candyCollectSource = section(
+	mainServerSource,
+	"local function beginCandyDelivery",
+	"local function completeCandyDelivery",
+	"Candy collection transition"
+)
+local candySaleSource = section(
+	mainServerSource,
+	"local function completeCandyDelivery",
+	"local hostWorldActionEvents",
+	"Candy sale transition"
+)
+for label, transitionSource in pairs({
+	["production"] = candyProduceSource,
+	["collection"] = candyCollectSource,
+	["sale"] = candySaleSource,
+}) do
+	check(
+		countPlain(transitionSource, "TransactionRuntime.commitPersistentTransition(") == 1,
+		"Candy " .. label .. " must use exactly one journaled persistent transition"
+	)
+	check(
+		not string.find(transitionSource, "task.defer(saveProfile", 1, true),
+		"Candy " .. label .. " must not rely on a deferred save after accepting the transition"
+	)
+end
+has(candyProduceSource, "operationRecord.result.batchToken", "A repeated production callback must recover its original batch token")
+has(candyCollectSource, "profile.data.candyBatchToken == reportedToken", "Collection does not require the exact durable ready token")
+has(candySaleSource, "profile.data.candyDeliveryToken == reportedToken", "Sale does not require the exact active contract token")
+has(candySaleSource, "if appliedNow then", "A duplicate candy-sale callback must not repeat payout presentation")
 has(mainServerSource, "profile.data.candyDeliveryToken = reportedToken", "Collection must carry the same token into delivery")
 has(
 	bunkerServerSource,
@@ -365,7 +504,13 @@ check(
 	),
 	"Legacy always-running chemistry animation gate is still present"
 )
-has(bunkerServerSource, "if visualAccumulator < 1 / 12 then", "Lab cosmetics must keep the mobile-safe 12 Hz replication cap")
+ordered(chemistryHeartbeatSource, {
+	"visualState.accumulator += deltaTime",
+	"if visualState.accumulator < 1 / 12 then",
+	"return",
+	"local step = visualState.accumulator",
+	"visualState.accumulator = 0",
+}, "Lab cosmetics must accumulate elapsed time and keep the mobile-safe 12 Hz replication cap")
 has(mainClientSource, "TAKE CHEMISTRY CASE THROUGH BUNKER HATCH", "Outdoor chemistry guidance does not route through the hatch")
 has(mainClientSource, "INSTALL ADVANCED CHEMISTRY LAB HERE", "Underground chemistry setup guidance is missing")
 for _, token in ipairs({

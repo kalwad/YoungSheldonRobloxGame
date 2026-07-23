@@ -271,7 +271,7 @@ for _, marker in ipairs({
 	"secretBunkerPurchased = secretBunkerPurchased",
 	"secretBunkerReadyAt = secretBunkerReadyAt",
 }) do
-	has(sanitizeSource, marker, "Schema-7 bunker sanitizer is missing " .. marker)
+	has(sanitizeSource, marker, "Schema-12 bunker sanitizer is missing " .. marker)
 end
 ordered(sanitizeSource, {
 	"local secretBunkerPurchased = raw.secretBunkerPurchased == true",
@@ -288,11 +288,12 @@ lacks(
 
 local bunkerSnapshotSource = section(
 	serverSource,
-	"local function secretBunkerSnapshot(profile)",
+	"local function secretBunkerSnapshot(profile, viewerProfile)",
 	"local function syncSecretBunkerAttributes",
 	"Secret-bunker snapshot"
 )
 for _, marker in ipairs({
+	"viewerProfile = viewerProfile or profile",
 	"profile.data.secretBunkerPurchased == true",
 	"profile.data.secretBunkerReadyAt",
 	"readyAt - unixNow()",
@@ -306,7 +307,9 @@ for _, marker in ipairs({
 	"remaining = remaining",
 	"unlocked = unlocked",
 	"status = status",
-	"canOrder = profile ~= nil and profile.loaded == true and not profile.releasing and not purchased",
+	"canOrder = profile ~= nil and profile.loaded == true and not profile.releasing",
+	"viewerProfile ~= nil and partyIsHost(viewerProfile.player)",
+	"partyCanProgress() and not purchased",
 }) do
 	has(bunkerSnapshotSource, marker, "Authoritative bunker snapshot is missing " .. marker)
 end
@@ -314,7 +317,7 @@ lacks(bunkerSnapshotSource, "serverNow()", "Persistent bunker completion must us
 
 local playerAttributeSource = section(
 	serverSource,
-	"local function syncSecretBunkerAttributes(profile)",
+	"local function syncSecretBunkerAttributes(_profile)",
 	"-- The attributes above are the durable replay surface",
 	"Secret-bunker player attributes"
 )
@@ -330,12 +333,50 @@ for _, attributeName in ipairs({
 		"player:SetAttribute(\"" .. attributeName .. "\"",
 		"Server does not publish player attribute " .. attributeName
 	)
-	has(
-		serverSource,
-		"player:SetAttribute(\"" .. attributeName .. "\", nil)",
-		"Player removal does not clear " .. attributeName
+end
+
+local leavingAttributeCleanupSource = section(
+	serverSource,
+	"function TransactionRuntime.playerLifecycle.clearLeavingPlayerAttributes(player)",
+	"returnSavedPartyToLobby = function(playersToReturn)",
+	"PartyV1 departing-player attribute cleanup"
+)
+for _, attributeName in ipairs({
+	"CooperSecretBunkerId",
+	"CooperSecretBunkerPurchased",
+	"CooperSecretBunkerReadyAt",
+	"CooperSecretBunkerUnlocked",
+	"CooperSecretBunkerStatus",
+}) do
+	check(
+		countPlain(leavingAttributeCleanupSource, "\"" .. attributeName .. "\"") == 1,
+		"Departing-player cleanup must list " .. attributeName .. " exactly once"
 	)
 end
+has(
+	leavingAttributeCleanupSource,
+	"player:SetAttribute(attributeName, nil)",
+	"Departing-player cleanup does not clear every listed bunker attribute"
+)
+
+local playerRemovalSource = section(
+	serverSource,
+	"function TransactionRuntime.playerLifecycle.onPlayerRemoving(player)",
+	"function TransactionRuntime.playerLifecycle.onClose()",
+	"PartyV1 player removal lifecycle"
+)
+check(
+	countPlain(
+		playerRemovalSource,
+		"TransactionRuntime.playerLifecycle.clearLeavingPlayerAttributes(player)"
+	) == 2,
+	"Both rejected-join and loaded-profile removal paths must clear bunker attributes"
+)
+has(
+	serverSource,
+	"Players.PlayerRemoving:Connect(TransactionRuntime.playerLifecycle.onPlayerRemoving)",
+	"Player removal is not wired to the PartyV1 lifecycle authority"
+)
 
 local presentationSource = section(
 	serverSource,
@@ -372,14 +413,20 @@ local orderSource = section(
 	"Secret-bunker purchase"
 )
 for _, marker in ipairs({
+	"hostMutationAllowed(profile)",
 	"profile.data.secretBunkerPurchased == true",
 	"secretBunkerConfig.Price",
 	"secretBunkerConfig.ConstructionSeconds",
 	"profile.data.allowance < price",
-	"unixNow() + constructionSeconds",
+	"local readyAt = finiteInteger(",
+	"TransactionRuntime.commitHostPurchase(",
+	'"PurchaseSecretBunker"',
+	"setAllowance(profile, profile.data.allowance - price)",
+	"profile.data.secretBunkerPurchased = true",
+	"profile.data.secretBunkerReadyAt = readyAt",
+	"if not purchased then",
 	"SecretBunkerPurchased",
 	"requestSecretBunkerPresentation(profile, \"Purchased\")",
-	"task.defer(saveProfile, profile.player, false)",
 }) do
 	has(orderSource, marker, "Authoritative bunker purchase is missing " .. marker)
 end
@@ -387,17 +434,19 @@ lacks(orderSource, "task.wait", "Atomic bunker purchase path must not yield")
 ordered(orderSource, {
 	"if profile.data.secretBunkerPurchased == true then",
 	"profile.data.allowance < price",
+	"local readyAt = finiteInteger(",
+	"TransactionRuntime.commitHostPurchase(",
+	'"PurchaseSecretBunker"',
 	"setAllowance(profile, profile.data.allowance - price)",
 	"profile.data.secretBunkerPurchased = true",
-	"profile.data.secretBunkerReadyAt = finiteInteger(",
+	"profile.data.secretBunkerReadyAt = readyAt",
+	"if not purchased then",
 	"profile.secretBunkerCompletionAnnounced = false",
-	"markDirty(profile)",
 	"syncSecretBunkerAttributes(profile)",
 	"feedback(profile.player, \"SecretBunkerPurchased\"",
 	"broadcastState()",
 	"requestSecretBunkerPresentation(profile, \"Purchased\")",
-	"task.defer(saveProfile, profile.player, false)",
-}, "Bunker purchase must reject duplicates, debit, persist, announce, present, and save in order")
+}, "Bunker purchase must durably journal debit/entitlement before announcing or presenting construction")
 check(
 	countPlain(orderSource, "setAllowance(profile, profile.data.allowance - price)") == 1,
 	"Bunker purchase contains more than one debit path"
@@ -406,6 +455,90 @@ check(
 	countPlain(orderSource, "profile.data.secretBunkerPurchased = true") == 1,
 	"Bunker purchase contains more than one entitlement mutation"
 )
+lacks(
+	orderSource,
+	"markDirty(profile)",
+	"Bunker purchase must not create an unjournaled entitlement save path"
+)
+lacks(
+	orderSource,
+	"task.defer(saveProfile",
+	"Bunker purchase must rely on commitHostPurchase durability, not a deferred direct save"
+)
+
+local hostPurchaseSource = section(
+	serverSource,
+	"function TransactionRuntime.commitHostPurchase",
+	"local function orderMachinePart",
+	"Durable host purchase coordinator"
+)
+for _, marker in ipairs({
+	"TransactionRuntime.activeSessionId()",
+	"TransactionRuntime.commitProfileValueOperation(",
+	"-price",
+	"TransactionRuntime.purchaseStillAuthorized(profile, operationKind, price)",
+	"if accepted and not durable then",
+	'"TransactionReconciliation"',
+	'title = "SAVING PURCHASE"',
+	'return true, false, "SavePendingAccepted"',
+	"return accepted, durable, status",
+}) do
+	has(hostPurchaseSource, marker, "Host purchase durability contract is missing " .. marker)
+end
+ordered(hostPurchaseSource, {
+	"TransactionRuntime.commitProfileValueOperation(",
+	"if accepted and not durable then",
+	'"TransactionReconciliation"',
+	'return true, false, "SavePendingAccepted"',
+	"return accepted, durable, status",
+}, "An accepted ambiguous purchase must suppress retry UX while durable presentation remains pending")
+lacks(
+	hostPurchaseSource,
+	'return false, false, "SavePending"',
+	"An accepted ambiguous purchase must not be reported as a retryable failure"
+)
+
+local bunkerPurchaseTail = section(
+	orderSource,
+	"local purchased, durable, transactionStatus = TransactionRuntime.commitHostPurchase(",
+	"return true, secretBunkerConfig.Name, price, readyAt\nend",
+	"Post-commit bunker presentation"
+)
+ordered(bunkerPurchaseTail, {
+	"TransactionRuntime.commitHostPurchase(",
+	"if not purchased then",
+	"return false",
+	"if not durable then",
+	"return true, secretBunkerConfig.Name, price, readyAt, true",
+	"profile.secretBunkerCompletionAnnounced = false",
+	"syncSecretBunkerAttributes(profile)",
+	"feedback(profile.player, \"SecretBunkerPurchased\"",
+	"broadcastState()",
+	"requestSecretBunkerPresentation(profile, \"Purchased\")",
+}, "No bunker presentation may run until commitHostPurchase reports durable success")
+local savePendingBunkerSource = section(
+	orderSource,
+	"if not durable then",
+	"profile.secretBunkerCompletionAnnounced = false",
+	"Accepted save-pending bunker purchase"
+)
+has(
+	savePendingBunkerSource,
+	"return true, secretBunkerConfig.Name, price, readyAt, true",
+	"An accepted save-pending bunker purchase does not return its non-retryable pending flag"
+)
+for _, forbiddenPresentation in ipairs({
+	"syncSecretBunkerAttributes(profile)",
+	"feedback(profile.player, \"SecretBunkerPurchased\"",
+	"broadcastState()",
+	"requestSecretBunkerPresentation(profile, \"Purchased\")",
+}) do
+	lacks(
+		savePendingBunkerSource,
+		forbiddenPresentation,
+		"Save-pending bunker purchase dispatches presentation before durability: " .. forbiddenPresentation
+	)
+end
 
 local completionSource = section(
 	serverSource,
@@ -462,22 +595,36 @@ lacks(
 	"Client-supplied prices must never participate in bunker authorization"
 )
 
+local hostWorldRecoverySource = section(
+	serverSource,
+	"recoverHostWorldState = function(profile, player)",
+	"local function loadPlayer(player)",
+	"PartyV1 host-world recovery"
+)
+for _, marker in ipairs({
+	"not partyIsHost(player)",
+	"local bunkerState = secretBunkerSnapshot(profile)",
+	"profile.secretBunkerCompletionAnnounced = bunkerState.unlocked",
+	"if bunkerState.purchased then",
+	"bunkerState.unlocked and \"ProfileLoadedUnlocked\" or \"ProfileLoadedResume\"",
+	"requestSecretBunkerPresentation(",
+}) do
+	has(hostWorldRecoverySource, marker, "Host bunker rejoin recovery is missing " .. marker)
+end
 local loadSource = section(
 	serverSource,
 	"local function loadPlayer(player)",
-	"Players.PlayerAdded:Connect",
-	"Profile load/rejoin recovery"
+	"function TransactionRuntime.playerLifecycle.resetSharedActorForDeparture(userId)",
+	"Profile load/rejoin integration"
 )
-for _, marker in ipairs({
-	"local loadedBunkerState = secretBunkerSnapshot(profile)",
-	"profile.secretBunkerCompletionAnnounced = loadedBunkerState.unlocked",
+ordered(loadSource, {
+	"local loadedWorldProfile = hostProfile()",
+	"local loadedBunkerState = secretBunkerSnapshot(loadedWorldProfile)",
+	"profile.secretBunkerCompletionAnnounced = partyIsHost(player) and loadedBunkerState.unlocked or false",
 	"syncSecretBunkerAttributes(profile)",
-	"if loadedBunkerState.purchased then",
-	"loadedBunkerState.unlocked and \"ProfileLoadedUnlocked\" or \"ProfileLoadedResume\"",
-	"requestSecretBunkerPresentation(",
-}) do
-	has(loadSource, marker, "Bunker rejoin recovery is missing " .. marker)
-end
+	"if partyIsHost(player) then",
+	"recoverHostWorldState(profile, player)",
+}, "Only the PartyV1 host may recover durable bunker world presentation")
 has(
 	serverSource,
 	"completeSecretBunkerIfReady(profile)",
@@ -531,8 +678,8 @@ local terminalHomeSource = section(
 	"Computer terminal home menu"
 )
 check(
-	countPlain(terminalHomeSource, "\"Secret Underground Bunker\"") == 1,
-	"Terminal home must contain exactly one kid-friendly Secret Underground Bunker option"
+	countPlain(terminalHomeSource, "\"Secret Underground Bunker (Host)\"") == 1,
+	"Terminal home must contain exactly one host-authorized Secret Underground Bunker option"
 )
 for _, marker in ipairs({
 	"showPage(\"SecretBunker\")",

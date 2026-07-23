@@ -86,6 +86,53 @@ real Roblox Player cross-place launch. Browser testing could not hand off to the
 installed Player, so live solo, friend invitation, reserved-server,
 MemoryStore, physical-device, and complete regression rows remain open.
 
+## Current local closure candidate — 2026-07-23, not published
+
+The current working tree is based on Git commit `f823103`. Its new closure
+changes are not represented by version 308, the historical Studio screenshots,
+or the dated Studio export above. Record the final candidate commit only after
+the working tree and Studio source map are frozen.
+
+- `bash tools/verify_milestone1_local.sh` passed all eight local phases:
+  `140` Luau sources compiled, the analyzer was clean, deterministic contracts
+  passed `130/130`, the compiler-register matrix passed `27/27`,
+  `git diff --check` was clean, all frozen schema/place/feature contracts
+  matched, all 13 active clients passed the authority scan, and retired/future
+  runtime surfaces remained disabled.
+- The deterministic additions cover revisioned Ready state, independent
+  Ready/Start throttles, double-Start idempotency, synchronous and asynchronous
+  bounded teleport failure paths, one-use admission tickets, exact host-grace
+  boundaries, sprint rules, same-frame two-client task completion,
+  fail-before-write/fail-after-write reward reconciliation, and completed
+  boombox payout settlement under missed ticks, duplicate callbacks, save
+  failures, and end/tick races.
+- The lobby permits at most two `TeleportAsync` requests for one launch
+  attempt. A synchronous request failure or asynchronous
+  `TeleportInitFailed` callback can consume the single remaining attempt. The
+  retry reuses the original reserved server, session manifest, admission
+  tickets, `TeleportOptions`, and launch token; duplicate or stale callbacks
+  cannot create another launch. This is locally source- and contract-verified,
+  not live TeleportService evidence.
+- Candy production/collection/sale, indexed boombox payout ticks, exact
+  completed-playback boombox settlement, and paid
+  task-upgrade/chemistry/boombox/machine-stage install acknowledgements now use
+  named, server-issued persistent operations. A completed boombox playback
+  reconciles to exactly `$300` without overpaying when ticks are missed or a
+  save/result callback races the end of playback. The legacy broad
+  `AdjustCurrency` and `SpendAllowance` API routes fail closed as deprecated.
+- `verify_milestone1_value_operations.luau`,
+  `verify_milestone1_remote_inventory.luau`, and
+  `verify_ui_accessibility_static.luau` compile and are ready for the
+  current-candidate Studio audit. They are read-only verifiers; they were not
+  run in Studio or a published client as part of this local evidence.
+
+This closes the repeatable CLI/static batch only. It does **not** close
+Milestone 1: the current working tree has not been synchronized into or
+executed in Studio, and privately published
+solo/two/four-player sessions, real MemoryStore/DataStore/TeleportService fault
+paths, adversarial runtime security, full feature regression, human visual
+acceptance, and physical-device input remain required.
+
 ## House source map
 
 | Studio instance | Canonical local source |
@@ -117,11 +164,17 @@ Required house contracts:
   prevents bounded or out-of-order history from reviving an old operation.
   Purchase presentation starts only after a durable debit+entitlement write;
   ambiguous saves reconcile without replaying the mutation.
-- The Milestone 1 journal closure protects shared task payouts and the six paid
-  order operations (machine part, boombox, autoplay, task robot, bunker, and
-  chemistry setup). Physical install acknowledgements and other legacy income
-  paths remain explicitly outside this closure and require their own operation
-  IDs before a later milestone may claim full-economy exactly-once coverage.
+- The Milestone 1 journal protects shared task payouts, the six paid order
+  operations (machine part, boombox, autoplay, task robot, bunker, and
+  chemistry setup), candy production/collection/sale, every indexed boombox
+  payout tick, one stable completed-playback settlement, and paid physical
+  install acknowledgement for task upgrades, chemistry, boombox, and machine
+  stages. The settlement reconciles any missed tick/save/end race to exactly
+  `$300` without duplicate overpayment in the deterministic fault suite. Broad
+  legacy currency operations are retired. This is source and deterministic
+  evidence; isolated DataStore failure/retry, concurrent-server, rejoin, and
+  published runtime tests are still required before calling the whole economy
+  globally exactly-once.
 - Before a task becomes visible, the host durably stores the versioned
   `CalmTaskStart` checkpoint: logical task identity, host ordinal, immutable
   eligible user IDs, safe task-start details, and recovery timing. A recovered
@@ -191,8 +244,11 @@ gates.
 4. Set the house cap to exactly four and the lobby cap to 50. During a rebuild,
    keep the last known-good start place active until both edit/runtime
    verification passes.
-5. Run `verify_milestone1_foundation.luau` in edit and runtime mode in both
-   places. Capture the output as evidence.
+5. Run `verify_milestone1_foundation.luau`,
+   `verify_milestone1_value_operations.luau`,
+   `verify_milestone1_remote_inventory.luau`, and
+   `verify_ui_accessibility_static.luau` in their documented edit/client-runtime
+   contexts in both places. Capture every output as evidence.
 6. Publish to a private test version and run solo, two-player, and four-player
    cross-place sessions. Studio mocks cannot pass the TeleportService,
    MemoryStore, host-rejoin, or reserved-server gates.
@@ -202,9 +258,11 @@ gates.
 8. If rebuilding from a rollback, make `100748614383412` the start place only
    after the pre-publication matrix gates pass, then run one final fresh-profile
    and migrated-profile production smoke test.
-9. Export a dated `milestone-1-verified` rollback set and record the verified Git
-   implementation commit (`e1d4b29`). The dated house/lobby exports now exist; the matrix remains open
-   until its genuine live and full-regression rows are evidenced.
+9. Export a dated `milestone-1-verified` rollback set and record the exact
+   verified Git implementation commit. Historical commit `e1d4b29` and the
+   2026-07-22 exports remain rollback evidence; they do not contain the current
+   local closure changes. The matrix remains open until genuine live and
+   full-regression rows are evidenced.
 
 ## Remaining gates not proven by local or Studio evidence
 
@@ -216,6 +274,8 @@ gates.
 - Real Roblox Player solo and cross-place handoff.
 - Physical-phone/tablet touch behavior.
 - Full existing-feature and four-player collision/delivery playthroughs.
+- Current-candidate Studio execution of the value-operation, complete remote
+  inventory, and static/runtime UI accessibility verifiers.
 
 Local compilation or a one-client Studio run must never be presented as proof
 that these live gates passed.

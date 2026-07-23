@@ -365,10 +365,50 @@ end
 
 local taskStartFunction = functionSection(serverSource, "startNextTask")
 for _, marker in ipairs({
+	"bankCycle = id == BANK_TASK_ID and (bankHackSuccessCount(profile) + 1) or 1",
+	"bankReward = id == BANK_TASK_ID and bankHackReward(profile) or 0",
+	"bankPreviewStepSeconds = id == BANK_TASK_ID and bankHackPreviewStep(profile) or 0.78",
+	"bankStartingLength = id == BANK_TASK_ID and bankHackStartingLength(profile) or 2",
+	"TransactionRuntime.commitCalmTaskStart(profile, false)",
+}) do
+	has(taskStartFunction, marker, "Durable bank-task checkpoint does not capture its complete cycle difficulty")
+end
+
+local checkpointSanitizerFunction = functionSection(serverSource, "sanitizeCalmTaskCheckpoint")
+for _, marker in ipairs({
+	"bankCycle = finiteInteger(raw.bankCycle, 1, 1, 1_000_001)",
+	"bankReward = finiteInteger(raw.bankReward, 0, 0, 2_000_000_000)",
+	"bankPreviewStepSeconds = math.clamp(bankPreviewStepSeconds, 0.05, 10)",
+	"bankStartingLength = finiteInteger(raw.bankStartingLength, 2, 1, 100)",
+}) do
+	has(checkpointSanitizerFunction, marker, "Bank checkpoint sanitizer is missing bounded difficulty field " .. marker)
+end
+
+local checkpointExposureSource = sourceSection(
+	serverSource,
+	"function TransactionRuntime.exposeCalmTaskCheckpoint(profile, checkpoint, recovered)",
+	"function TransactionRuntime.commitCalmTaskStart(profile, recovered)",
+	"Durable bank difficulty exposure"
+)
+ordered(checkpointExposureSource, {
+	"record.bankCycle = checkpoint.bankCycle",
+	"record.bankReward = checkpoint.bankReward",
+	"record.bankPreviewStepSeconds = checkpoint.bankPreviewStepSeconds",
+	"record.bankStartingLength = checkpoint.bankStartingLength",
+	"-- CALM_TASK_START_EXPOSURE_AFTER_DURABLE_SAVE",
+	"partySession.task = record",
+}, "A bank task must restore its captured difficulty before durable shared exposure")
+for _, forbiddenLiveRecalculation in ipairs({
+	"record.bankCycle = bankHackSuccessCount(profile)",
+	"record.bankReward = bankHackReward(profile)",
 	"record.bankPreviewStepSeconds = bankHackPreviewStep(profile)",
 	"record.bankStartingLength = bankHackStartingLength(profile)",
 }) do
-	has(taskStartFunction, marker, "Bank task assignment does not capture its complete cycle difficulty")
+	lacks(
+		checkpointExposureSource,
+		forbiddenLiveRecalculation,
+		"Recovered bank difficulty must not be recomputed from a newer profile state"
+	)
 end
 
 local automationLaunchFunction = functionSection(serverSource, "launchTaskAutomation")
@@ -399,8 +439,10 @@ lacks(automationLaunchFunction, "bankHackEvent", "HackerBot must not fake client
 local startFunction = functionSection(serverSource, "startBankHack")
 for _, marker in ipairs({
 	"validComputerSession(profile.player)",
-	"profile.task",
+	"local record = partySession.task",
 	"BANK_TASK_ID",
+	"record.bankActorUserId",
+	"profile.player.UserId",
 	"profile.bankHackSession",
 	"bankRetryReadyAt",
 	"bankHackSessionSerial += 1",
@@ -424,6 +466,8 @@ for _, marker in ipairs({
 	has(startFunction, marker, "Bank start validation/session creation is incomplete")
 end
 ordered(startFunction, {
+	"local record = partySession.task",
+	"record.bankActorUserId",
 	"record.bankStartingLength",
 	"local sequenceLength = startingLength + bankRoundCount() - 1",
 	"local session = {",
@@ -530,37 +574,120 @@ check(invalidateAt ~= nil and validateAt ~= nil and completeAt ~= nil and invali
 
 local completionFunction = sourceSection(serverSource, "completeTask = function(profile", "local function bankRoundCount", "Task completion authority")
 for _, marker in ipairs({
+	"local record = expectedRecord or partySession.task",
+	"partySession.task ~= record",
+	'record.status ~= "Active" and record.status ~= "Completing"',
+	"record.completionWorkerActive == true",
 	"record.id == BANK_TASK_ID",
-	"local automatedBankProof = record.automated == true",
+	"local automationProfile = hostProfile()",
+	"local automatedBankProof = automationProfile ~= nil and record.automated == true",
 	"record.automationUpgradeId == \"HackerBot\"",
-	"profile.data.taskAutomationInstalled.HackerBot == true",
+	"automationProfile.data.taskAutomationInstalled.HackerBot == true",
 	"type(record.bankAutomationRunId) == \"string\"",
 	"record.bankAutomationRunId == record.automationRunId",
-	"profile.automationRuns[record.automationRunId] == record",
+	"automationProfile.automationRuns[record.automationRunId] == record",
 	"local manualBankProof = record.automated ~= true and record.bankHackValidated == true",
 	"if (not automatedBankProof and not manualBankProof) or record.bankSuccessCounted == true then",
-	"record.bankSuccessCounted == true",
 	"record.bankSuccessCounted = true",
 	"reward = finiteInteger(record.bankReward, bankHackReward(profile)",
-	"profile.data.bankHackSuccesses = bankHackSuccessCount(profile) + 1",
-	"setAllowance(profile, profile.data.allowance + reward)",
-	"profile.data.totalTasks += 1",
-	"markDirty(profile)",
+	'record.status = "Completing"',
+	"for _, userId in ipairs(record.eligibility.userIds) do",
+	"record.eligibility.memberSet[partySession.hostUserId] == true",
+	"local operationKind = \"TaskReward:\" .. tostring(record.logicalId)",
+	"TransactionRuntime.reserveProfileValueOperation(",
+	"TransactionRuntime.commitProfileValueOperation(",
+	"setAllowance(recipient, recipient.data.allowance + reward)",
+	"recipient.data.totalTasks += 1",
+	"recipient.data.bankHackSuccesses = bankHackSuccessCount(recipient) + 1",
+	"recipient.data.calmTaskCheckpoint = nil",
+	"if not allResolved then",
+	'record.status = "Completed"',
+	"partySession.completedTasks += 1",
+	"partySession.task = nil",
 	"broadcastState()",
-	"task.defer(saveProfile, profile.player, false)",
 }) do
 	has(completionFunction, marker, "Idempotent manual/HackerBot bank completion authority is incomplete")
 end
 ordered(completionFunction, {
 	"record.bankSuccessCounted = true",
-	"profile.data.bankHackSuccesses = bankHackSuccessCount(profile) + 1",
-	"setAllowance(profile, profile.data.allowance + reward)",
-	"profile.data.totalTasks += 1",
-	"markDirty(profile)",
+	'record.status = "Completing"',
+	"local operationKind = \"TaskReward:\" .. tostring(record.logicalId)",
+	"TransactionRuntime.commitProfileValueOperation(",
+	"setAllowance(recipient, recipient.data.allowance + reward)",
+	"recipient.data.totalTasks += 1",
+	"recipient.data.bankHackSuccesses = bankHackSuccessCount(recipient) + 1",
+	"recipient.data.calmTaskCheckpoint = nil",
+	'record.status = "Completed"',
+	"partySession.task = nil",
 	"broadcastState()",
-	"task.defer(saveProfile, profile.player, false)",
-}, "Bank award/save ordering")
-check(countPlain(serverSource, "profile.data.bankHackSuccesses = bankHackSuccessCount(profile) + 1") == 1, "Bank success progression has more than one mutation path")
+}, "Bank proof, journaled shared award, host checkpoint, and finalization ordering")
+check(
+	countPlain(serverSource, "recipient.data.bankHackSuccesses = bankHackSuccessCount(recipient) + 1") == 1,
+	"Bank success progression has more than one mutation path"
+)
+lacks(
+	completionFunction,
+	"task.defer(saveProfile",
+	"Bank rewards must use the schema-12 operation journal instead of a deferred direct save"
+)
+lacks(
+	completionFunction,
+	"setAllowance(profile, profile.data.allowance + reward)",
+	"Bank success must reward the immutable eligible recipients, not only the actor profile"
+)
+
+local eligibilityFunction = sourceSection(
+	serverSource,
+	"-- M1_TASK_ELIGIBILITY_CONTRACT",
+	"function TransactionRuntime.checkpointValidation",
+	"Immutable task eligibility"
+)
+for _, marker in ipairs({
+	"local function captureTaskEligibility(version)",
+	"partySession.activePlayers",
+	"partySession.expectedMembers[userId] == true",
+	"profile.loaded and not profile.releasing and not profile.leaseLost",
+	"profile.detached ~= true",
+	"table.sort(userIds)",
+	"return table.freeze({",
+	"userIds = table.freeze(userIds)",
+	"memberSet = table.freeze(memberSet)",
+	"record.eligibility.memberSet[userId] ~= true",
+	"record.eligibilityResolutionByUserId[userId]",
+}) do
+	has(eligibilityFunction, marker, "Immutable task eligibility contract is incomplete")
+end
+
+local taskCheckpointFunction = functionSection(serverSource, "startNextTask")
+for _, marker in ipairs({
+	"local eligibility = captureTaskEligibility(profile.data.totalTasks + 1)",
+	"eligibility.memberSet[profile.player.UserId] ~= true",
+	"eligibleUserIds = table.clone(eligibility.userIds)",
+	"profile.data.calmTaskCheckpoint = {",
+	"TransactionRuntime.commitCalmTaskStart(profile, false)",
+}) do
+	has(taskCheckpointFunction, marker, "Bank task start does not persist its immutable eligibility checkpoint")
+end
+
+local recipientOrderingSource = sourceSection(
+	completionFunction,
+	"local payoutUserIds = {}",
+	"local allResolved = true",
+	"Task reward recipient ordering"
+)
+ordered(recipientOrderingSource, {
+	"if userId ~= partySession.hostUserId then",
+	"table.insert(payoutUserIds, userId)",
+	"table.insert(payoutUserIds, partySession.hostUserId)",
+	"for _, userId in ipairs(payoutUserIds) do",
+	"if userId == partySession.hostUserId then",
+	"local everyGuestTerminal = true",
+	'guestResolution.status ~= "Committed" and guestResolution.status ~= "Forfeited"',
+	"if not everyGuestTerminal then",
+	"local operationKind = \"TaskReward:\" .. tostring(record.logicalId)",
+	"if userId == partySession.hostUserId then",
+	"recipient.data.calmTaskCheckpoint = nil",
+}, "Guests must resolve before the host clears the durable calm-task checkpoint")
 
 local handler = sourceSection(serverSource, "bankHackEvent.OnServerEvent:Connect", "local function setupLeaderstats", "Dedicated bank remote handler")
 for _, action in ipairs({ "Start", "Input", "Cancel" }) do
@@ -598,17 +725,50 @@ end
 local requestHandler = sourceSection(serverSource, "requestEvent.OnServerEvent:Connect", "local function setupLeaderstats", "Family request handler")
 has(requestHandler, "action == \"CloseComputer\"", "Closing the terminal is not handled server-side")
 has(requestHandler, "cancelBankHackSession", "Closing/EXIT does not cancel an active bank session")
-local removingSection = sourceSection(serverSource, "Players.PlayerRemoving:Connect", "for _, player in ipairs(Players:GetPlayers())", "Player removal cleanup")
-has(removingSection, "cancelBankHackSession", "Player removal does not cancel a bank session")
-has(removingSection, "bankInputNextAt[player] = nil", "Player removal leaks its bank input limiter")
+has(
+	serverSource,
+	"Players.PlayerRemoving:Connect(TransactionRuntime.playerLifecycle.onPlayerRemoving)",
+	"Player removal is not wired to the PartyV1 lifecycle authority"
+)
+local removingSection = sourceSection(
+	serverSource,
+	"function TransactionRuntime.playerLifecycle.onPlayerRemoving(player)",
+	"function TransactionRuntime.playerLifecycle.onClose()",
+	"PartyV1 player removal cleanup"
+)
+for _, marker in ipairs({
+	"if profile and profile.bankHackSession then",
+	"cancelBankHackSession(profile, \"Player left the server.\", false)",
+	"bankInputNextAt[player] = nil",
+}) do
+	has(removingSection, marker, "Player removal bank-session cleanup is incomplete")
+end
 local watchdog = sourceSection(
 	serverSource,
-	"task.spawn(function()\n\tlocal nextAutoSave",
-	"\n\nbroadcastState()",
-	"Server watchdog"
+	"function TransactionRuntime.runMaintenanceLoop()",
+	"function TransactionRuntime.runSessionHeartbeatLoop()",
+	"PartyV1 server maintenance watchdog"
 )
-has(watchdog, "bankHackSession", "Server watchdog does not inspect active bank sessions")
-has(watchdog, "validComputerSession", "Server watchdog does not cancel bank sessions after leaving the computer")
+for _, marker in ipairs({
+	"for _, profile in ipairs(presentProfiles()) do",
+	"local bankSession = profile.bankHackSession",
+}) do
+	has(watchdog, marker, "Server watchdog bank-session cleanup is missing " .. marker)
+end
+ordered(watchdog, {
+	"local bankSession = profile.bankHackSession",
+	"if bankSession and (partySession.task ~= bankSession.record or not validComputerSession(profile.player)) then",
+	"cancelBankHackSession(",
+	"partySession.task ~= bankSession.record",
+	"and \"The active task changed, so the bank connection was closed.\"",
+	"or \"The bank connection was lost when you left the computer.\"",
+	"true",
+}, "The maintenance watchdog must invalidate stale shared tasks and out-of-range computer sessions")
+has(
+	serverSource,
+	"task.spawn(TransactionRuntime.runMaintenanceLoop)",
+	"PartyV1 startup does not run the authoritative maintenance watchdog"
+)
 
 -- The client can report only input intent. It can never report success, reward,
 -- cycle, round, pattern, or a currency mutation.
@@ -630,7 +790,6 @@ end
 -- Client UI, input, timing, and stale-render protection --------------------
 
 for _, marker in ipairs({
-	"local ContextActionService = game:GetService(\"ContextActionService\")",
 	"local bankHackEvent = remotes:WaitForChild(\"BankHack\"",
 	"\"Hack Medford Bank\"",
 	"MEDFORD BANK",
@@ -643,8 +802,6 @@ for _, marker in ipairs({
 	"BankHackCancelled",
 	"BankHackError",
 	"bankHackEvent.OnClientEvent:Connect",
-	"ContextActionService:BindActionAtPriority",
-	"ContextActionService:UnbindAction",
 	"Enum.ContextActionResult.Sink",
 	"local bankKeyRows =",
 	"bankPanel.Parent = terminal",
@@ -661,6 +818,20 @@ for _, marker in ipairs({
 }) do
 	has(clientSource, marker, "Client bank terminal/UI contract is incomplete")
 end
+local bindInputsFunction = functionSection(clientSource, "bindBankInputs")
+for _, marker in ipairs({
+	"game:GetService(\"ContextActionService\"):BindActionAtPriority(",
+	"BANK_INPUT_ACTION",
+	"return Enum.ContextActionResult.Sink",
+}) do
+	has(bindInputsFunction, marker, "Bank input binding is missing " .. marker)
+end
+local unbindInputsFunction = functionSection(clientSource, "unbindBankInputs")
+has(
+	unbindInputsFunction,
+	"game:GetService(\"ContextActionService\"):UnbindAction(BANK_INPUT_ACTION)",
+	"Bank input teardown does not remove the exact BANKLINK action"
+)
 
 local bankStartConstructor = sourceSection(
 	clientSource,

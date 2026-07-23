@@ -73,6 +73,23 @@ local function validBoundedString(value: unknown, minimum: number, maximum: numb
 	return type(value) == "string" and #value >= minimum and #value <= maximum
 end
 
+-- Build the stable, bounded kind used to find retries of one logical
+-- server-authored transition. This deliberately accepts no spaces, control
+-- characters, path syntax, or arbitrary client text.
+function Ledger.logicalKind(prefix: unknown, rawKey: unknown): string?
+	local key = tostring(rawKey or "")
+	if type(prefix) ~= "string" or #prefix < 1 or #prefix > 32
+		or #key < 1 or string.match(key, "^[%w_:%-]+$") == nil
+	then
+		return nil
+	end
+	local kind = prefix .. ":" .. key
+	if #kind > 64 then
+		return nil
+	end
+	return kind
+end
+
 local function sanitizeResult(raw: unknown): { [string]: string | number | boolean }
 	local result: { [string]: string | number | boolean } = {}
 	if type(raw) ~= "table" then

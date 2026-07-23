@@ -2606,7 +2606,7 @@ local function collectChemistryReward(subjectPlayer)
 
 	chemistryRewardClaiming = true
 	collectCandyPrompt.Enabled = false
-	local invoked, accepted, batchToken = invokeFamily(
+	local invoked, accepted, batchToken, durable = invokeFamily(
 		"ReportAction",
 		player,
 		"CandyBatchCollected",
@@ -2645,7 +2645,12 @@ local function collectChemistryReward(subjectPlayer)
 	chemistryControlStatus.Text = [[REACTOR: STANDBY
 PUMPS: IDLE
 OUTPUT: RETRACTING]]
-	sendNotice(player, "Blue Rock Candy pan equipped! Follow the yellow arrow to the Los Pollos Hermanos truck, or press its hotbar number to stash it.")
+	sendNotice(
+		player,
+		durable == false
+			and "Blue Rock Candy pan equipped while Roblox confirms the buyer contract. It cannot duplicate."
+			or "Blue Rock Candy pan equipped! Follow the yellow arrow to the Los Pollos Hermanos truck, or press its hotbar number to stash it."
+	)
 	task.delay(0.65, candyPresentation.pump)
 	return true
 end
@@ -2686,6 +2691,12 @@ local function startChemistryExperiment(player)
 
 	chemistryExperimentToken += 1
 	local token = chemistryExperimentToken
+	local productionKey = string.format(
+		"%d:%d:%d",
+		player.UserId,
+		token,
+		math.floor(now * 1000)
+	)
 	local endsAt = now + CHEMISTRY_EXPERIMENT_DURATION
 	chemistryExperimentReadyAt = endsAt + CHEMISTRY_EXPERIMENT_COOLDOWN
 	chemistryExperimentOwnerUserId = player.UserId
@@ -2711,16 +2722,24 @@ FLOW: CHARGING]]
 		-- Persist the completed reaction before leasing the one shared physical
 		-- tray. If the owner leaves at any point after this returns, the same token
 		-- is restored on their next server and can be presented again.
-		local invoked, accepted, batchToken = invokeFamily(
+		local invoked, accepted, batchToken, durable = invokeFamily(
 			"ReportAction",
 			player,
 			"CandyBatchProduced",
-			{ productKind = "BlueRockCandy" }
+			{
+				productKind = "BlueRockCandy",
+				productionKey = productionKey,
+			}
 		)
 		if invoked and accepted == true and type(batchToken) == "string" and batchToken ~= "" then
 			candyPresentation.queuePlayer(player)
 			candyPresentation.pump()
-			sendNotice(player, "Chemistry complete! Your Blue Rock Candy batch is saved and will slide out when the shared tray is available.")
+			sendNotice(
+				player,
+				durable == false
+					and "Chemistry complete! The tray is ready while Roblox confirms the batch save."
+					or "Chemistry complete! Your Blue Rock Candy batch is saved and will slide out when the shared tray is available."
+			)
 		else
 			sendNotice(player, "Chemistry finished, but its durable output record could not be secured. Please run the reaction again.")
 		end

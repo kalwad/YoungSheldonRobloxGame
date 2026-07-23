@@ -25,7 +25,7 @@ of the row and does not satisfy its remaining live or topology requirement.
 - Only `Lobby` is enabled. Horror, secrets, finale, postgame, and production
   scenario tools remain disabled.
 
-## Current candidate Studio closure evidence — 2026-07-22
+## Carried-forward Studio evidence — 2026-07-22
 
 Candidate commits: `f31c0cd` + `14932d7`.
 
@@ -38,9 +38,9 @@ Candidate commits: `f31c0cd` + `14932d7`.
   launch-block reason text. The client does not parse captions to infer state.
 - Launch is atomically locked, diagnostics are allowlisted and secret-safe, and
   stale rollback can only alter its own session/reconnect records.
-- The current Milestone 1 lobby edit audit passed `316` checks. No
-  current-candidate screenshot or physical-device/mobile visual acceptance is
-  claimed.
+- That Milestone 1 lobby edit audit passed `316` checks. No
+  current-working-tree screenshot or physical-device/mobile visual acceptance
+  is claimed.
 - The lobby environment is now a warm 1980s suburban rec room. Its updater is
   scoped and idempotent and cannot clear Workspace, Terrain, replicated data,
   StarterGui, or runtime scripts.
@@ -60,7 +60,8 @@ Candidate commits: `f31c0cd` + `14932d7`.
   authoritative `selfReady = true` and `canLaunch = true`; startup readiness
   passed again. Server and client startup logs contained no project
   errors/warnings (only the external Studio MCP version-mismatch warning).
-- The current preview passed `71` edit checks and `118` active-runtime checks.
+- That carried-forward preview passed `71` edit checks and `118`
+  active-runtime checks.
   Runtime state was schema `12` / `PartyV1`, with a loaded `Active` host, all
   four core remotes, ready world and automation controllers, exactly George,
   Georgie, Mary, and Missy, and every future feature flag still false.
@@ -73,22 +74,53 @@ Candidate commits: `f31c0cd` + `14932d7`.
   (`CooperYardRideables`); the largest client entry was external/core and below
   `0.8%`. This is not mobile, multiplayer, active-feature, or soak evidence.
 
+## Current local candidate evidence — 2026-07-23
+
+The working tree is based on `f823103` and is not published. Its local
+deterministic/static evidence passed, but its new source changes must not inherit
+the Studio, screenshot, or live evidence above until those scenarios are rerun.
+
+- `bash tools/verify_milestone1_local.sh` passed all eight phases: `140` sources
+  compiled, static analysis passed, deterministic contracts passed `130/130`,
+  compiler-register profiles passed `27/27`, `git diff --check` passed, frozen
+  configuration and value-operation markers matched, 13 active clients passed
+  the authority scan, and disabled/retired runtime surfaces stayed absent.
+- New deterministic scenarios cover one-use tickets, Ready/Start ordering,
+  double-Start, synchronous and asynchronous bounded same-reservation teleport
+  retries, exact host-grace boundaries, sprint, same-frame two-client
+  completion, reward retry reconciliation, and boombox missed-tick/save/race
+  settlement. These fakes are not published service or multi-client proof.
+- Candy lifecycle, indexed boombox payout ticks, exact completed-playback
+  boombox settlement, and paid physical install transitions now have stable
+  server-owned persistent operation identities. A completed playback settles
+  to exactly `$300` without duplicate overpayment. Broad `AdjustCurrency` and
+  `SpendAllowance` routes are retired.
+- Three read-only current-candidate Studio audits now compile:
+  `verify_milestone1_value_operations.luau`,
+  `verify_milestone1_remote_inventory.luau`, and
+  `verify_ui_accessibility_static.luau`. They remain **NOT RUN** in Studio and a
+  published client for this candidate.
+
 ## Automated contract checks
 
 | ID | Check | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| A01 | Compile every local `.luau` source | No compile errors | PASS | Current candidate `f31c0cd` + `14932d7`: default `luau-compile` passed 120/120 sources |
-| A02 | `git diff --check` | No whitespace errors | PASS | 2026-07-22: exited 0 with no findings |
+| A01 | Compile every local `.luau` source | No compile errors | PASS | 2026-07-23 local gate: default `luau-compile` passed 140/140 sources |
+| A02 | `git diff --check` | No whitespace errors | PASS | 2026-07-23 local gate: exited 0 with no findings |
 | A03 | Run `verify_milestone1_foundation.luau` in house edit mode | PASS | NOT RUN | Historical 2026-07-22 house evidence passed 530 checks, but the current schema-12 candidate was not installed into or rerun in the separate house place |
-| A04 | Run verifier in a one-player house runtime | PASS | NOT RUN | Historical 2026-07-22 house evidence passed 616 checks; the current candidate was exercised only through the explicitly non-production Studio preview adapter |
-| A05 | Run verifier in lobby edit mode | PASS | PASS | Current candidate: 316 Milestone 1 lobby edit checks passed |
-| A06 | Run verifier in a lobby runtime | PASS | PARTIAL | Current candidate zero-delay Ready/Launch and fresh startup-readiness run passed; no complete current-candidate lobby-runtime verifier count was recorded |
+| A04 | Run verifier in a one-player house runtime | PASS | NOT RUN | Historical 2026-07-22 house evidence passed 616 checks and the carried-forward candidate used the explicitly non-production Studio preview adapter; the latest working tree has not run in Studio |
+| A05 | Run verifier in lobby edit mode | PASS | NOT RUN | Carried-forward candidate passed 316 checks; rerun after installing the current local source map |
+| A06 | Run verifier in a lobby runtime | PASS | NOT RUN | Carried-forward zero-delay Ready/Launch and startup-readiness evidence exists; the current local candidate has not run the complete lobby-runtime verifier |
 | A07 | Run every Milestone 0 gameplay regression suite | No regressions except intentional M1 source/cap contracts | NOT RUN | |
-| A08 | Client-authority scan | No client cash awards, task completion, host selection, or story forcing | PASS | 2026-07-22: all 13 active local client sources scanned; no forbidden authority pattern |
-| A09 | Studio in-place house verifier | Preview package and safety guards pass before launch; normal house/remotes/scripts/profile pass after launch | PASS | Current candidate: 71/71 edit checks and 118/118 active-runtime checks |
-| A10 | Core compiler register preflight and fresh startup readiness | Default plus register-pressure profiles compile; core authorities reach fresh runtime markers | PASS | `verify_runtime_register_budget.sh` passed 27/27 (full `O0`/`O1`/`O2` × `g0`/`g1`/`g2` matrix across all three core servers); two clean fresh runs reported `RuntimeStartupReadiness PASS` |
-| A11 | Deterministic contract suite | Every local contract test passes | PASS | `luau tests/run.luau`: 82/82 passed |
-| A12 | Physical-prompt source/runtime guard audit | Every required prompt guard is present | PASS | `verify_prompt_security_guards.luau`: 124 checks passed; published adversarial abuse remains open |
+| A08 | Client-authority scan | No client cash awards, task completion, host selection, or story forcing | PASS | 2026-07-23 local gate: all 13 active client sources scanned; no forbidden authority pattern |
+| A09 | Studio in-place house verifier | Preview package and safety guards pass before launch; normal house/remotes/scripts/profile pass after launch | NOT RUN | Carried-forward candidate passed 71/71 edit and 118/118 active-runtime checks; rerun after current source sync |
+| A10 | Core compiler register preflight and fresh startup readiness | Default plus register-pressure profiles compile; core authorities reach fresh runtime markers | PARTIAL | Current local `verify_runtime_register_budget.sh` passed 27/27; the two clean `RuntimeStartupReadiness PASS` runs belong to the carried-forward Studio candidate and must be rerun |
+| A11 | Deterministic contract suite | Every local contract test passes | PASS | 2026-07-23: `luau tests/run.luau` passed 130/130 |
+| A12 | Physical-prompt source/runtime guard audit | Every required prompt guard is present | PARTIAL | Carried-forward `verify_prompt_security_guards.luau` passed 124 checks; current-candidate Studio and published adversarial abuse remain open |
+| A13 | Current value-operation audit in Studio edit/runtime | Candy, boombox ticks and exact `$300` settlement, paid installs, and retired broad APIs match the journal contract | NOT RUN | `verify_milestone1_value_operations.luau` compiles; its corresponding deterministic identities and settlement fault/race cases pass locally, but no current Studio result is recorded |
+| A14 | Complete remote/prompt/server-boundary inventory in Studio and published candidate | Inventory matches allowlists; production debug surfaces are absent | NOT RUN | `verify_milestone1_remote_inventory.luau` compiles; published malformed-payload/replay/flood probes remain separate required evidence |
+| A15 | UI accessibility audit in edit and client runtime | Safe-area, touch-target, contrast, scrolling, close/back, selection, and status contracts pass | NOT RUN | `verify_ui_accessibility_static.luau` compiles; it makes no aesthetic, physical-hardware, localization, or published-client claim |
+| A16 | Repeatable local Milestone 1 gate | All eight CLI/static phases pass | PASS | `bash tools/verify_milestone1_local.sh`: 140 compile, analyzer clean, 130/130 deterministic, 27/27 register, 13 active client authority scans, clean diff/config/value/disabled-surface phases |
 
 ## Lobby UI and Studio interaction checks
 
@@ -97,22 +129,28 @@ handoff, Roblox friend invitation, or physical-device touch behavior.
 
 | ID | Check | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| L01 | Play Solo in Studio | Validated party opens a playable in-place house without production teleport or saved authority | PASS | Exact keyboard-activated Create Party → Ready → Start flow replaced lobby with verified house runtime |
-| L02 | Create Party | Host party is created and controls update | PASS | Final lobby interaction test |
-| L03 | Ready and cancel ready | Text/state toggles correctly in both directions | PASS | Reproduced and repaired; typed server state remained stable through rerenders, Ready/cancel worked, and zero-delay regression passed |
-| L04 | Host Launch in Studio | In-place house handoff only; no reserved server, MemoryStore, live ticket, or production DataStore authority | PASS | Runtime returned `STUDIO_HOUSE_STARTED`; lobby GUI/world disappeared and normal house systems loaded |
-| L05 | Leave Party | Party UI returns to the no-party state | PASS | Final lobby interaction test |
+| L01 | Play Solo in Studio | Validated party opens a playable in-place house without production teleport or saved authority | NOT RUN | Carried-forward candidate passed; current server source has not been rerun |
+| L02 | Create Party | Host party is created and controls update | NOT RUN | Carried-forward candidate passed; current server source has not been rerun |
+| L03 | Ready and cancel ready | Text/state toggles correctly in both directions | PARTIAL | Typed/revisioned state and zero-delay ordering pass deterministically; carried-forward Studio passed, but current server source has not been rerun |
+| L04 | Host Launch in Studio | In-place house handoff only; no reserved server, MemoryStore, live ticket, or production DataStore authority | NOT RUN | Carried-forward runtime returned `STUDIO_HOUSE_STARTED`; current server source has not been rerun |
+| L05 | Leave Party | Party UI returns to the no-party state | NOT RUN | Carried-forward candidate passed; current server source has not been rerun |
 | L06 | Responsive simulated layouts | Desktop, small phone portrait/landscape, modern phone, Android landscape, and tablet fit and scroll | PASS | Final captures: iPhone 7 portrait/landscape, iPhone 13 portrait, Galaxy A16 landscape, iPad 6 landscape, and desktop |
 | L07 | Lobby movement presentation | Scriptable movement prevents mobile joystick/jump controls covering UI | PASS | Confirmed in simulated mobile layouts |
 | L08 | Physical phone/tablet interaction | Touch, safe areas, keyboard opening, and rotation work on real hardware | NOT RUN | Simulator evidence is not a physical-device test |
 | L09 | Fresh lobby client initialization | Runtime stays stable without forcing global GUI selection; ordinary selectable buttons still work | PASS | Removed automatic `GuiService.SelectedObject` writes that crashed current Studio; fresh runtime stayed stable and every button flow passed; exported/published in v308 |
-| L10 | Movement after Studio handoff | First-play tutorial owns its intentional modal lock; closing it restores normal camera and movement | PASS | `START BUILDING` closed, PlayerModule controller enabled, WalkSpeed remained 16, and held-W moved about 26 studs |
+| L10 | Movement after Studio handoff | First-play tutorial owns its intentional modal lock; closing it restores normal camera and movement | NOT RUN | Carried-forward candidate moved normally after handoff; current source map and handoff must be rerun |
 
 ## Party and teleport tests
 
 TeleportService cannot exercise a real cross-place reserved-server launch in a
 Studio playtest. Rows marked **live** must run from a privately published test
 version in the Roblox client; do not substitute a Studio-only mock.
+
+The deterministic coordinator proves that either one synchronous
+teleport-request failure or one asynchronous `TeleportInitFailed` callback can
+consume the same single retry budget using the original reservation, manifest,
+tickets, options, and launch token. Duplicate or stale callbacks cannot create
+a third request. Every row below remains live-only.
 
 | ID | Topology | Procedure | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -141,7 +179,7 @@ task count.
 | T03 | Host starts trash; guest delivers it | One shared advance; every present member gets `$40` once | NOT RUN | |
 | T04 | Guest finds/returns Missy’s toy | One shared advance; every present member gets `$70` once | NOT RUN | |
 | T05 | Guest completes bank memory game | One shared advance; every present member gets the authoritative cycle reward once | NOT RUN | |
-| T06 | Two clients submit the final interaction simultaneously | Idempotency token accepts one completion only | PARTIAL | Controlled 4-client Studio test: duplicate completion returned false with no second reward; live contention remains |
+| T06 | Two clients submit the final interaction simultaneously | Idempotency token accepts one completion only | PARTIAL | Controlled 4-client Studio duplicate was rejected; the deterministic two-client same-frame scenario also advances once, pays each eligible member once, and deduplicates fail-after-write retry. Published contention remains |
 | T07 | An original expected guest finishes initial admission after a task began | The immutable snapshot does not change; that guest becomes eligible only for later tasks | NOT RUN | |
 | T08 | Snapshot-eligible guest disconnects before completion | The retained identity is paid once if commit occurs inside the 90-second grace; otherwise it is explicitly forfeited at the exact boundary | NOT RUN | |
 | T09 | Complete a full five-task cycle | Shared cycle/index advances once and remains identical on all snapshots | NOT RUN | |
@@ -193,34 +231,37 @@ at least one physical touch device.
 | ID | Procedure | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
 | S01 | Hold left/right Shift while moving | Server speed is 22; release returns to 16 | PASS | Solo house runtime verified server speed `22` while sprinting and `16` after release |
-| S02 | Hold sprint while stationary | Stamina does not drain without movement | NOT RUN | |
-| S03 | Sprint continuously | Approximately six seconds to exhaustion; cannot bypass server limit | PARTIAL | Stamina drain verified in solo runtime; exact six-second exhaustion and exploit attempt remain open |
-| S04 | Release and recover | Gradual regeneration; sprint becomes available predictably | NOT RUN | |
+| S02 | Hold sprint while stationary | Stamina does not drain without movement | PARTIAL | Deterministic server-rule test passes; current-candidate runtime/input test remains open |
+| S03 | Sprint continuously | Approximately six seconds to exhaustion; cannot bypass server limit | PARTIAL | Historical solo runtime observed drain; deterministic server-rule test reaches exhaustion at six moving seconds. Published exploit/input testing remains open |
+| S04 | Release and recover | Gradual regeneration; sprint becomes available predictably | PARTIAL | Deterministic server-rule test proves the 0.8-second delay and 1.5-per-second recovery; runtime/UI behavior remains open |
 | S05 | Full and idle | Stamina UI is not visible | NOT RUN | |
 | S06 | Drain/recover | UI appears while used or recovering, then hides at full | NOT RUN | |
 | S07 | Touch button | Button is reachable inside safe area and its tap-on/tap-off state is clear and reliable | NOT RUN | |
 | S08 | Open computer/bunker terminal or sit | Sprint is denied and movement lock/seat state wins | PARTIAL | Computer exit cleared its movement lock and `W` moved about 8 studs at speed 16; bunker and seat variants remain open |
 | S09 | Carry an item | Existing carry multiplier composes with server movement; no speed exploit | NOT RUN | |
-| S10 | Respawn/reset while sprinting | State, humanoid speed, attributes, input, and UI restore cleanly | NOT RUN | |
-| S11 | Spam intent remote / locally alter WalkSpeed | Server rate limit and authoritative loop restore valid state | NOT RUN | |
+| S10 | Respawn/reset while sprinting | State, humanoid speed, attributes, input, and UI restore cleanly | PARTIAL | Deterministic server-rule test restores full isolated character state; Roblox respawn/UI/input integration remains open |
+| S11 | Spam intent remote / locally alter WalkSpeed | Server rate limit and authoritative loop restore valid state | PARTIAL | Deterministic server-rule tests correct local speed edits and prevent negative/stacked state under toggle spam; published remote abuse remains open |
 | S12 | Four-player sprint isolation | One player's sprint/stamina state cannot alter another player's state | PASS | Controlled 4-client Studio house verified per-player isolation |
 
 ## Regression and release checks
 
 | ID | Check | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| R01 | Four normal PNG NPCs | Only George, Mary, Missy, Georgie; original art/dialogue/catchphrases | PARTIAL | Current preview runtime roster was exactly George, Georgie, Mary, and Missy; original PNG appearance, dialogue, and catchphrases were not re-certified |
+| R01 | Four normal PNG NPCs | Only George, Mary, Missy, Georgie; original art/dialogue/catchphrases | PARTIAL | Carried-forward preview runtime roster was exactly George, Georgie, Mary, and Missy; the latest working tree plus original PNG appearance, dialogue, and catchphrases were not re-certified |
 | R02 | Five tasks, robots, deliveries, boombox, bank, bunker, chemistry, candy | Existing mechanics complete without errors | NOT RUN | |
 | R03 | Doors, truck, furniture, robots and players under four-player load | No phasing, blocking deadlocks, or void spawn | NOT RUN | |
-| R04 | Horror/runtime object audit | No panic/crisis/progression/horror UI or behavior | PASS | Current schema-12 preview kept Horror, SecretExploration, TimeMachineFinale, Postgame, and StudioScenarioTools false |
-| R05 | Client/server logs through all scenarios | No project warnings or errors | PARTIAL | Two fresh current-candidate startup runs had no project warnings/errors; only the external Studio MCP version-mismatch warning remained. Full feature and multiplayer scenario logs are still open |
+| R04 | Horror/runtime object audit | No panic/crisis/progression/horror UI or behavior | PARTIAL | Current local gate keeps Horror, SecretExploration, TimeMachineFinale, Postgame, and StudioScenarioTools false and excludes retired surfaces; current-candidate runtime object audit remains open |
+| R05 | Client/server logs through all scenarios | No project warnings or errors | PARTIAL | Two fresh carried-forward Studio startup runs had no project warnings/errors; only the external Studio MCP version-mismatch warning remained. The latest working tree has not run in Studio, and full feature/multiplayer logs remain open |
 | R06 | Creator Dashboard | Lobby `100748614383412` is the start place with capacity at least 4 (50 recommended); house `98645411943406` is non-start and capped exactly at 4 | PASS | Dashboard verified: lobby start/cap 50; house cap 4 and `Secure` within-universe access only |
-| R07 | Rollback | Dated exports and Git restore instructions recover Milestone 0 | PASS | Historical rollback sets remain documented; current candidate export is 668659 bytes with SHA-256 `09dc971d4f534c34c369d82455a7bac026ec6bc7342d0d3ec2cbcf91a5a2fb7a` |
+| R07 | Rollback | Dated exports and Git restore instructions recover Milestone 0 | PARTIAL | Historical rollback sets remain documented; the 668659-byte export with SHA-256 `09dc971d4f534c34c369d82455a7bac026ec6bc7342d0d3ec2cbcf91a5a2fb7a` predates the current local closure and is not its final verified export |
 | R08 | Runtime performance | Ordinary and stress scenarios stay inside approved budgets | PARTIAL | Idle Studio sample: server max 1.68% (`CooperYardRideables`), client external/core max below 0.8%; active gameplay, mobile, four-player, and soak profiling remain open |
 
-The current schema-12 journal does not yet provide global exactly-once closure.
-Candy payout, boombox payout ticks, `AdjustCurrency`, `SpendAllowance`, and
-physical install transitions still require operation IDs and reconciliation.
+The current source and deterministic suite now assign stable server-owned
+operation identities to every enumerated Milestone 1 reward, payout, purchase,
+and paid physical install transition, while broad legacy currency routes fail
+closed. Global exactly-once **release assurance remains open** until isolated
+DataStore fail-before/fail-after-write, concurrent-server, disconnect/rejoin,
+published multiplayer, and every full-regression value path pass.
 
 ## Sign-off
 

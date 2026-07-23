@@ -813,6 +813,35 @@ local function sanitizeData(raw)
 	-- an impossible partial save without taking an already-installed item away.
 	local boomboxPlaced = raw.boomboxPlaced == true
 	local boomboxPurchased = raw.boomboxPurchased == true or boomboxPlaced
+	local boomboxPendingSettlement = false
+	if type(raw.boomboxPendingSettlement) == "table" then
+		local rawSettlement = raw.boomboxPendingSettlement
+		local maximumTicks = finiteInteger(Config.Boombox.MaximumPaidTicks, 1, 1, 10_000)
+		local payoutPerTick = finiteInteger(Config.Boombox.PayoutPerTick, 0, 0, 2_000_000_000)
+		local maximumPayout = math.min(2_000_000_000, maximumTicks * payoutPerTick)
+		local settlementSessionId = type(rawSettlement.sessionId) == "string"
+			and string.sub(rawSettlement.sessionId, 1, 48) or ""
+		local paidTicks = finiteInteger(rawSettlement.paidTicks, 0, 0, maximumTicks)
+		local totalPaid = finiteInteger(rawSettlement.totalPaid, 0, 0, maximumPayout)
+		local settlementValue = finiteInteger(rawSettlement.settlementValue, 0, 0, maximumPayout)
+		-- The completion contract is fixed: indexed beats plus catch-up equal
+		-- exactly one configured full-song payout. Reject malformed stored values
+		-- instead of letting profile corruption mint an arbitrary recovery reward.
+		if boomboxPurchased and boomboxPlaced
+			and settlementSessionId ~= ""
+			and TransactionLedger.logicalKind("BoomboxSettle", settlementSessionId) ~= nil
+			and totalPaid == paidTicks * payoutPerTick
+			and totalPaid + settlementValue == maximumPayout
+		then
+			boomboxPendingSettlement = {
+				sessionId = settlementSessionId,
+				settlementValue = settlementValue,
+				paidTicks = paidTicks,
+				totalPaid = totalPaid,
+				completedAt = finiteInteger(rawSettlement.completedAt, 0, 0, 4_102_444_800),
+			}
+		end
+	end
 	local installedRaw = type(raw.taskAutomationInstalled) == "table" and raw.taskAutomationInstalled or {}
 	local taskAutomationInstalled = {}
 	for _, definition in ipairs(Config.TaskAutomationUpgrades) do
@@ -898,6 +927,7 @@ local function sanitizeData(raw)
 		-- not contain this field and safely migrate to false; impossible partial
 		-- saves cannot retain the upgrade without the underlying entitlement.
 		boomboxAutoplayPurchased = boomboxPurchased and raw.boomboxAutoplayPurchased == true,
+		boomboxPendingSettlement = boomboxPendingSettlement,
 		taskAutomationInstalled = taskAutomationInstalled,
 		pendingTaskUpgradeId = pendingTaskUpgradeId,
 		bankHackSuccesses = finiteInteger(raw.bankHackSuccesses, 0, 0, 1_000_000),
@@ -1053,6 +1083,16 @@ local function invalidateLostProfileLease(profile, reason)
 	profile.loaded = false
 	profile.releasing = true
 	local player = profile.player
+	-- A lease-lost server may no longer settle value. Drop only its transient
+	-- Sound ownership; any already-persisted completion intent belongs to the
+	-- next lease owner and remains untouched in profile data.
+	if profile.boomboxPlayback then
+		profile.boomboxPlayback.finalized = true
+		profile.boomboxPlayback = nil
+	end
+	if boomboxPlaybackOwner == player then
+		boomboxPlaybackOwner = nil
+	end
 	if player then
 		player:SetAttribute("CooperGameProfileLoaded", false)
 	end
@@ -1616,6 +1656,48 @@ local function hiddenSnapshot(profile)
 	return nil
 end
 
+-- A completed song remains unavailable until every value-bearing beat or
+-- catch-up operation for that session is durable. This helper intentionally
+-- reads only server-owned profile state; client Sound/UI state can disappear
+-- during leave, shutdown, or reconnect without losing the payout contract.
+-- The namespace is declared here so snapshot code and the later transaction
+-- implementation do not consume separate top-level local-function registers.
+local TransactionRuntime = {}
+
+function TransactionRuntime.boomboxValueReconciliationPending(profile, sessionId)
+	local journal = profile and profile.data and profile.data.operationJournal or nil
+	if type(journal) ~= "table" or type(journal.pending) ~= "table" then
+		return false
+	end
+	local settlementKind = sessionId
+		and TransactionLedger.logicalKind("BoomboxSettle", sessionId) or nil
+	local tickPrefix = sessionId and ("BoomboxTick:" .. sessionId .. ":") or nil
+	for _, record in ipairs(journal.pending) do
+		if type(record) == "table" and record.state == "NeedsReconciliation"
+			and type(record.kind) == "string"
+		then
+			if sessionId == nil then
+				if string.sub(record.kind, 1, #"BoomboxTick:") == "BoomboxTick:"
+					or string.sub(record.kind, 1, #"BoomboxSettle:") == "BoomboxSettle:"
+				then
+					return true
+				end
+			elseif record.kind == settlementKind
+				or (tickPrefix ~= nil
+					and string.sub(record.kind, 1, #tickPrefix) == tickPrefix)
+			then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function TransactionRuntime.boomboxSettlementPending(profile)
+	return type(profile and profile.data and profile.data.boomboxPendingSettlement) == "table"
+		or TransactionRuntime.boomboxValueReconciliationPending(profile, nil)
+end
+
 local function boomboxSnapshot(profile, viewerProfile)
 	viewerProfile = viewerProfile or profile
 	local purchased = profile.data.boomboxPurchased == true
@@ -1625,6 +1707,7 @@ local function boomboxSnapshot(profile, viewerProfile)
 	local globalPlaybackProfile = boomboxPlaybackOwner and profiles[boomboxPlaybackOwner] or nil
 	local globalPlayback = globalPlaybackProfile and globalPlaybackProfile.boomboxPlayback or nil
 	local globallyPlaying = globalPlayback ~= nil
+	local payoutSaving = TransactionRuntime.boomboxSettlementPending(profile)
 	local occupiedByOther = globallyPlaying
 		and (not viewerProfile or boomboxPlaybackOwner ~= viewerProfile.player)
 	local remaining = math.max(0, profile.data.boomboxNextPlayAt - unixNow())
@@ -1646,6 +1729,8 @@ local function boomboxSnapshot(profile, viewerProfile)
 		end
 	elseif globallyPlaying then
 		status = "Playing"
+	elseif payoutSaving then
+		status = "SavingPayout"
 	elseif remaining > 0 then
 		status = "Cooldown"
 	else
@@ -1669,6 +1754,7 @@ local function boomboxSnapshot(profile, viewerProfile)
 		playbackOwnerUserId = globallyPlaying and boomboxPlaybackOwner.UserId or nil,
 		occupiedByOther = occupiedByOther,
 		ownsPlayback = playback ~= nil,
+		payoutSaving = payoutSaving,
 		status = status,
 		deliveryStatus = deliveryStatus,
 		targetHint = targetHint,
@@ -1681,10 +1767,10 @@ local function boomboxSnapshot(profile, viewerProfile)
 			and (not profile.data.chemistrySetupPurchased or profile.data.chemistrySetupPlaced),
 		canUpgradeAutoplay = viewerProfile ~= nil and partyIsHost(viewerProfile.player)
 			and partyCanProgress()
-			and purchased and placed and not autoplayPurchased,
+			and purchased and placed and not autoplayPurchased and not payoutSaving,
 		canPlay = viewerProfile ~= nil and partyIsHost(viewerProfile.player)
 			and partyCanProgress()
-			and placed and not globallyPlaying and remaining <= 0,
+			and placed and not globallyPlaying and not payoutSaving and remaining <= 0,
 	}
 end
 
@@ -2162,7 +2248,6 @@ end
 -- Operation ids are born here, never in a RemoteEvent payload. Every protected
 -- value mutation and its committed record enter the same schema-12 profile
 -- payload before saveProfile performs its lease-checked UpdateAsync write.
-local TransactionRuntime = {}
 
 function TransactionRuntime.activeSessionId()
 	local sessionId = partySession.id
@@ -2250,6 +2335,22 @@ function TransactionRuntime.afterReconciliation(profile)
 	profile.transactionReconciliationBlocked = TransactionRuntime.hasBlockingReconciliation(profile)
 	local currentPlayer = profile.player
 	if currentPlayer and profiles[currentPlayer] == profile and currentPlayer.Parent == Players then
+		-- Value-bearing callbacks with an unconfirmed save deliberately avoid
+		-- publishing final world state. Once reconciliation is durable, rebuild
+		-- those player-facing attributes from the authoritative profile.
+		syncCandyDeliveryAttributes(profile)
+		if partyIsHost(currentPlayer) then
+			syncBoomboxPlacedAttribute(profile)
+			syncChemistrySetupAttributes(profile)
+			if TransactionRuntime.recoverPendingBoomboxSettlement
+				and not profile.boomboxPlayback
+			then
+				-- The track-completion intent is profile data, not a task owned by
+				-- the old Sound callback. As soon as a prior beat save settles,
+				-- finish the exact same catch-up contract.
+				TransactionRuntime.recoverPendingBoomboxSettlement(profile, true)
+			end
+		end
 		if TransactionRuntime.recoverWorld and partyIsHost(currentPlayer) then
 			TransactionRuntime.recoverWorld(profile, currentPlayer)
 		end
@@ -2555,6 +2656,43 @@ function TransactionRuntime.commitProfileValueOperation(
 	end
 	profile.transactionReconciliationBlocked = false
 	return true, true, true, committed, "Committed"
+end
+
+-- Stable logical operation kinds let a server callback retry the same
+-- value-bearing transition without minting a second operation. Keys are
+-- server-authored delivery/session tokens; no client payload can select one.
+function TransactionRuntime.logicalOperationKind(prefix, rawKey)
+	return TransactionLedger.logicalKind(prefix, rawKey)
+end
+
+-- Apply one persistent non-purchase transition (install, payout, or other
+-- server-owned value operation). A terminal logical record answers retries
+-- before mutable entitlement checks, while an ambiguous save blocks all new
+-- value until the existing record is reconciled.
+function TransactionRuntime.commitPersistentTransition(profile, kind, value, mutate, authorize)
+	local operationSessionId = TransactionRuntime.activeSessionId()
+	if not operationSessionId or type(kind) ~= "string" or #kind < 1 or #kind > 64 then
+		return false, false, false, "InvalidServerOperation", nil
+	end
+	local existing = TransactionRuntime.findLogicalOperation(profile, kind)
+	local accepted, durable, appliedNow, operationRecord, status =
+		TransactionRuntime.commitProfileValueOperation(
+			profile,
+			kind,
+			value,
+			existing and existing.id or nil,
+			operationSessionId,
+			mutate,
+			authorize
+		)
+	if accepted and not durable and profile and profile.player then
+		feedback(profile.player, "TransactionReconciliation", {
+			title = "SAVING PROGRESS",
+			operation = kind,
+			text = "Your progress is recorded and cannot be applied twice while its save is reconciled.",
+		})
+	end
+	return accepted, durable, appliedNow, status, operationRecord
 end
 
 local function pickHiddenLocation(profile)
@@ -3958,9 +4096,12 @@ function TransactionRuntime.commitHostPurchase(profile, operationKind, price, mu
 		-- Presentation is reconstructed only after the reconciliation worker has
 		-- verified the debit and entitlement in durable storage. Never dispatch a
 		-- truck, construction sequence, or success toast from an ambiguous save.
-		return false, false, "SavePending"
+		-- This is an accepted, non-retryable outcome. Reporting ordinary failure
+		-- here would paint the terminal red and encourage a second click even
+		-- though the authoritative debit already exists in the live profile.
+		return true, false, "SavePendingAccepted"
 	end
-	return accepted and durable, durable, status
+	return accepted, durable, status
 end
 
 local function orderMachinePart(profile, expectedStage)
@@ -3995,7 +4136,7 @@ local function orderMachinePart(profile, expectedStage)
 	if profile.data.allowance < cost then
 		return false, string.format("You need $%d more allowance.", cost - profile.data.allowance)
 	end
-	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+	local purchased, durable, transactionStatus = TransactionRuntime.commitHostPurchase(
 		profile,
 		"PurchaseMachinePart",
 		cost,
@@ -4011,6 +4152,11 @@ local function orderMachinePart(profile, expectedStage)
 	)
 	if not purchased then
 		return false, "The component purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
+	if not durable then
+		-- recoverHostWorldState queues the paid delivery after reconciliation.
+		-- Suppress all success/truck presentation until that save is confirmed.
+		return true, definition.name, definition.stage, cost, true
 	end
 	profile.partDeliveryStep = "WaitingDelivery"
 	queueDelivery(profile, "MachinePart", definition.stage)
@@ -4049,7 +4195,7 @@ local function orderBoombox(profile)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+	local purchased, durable, transactionStatus = TransactionRuntime.commitHostPurchase(
 		profile,
 		"PurchaseBoombox",
 		price,
@@ -4066,6 +4212,9 @@ local function orderBoombox(profile)
 	)
 	if not purchased then
 		return false, "The boombox purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
+	if not durable then
+		return true, "Cooper Party Boombox", price, true
 	end
 	profile.boomboxDeliveryStep = "WaitingDelivery"
 	syncBoomboxPlacedAttribute(profile)
@@ -4103,7 +4252,7 @@ local function upgradeBoomboxAutoplay(profile)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+	local purchased, durable, transactionStatus = TransactionRuntime.commitHostPurchase(
 		profile,
 		"PurchaseBoomboxAutoplay",
 		price,
@@ -4118,6 +4267,9 @@ local function upgradeBoomboxAutoplay(profile)
 	)
 	if not purchased then
 		return false, "The autoplay purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
+	if not durable then
+		return true, "Boombox Autoplay", price, true
 	end
 	feedback(profile.player, "BoomboxAutoplayPurchased", {
 		price = price,
@@ -4177,7 +4329,7 @@ local function orderTaskUpgrade(profile, requestedUpgradeId)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+	local purchased, durable, transactionStatus = TransactionRuntime.commitHostPurchase(
 		profile,
 		"PurchaseTaskUpgrade:" .. upgradeId,
 		price,
@@ -4193,6 +4345,9 @@ local function orderTaskUpgrade(profile, requestedUpgradeId)
 	)
 	if not purchased then
 		return false, "The automation purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
+	if not durable then
+		return true, definition.name, price, true
 	end
 	profile.taskUpgradeDeliveryStep = "WaitingDelivery"
 	queueDelivery(profile, "TaskUpgrade", 0, upgradeId)
@@ -4239,7 +4394,7 @@ local function orderSecretBunker(profile)
 		1,
 		4_102_444_800
 	)
-	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+	local purchased, durable, transactionStatus = TransactionRuntime.commitHostPurchase(
 		profile,
 		"PurchaseSecretBunker",
 		price,
@@ -4256,6 +4411,9 @@ local function orderSecretBunker(profile)
 	)
 	if not purchased then
 		return false, "The bunker purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
+	if not durable then
+		return true, secretBunkerConfig.Name, price, readyAt, true
 	end
 	profile.secretBunkerCompletionAnnounced = false
 
@@ -4319,7 +4477,7 @@ local function orderChemistrySetup(profile)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+	local purchased, durable, transactionStatus = TransactionRuntime.commitHostPurchase(
 		profile,
 		"PurchaseChemistrySetup",
 		price,
@@ -4335,6 +4493,9 @@ local function orderChemistrySetup(profile)
 	)
 	if not purchased then
 		return false, "The chemistry purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
+	if not durable then
+		return true, chemistrySetupConfig.Name, price, true
 	end
 	profile.chemistryDeliveryStep = "WaitingDelivery"
 	syncChemistrySetupAttributes(profile)
@@ -4380,122 +4541,195 @@ end
 
 local function createCandyBatch(profile, metadata)
 	local worldProfile = hostProfile()
-	if not profile or not profile.loaded or profile.releasing
-		or not partyCanProgress()
-		or not worldProfile or worldProfile.data.chemistrySetupPlaced ~= true
-	then
+	if not profile or not profile.loaded or profile.releasing then
 		return false
 	end
-	if type(metadata) ~= "table" or metadata.productKind ~= "BlueRockCandy"
-		or profile.data.candyDeliveryActive == true
-	then
+	local productionKey = type(metadata) == "table" and tostring(metadata.productionKey or "") or ""
+	local operationKind = TransactionRuntime.logicalOperationKind("CandyProduce", productionKey)
+	if type(metadata) ~= "table" or metadata.productKind ~= "BlueRockCandy" or not operationKind then
 		return false
 	end
-	if profile.data.candyBatchReady == true then
-		-- Completion callbacks are idempotent. A retry reconstructs the same
-		-- finished batch instead of minting another token or stacking inventory.
-		syncCandyDeliveryAttributes(profile)
-		return true, profile.data.candyBatchToken
+	local accepted, durable, appliedNow, _, operationRecord = TransactionRuntime.commitPersistentTransition(
+		profile,
+		operationKind,
+		0,
+		function()
+			local batchToken = HttpService:GenerateGUID(false)
+			profile.data.candyBatchReady = true
+			profile.data.candyBatchToken = batchToken
+			return {
+				batchToken = batchToken,
+				productKind = "BlueRockCandy",
+			}
+		end,
+		function()
+			return partyCanProgress()
+				and worldProfile ~= nil
+				and hostProfile() == worldProfile
+				and worldProfile.data.chemistrySetupPlaced == true
+				and profile.data.candyDeliveryActive ~= true
+				and profile.data.candyBatchReady ~= true,
+				"CandyProductionNotAuthorized"
+		end
+	)
+	if not accepted then
+		return false
 	end
-	profile.data.candyBatchReady = true
-	profile.data.candyBatchToken = HttpService:GenerateGUID(false)
-	markDirty(profile)
+	local batchToken = operationRecord and operationRecord.result
+		and tostring(operationRecord.result.batchToken or "") or ""
+	if batchToken == "" then
+		return false
+	end
 	syncCandyDeliveryAttributes(profile)
-	local batchState = candyDeliverySnapshot(profile)
-	feedback(profile.player, "CandyBatchReady", {
-		title = "CHEMISTRY BATCH READY",
-		text = "Your finished Blue Rock Candy is secured. Return to the bunker output tray to collect it.",
-	})
-	broadcastState()
-	-- Persist reaction completion before the physical tray is treated as the
-	-- source of truth. The bounded save retries close the leave/server-shutdown
-	-- loss window; a dirty revision remains queued if Roblox storage is transient.
-	if not saveProfile(profile.player, false) then
-		warn("[CooperGame] Finished candy batch remains dirty after immediate save retries for " .. profile.player.Name)
+	if appliedNow then
+		if durable then
+			feedback(profile.player, "CandyBatchReady", {
+				title = "CHEMISTRY BATCH READY",
+				text = "Your finished Blue Rock Candy is secured. Return to the bunker output tray to collect it.",
+			})
+		else
+			feedback(profile.player, "CandyBatchSaving", {
+				title = "BATCH READY — SAVING",
+				text = "The output tray is ready while Roblox confirms the save. This batch cannot duplicate.",
+			})
+		end
+		broadcastState()
 	end
-	return true, batchState.readyBatchToken
+	return true, batchToken, durable
 end
 
 local function beginCandyDelivery(profile, metadata)
 	local worldProfile = hostProfile()
-	if not profile or not profile.loaded or profile.releasing
-		or not partyCanProgress()
-		or not worldProfile or worldProfile.data.chemistrySetupPlaced ~= true
-	then
+	if not profile or not profile.loaded or profile.releasing then
 		return false
 	end
 	local reportedToken = type(metadata) == "table" and tostring(metadata.batchToken or "") or ""
-	if profile.data.candyDeliveryActive == true then
-		-- A duplicated collection callback may only recover the exact contract;
-		-- it never emits a second Start transition or creates a fresh token.
-		if reportedToken == "" or reportedToken ~= profile.data.candyDeliveryToken then
-			return false
-		end
-		syncCandyDeliveryAttributes(profile)
-		candyDeliveryChanged:Fire(profile.player, "Recover", candyDeliverySnapshot(profile))
-		return true, profile.data.candyDeliveryToken
-	end
-	if profile.data.candyBatchReady ~= true
-		or reportedToken == ""
-		or reportedToken ~= profile.data.candyBatchToken
-	then
+	local operationKind = TransactionRuntime.logicalOperationKind("CandyCollect", reportedToken)
+	if not operationKind then
 		return false
 	end
-	-- Atomically consume the durable output token and reuse it for the buyer
-	-- contract. There is no gap where neither state owns the finished batch.
-	profile.data.candyBatchReady = false
-	profile.data.candyBatchToken = ""
-	profile.data.candyDeliveryActive = true
-	profile.data.candyDeliveryToken = reportedToken
-	markDirty(profile)
+	local accepted, durable, appliedNow = TransactionRuntime.commitPersistentTransition(
+		profile,
+		operationKind,
+		0,
+		function()
+			-- Atomically consume the durable output token and reuse it for the
+			-- buyer contract. There is no save where neither state owns the batch.
+			profile.data.candyBatchReady = false
+			profile.data.candyBatchToken = ""
+			profile.data.candyDeliveryActive = true
+			profile.data.candyDeliveryToken = reportedToken
+			return {
+				batchToken = reportedToken,
+				deliveryActive = true,
+			}
+		end,
+		function()
+			return partyCanProgress()
+				and worldProfile ~= nil
+				and hostProfile() == worldProfile
+				and worldProfile.data.chemistrySetupPlaced == true
+				and profile.data.candyDeliveryActive ~= true
+				and profile.data.candyBatchReady == true
+				and profile.data.candyBatchToken == reportedToken,
+				"CandyCollectionNotAuthorized"
+		end
+	)
+	if not accepted then
+		return false
+	end
 	syncCandyDeliveryAttributes(profile)
 	local deliveryState = candyDeliverySnapshot(profile)
-	feedback(profile.player, "CandyDeliveryStarted", {
-		title = "LOS POLLOS PICKUP",
-		payout = deliveryState.payout,
-		text = string.format(
-			"New bunker task: equip the Blue Rock Candy Pan and deliver it to the yellow Los Pollos Hermanos truck for $%d.",
-			deliveryState.payout
-		),
-	})
-	candyDeliveryChanged:Fire(profile.player, "Start", deliveryState)
-	broadcastState()
-	task.defer(saveProfile, profile.player, false)
-	return true, profile.data.candyDeliveryToken
+	if appliedNow then
+		if durable then
+			feedback(profile.player, "CandyDeliveryStarted", {
+				title = "LOS POLLOS PICKUP",
+				payout = deliveryState.payout,
+				text = string.format(
+					"New bunker task: equip the Blue Rock Candy Pan and deliver it to the yellow Los Pollos Hermanos truck for $%d.",
+					deliveryState.payout
+				),
+			})
+		else
+			feedback(profile.player, "CandyDeliverySaving", {
+				title = "BUYER CONTRACT — SAVING",
+				payout = deliveryState.payout,
+				text = "Your candy pan is equipped while Roblox confirms the buyer contract.",
+			})
+		end
+		candyDeliveryChanged:Fire(profile.player, "Start", deliveryState)
+		broadcastState()
+	else
+		candyDeliveryChanged:Fire(profile.player, "Recover", deliveryState)
+	end
+	return true, reportedToken, durable
 end
 
 local function completeCandyDelivery(profile, metadata)
-	if not profile or not profile.loaded or profile.releasing
-		or not partyCanProgress()
-		or profile.data.candyDeliveryActive ~= true
-	then
+	if not profile or not profile.loaded or profile.releasing then
 		return false
 	end
 	local reportedToken = type(metadata) == "table" and tostring(metadata.batchToken or "") or ""
-	if reportedToken == "" or reportedToken ~= profile.data.candyDeliveryToken then
+	local operationKind = TransactionRuntime.logicalOperationKind("CandySale", reportedToken)
+	if not operationKind then
 		return false
 	end
 	local payout = finiteInteger(candyDeliveryConfig.Payout, 3000, 1, 2_000_000_000)
-	-- Consume the durable contract before crediting money. A duplicate prompt,
-	-- stale callback, or replayed Bindable invocation therefore cannot pay twice.
-	profile.data.candyDeliveryActive = false
-	profile.data.candyDeliveryToken = ""
-	profile.data.candyBatchReady = false
-	profile.data.candyBatchToken = ""
-	profile.data.candyBatchesSold = finiteInteger(profile.data.candyBatchesSold, 0, 0, 10_000_000) + 1
-	setAllowance(profile, profile.data.allowance + payout)
-	markDirty(profile)
+	local accepted, durable, appliedNow = TransactionRuntime.commitPersistentTransition(
+		profile,
+		operationKind,
+		payout,
+		function()
+			-- The delivery token, payout, statistic, and committed operation share
+			-- one lease-owned profile write. Duplicate buyer prompts and stale
+			-- callbacks return the terminal record without applying any field twice.
+			profile.data.candyDeliveryActive = false
+			profile.data.candyDeliveryToken = ""
+			profile.data.candyBatchReady = false
+			profile.data.candyBatchToken = ""
+			profile.data.candyBatchesSold =
+				finiteInteger(profile.data.candyBatchesSold, 0, 0, 10_000_000) + 1
+			setAllowance(profile, profile.data.allowance + payout)
+			return {
+				allowance = profile.data.allowance,
+				batchesSold = profile.data.candyBatchesSold,
+				batchToken = reportedToken,
+				payout = payout,
+			}
+		end,
+		function()
+			return partyCanProgress()
+				and profile.data.candyDeliveryActive == true
+				and profile.data.candyDeliveryToken == reportedToken,
+				"CandyDeliveryNotAuthorized"
+		end
+	)
+	if not accepted then
+		return false
+	end
 	syncCandyDeliveryAttributes(profile)
-	local deliveryState = candyDeliverySnapshot(profile)
-	feedback(profile.player, "CandyDeliveryComplete", {
-		title = "BATCH SOLD",
-		payout = payout,
-		text = string.format("Los Pollos Hermanos accepted the batch. You earned a huge $%d payout!", payout),
-	})
-	candyDeliveryChanged:Fire(profile.player, "Complete", deliveryState)
-	broadcastState()
-	task.defer(saveProfile, profile.player, false)
-	return true, payout
+	if appliedNow then
+		local deliveryState = candyDeliverySnapshot(profile)
+		if durable then
+			feedback(profile.player, "CandyDeliveryComplete", {
+				title = "BATCH SOLD",
+				payout = payout,
+				text = string.format("Los Pollos Hermanos accepted the batch. You earned a huge $%d payout!", payout),
+			})
+		else
+			feedback(profile.player, "CandyDeliverySaving", {
+				title = "SALE ACCEPTED — SAVING",
+				payout = payout,
+				text = string.format(
+					"Your $%d sale is being confirmed by Roblox and cannot be paid twice.",
+					payout
+				),
+			})
+		end
+		candyDeliveryChanged:Fire(profile.player, "Complete", deliveryState)
+		broadcastState()
+	end
+	return true, payout, durable
 end
 
 local hostWorldActionEvents = {
@@ -4580,34 +4814,58 @@ local function reportPlayerAction(eventKey, player, metadata)
 		})
 		broadcastState()
 		return true
-	elseif eventKey == "TaskUpgradeInstalled"
-		and pendingUpgrade
-		and reportedUpgradeId == pendingUpgradeId
-		and profile.taskUpgradeDeliveryStep == "Install"
-	then
-		profile.data.taskAutomationInstalled[pendingUpgradeId] = true
-		profile.data.pendingTaskUpgradeId = ""
-		profile.taskUpgradeDeliveryStep = nil
-		profile.deliveryQueued.TaskUpgrade = false
-		markDirty(profile)
-		feedback(player, "TaskUpgradeInstalled", {
-			upgradeId = pendingUpgradeId,
-			taskId = pendingUpgrade.taskId,
-			name = pendingUpgrade.name,
-			text = pendingUpgrade.name .. " installed! Its matching task will now run automatically.",
-		})
-		local activeRecord = partySession.task
-		if activeRecord and activeRecord.id == pendingUpgrade.taskId and activeRecord.automated ~= true then
-			destroyManualCarryForAutomation(player, activeRecord.id)
-			if armTaskAutomation(activeRecord, pendingUpgrade) then
-				launchTaskAutomation(profile, activeRecord, pendingUpgrade)
+	elseif eventKey == "TaskUpgradeInstalled" and automationById[reportedUpgradeId] then
+		local installDefinition = automationById[reportedUpgradeId]
+		local operationKind = TransactionRuntime.logicalOperationKind(
+			"InstallTaskUpgrade",
+			reportedUpgradeId
+		)
+		local accepted, durable, appliedNow = TransactionRuntime.commitPersistentTransition(
+			profile,
+			operationKind,
+			1,
+			function()
+				profile.data.taskAutomationInstalled[reportedUpgradeId] = true
+				profile.data.pendingTaskUpgradeId = ""
+				return {
+					installed = true,
+					upgradeId = reportedUpgradeId,
+				}
+			end,
+			function()
+				return pendingUpgrade ~= nil
+					and reportedUpgradeId == pendingUpgradeId
+					and profile.taskUpgradeDeliveryStep == "Install",
+					"TaskUpgradeInstallNotAuthorized"
 			end
+		)
+		if not accepted then
+			return false
 		end
-		broadcastState()
-		task.defer(saveProfile, player, false)
-		if profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced then
-			profile.chemistryDeliveryStep = "WaitingDelivery"
-			queueDelivery(profile, "ChemistrySetup", 0)
+		if appliedNow then
+			profile.taskUpgradeDeliveryStep = nil
+			profile.deliveryQueued.TaskUpgrade = false
+			feedback(player, durable and "TaskUpgradeInstalled" or "TaskUpgradeInstallSaving", {
+				upgradeId = reportedUpgradeId,
+				taskId = installDefinition.taskId,
+				name = installDefinition.name,
+				title = durable and "ROBOT INSTALLED" or "ROBOT INSTALLED — SAVING",
+				text = durable
+					and (installDefinition.name .. " installed! Its matching task will now run automatically.")
+					or (installDefinition.name .. " is online while Roblox confirms the installation save."),
+			})
+			local activeRecord = partySession.task
+			if activeRecord and activeRecord.id == installDefinition.taskId and activeRecord.automated ~= true then
+				destroyManualCarryForAutomation(player, activeRecord.id)
+				if armTaskAutomation(activeRecord, installDefinition) then
+					launchTaskAutomation(profile, activeRecord, installDefinition)
+				end
+			end
+			broadcastState()
+			if profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced then
+				profile.chemistryDeliveryStep = "WaitingDelivery"
+				queueDelivery(profile, "ChemistrySetup", 0)
+			end
 		end
 		return true
 	elseif eventKey == "TaskUpgradeCarryLost"
@@ -4652,22 +4910,39 @@ local function reportPlayerAction(eventKey, player, metadata)
 		})
 		broadcastState()
 		return true
-	elseif eventKey == "ChemistrySetupPlaced"
-		and profile.data.chemistrySetupPurchased
-		and not profile.data.chemistrySetupPlaced
-		and profile.chemistryDeliveryStep == "Install"
-	then
-		profile.data.chemistrySetupPlaced = true
-		profile.chemistryDeliveryStep = nil
-		profile.deliveryQueued.ChemistrySetup = false
-		markDirty(profile)
-		syncChemistrySetupAttributes(profile)
-		feedback(player, "ChemistrySetupPlaced", {
-			name = chemistrySetupConfig.Name,
-			text = "Advanced chemistry lab online! The reactor, pumps, and fluid network are ready in the bunker.",
-		})
-		broadcastState()
-		task.defer(saveProfile, player, false)
+	elseif eventKey == "ChemistrySetupPlaced" and profile.data.chemistrySetupPurchased then
+		local accepted, durable, appliedNow = TransactionRuntime.commitPersistentTransition(
+			profile,
+			"InstallChemistrySetup",
+			1,
+			function()
+				profile.data.chemistrySetupPlaced = true
+				return {
+					chemistrySetupPlaced = true,
+				}
+			end,
+			function()
+				return profile.data.chemistrySetupPlaced ~= true
+					and profile.chemistryDeliveryStep == "Install",
+					"ChemistryInstallNotAuthorized"
+			end
+		)
+		if not accepted then
+			return false
+		end
+		if appliedNow then
+			profile.chemistryDeliveryStep = nil
+			profile.deliveryQueued.ChemistrySetup = false
+			syncChemistrySetupAttributes(profile)
+			feedback(player, durable and "ChemistrySetupPlaced" or "ChemistrySetupSaving", {
+				name = chemistrySetupConfig.Name,
+				title = durable and "CHEMISTRY LAB ONLINE" or "CHEMISTRY LAB ONLINE — SAVING",
+				text = durable
+					and "Advanced chemistry lab online! The reactor, pumps, and fluid network are ready in the bunker."
+					or "The lab is online while Roblox confirms the installation save.",
+			})
+			broadcastState()
+		end
 		return true
 	elseif eventKey == "ChemistryCarryLost"
 		and profile.data.chemistrySetupPurchased
@@ -4713,28 +4988,46 @@ local function reportPlayerAction(eventKey, player, metadata)
 		})
 		broadcastState()
 		return true
-	elseif eventKey == "BoomboxPlaced"
-		and profile.data.boomboxPurchased and not profile.data.boomboxPlaced
-		and profile.boomboxDeliveryStep == "Install"
-	then
-		profile.data.boomboxPlaced = true
-		profile.boomboxDeliveryStep = nil
-		profile.deliveryQueued.Boombox = false
-		markDirty(profile)
-		syncBoomboxPlacedAttribute(profile)
-		feedback(player, "BoomboxPlaced", {
-			text = "Boombox set up! Turn it on to start earning while the song plays.",
-		})
-		broadcastState()
-		task.defer(saveProfile, player, false)
-		if profile.data.pendingPartStage == 0 and profile.data.pendingTaskUpgradeId ~= "" then
-			profile.taskUpgradeDeliveryStep = "WaitingDelivery"
-			queueDelivery(profile, "TaskUpgrade", 0, profile.data.pendingTaskUpgradeId)
-		elseif profile.data.pendingPartStage == 0
-			and profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced
-		then
-			profile.chemistryDeliveryStep = "WaitingDelivery"
-			queueDelivery(profile, "ChemistrySetup", 0)
+	elseif eventKey == "BoomboxPlaced" and profile.data.boomboxPurchased then
+		local accepted, durable, appliedNow = TransactionRuntime.commitPersistentTransition(
+			profile,
+			"InstallBoombox",
+			1,
+			function()
+				profile.data.boomboxPlaced = true
+				return {
+					boomboxPlaced = true,
+				}
+			end,
+			function()
+				return profile.data.boomboxPlaced ~= true
+					and profile.boomboxDeliveryStep == "Install",
+					"BoomboxInstallNotAuthorized"
+			end
+		)
+		if not accepted then
+			return false
+		end
+		if appliedNow then
+			profile.boomboxDeliveryStep = nil
+			profile.deliveryQueued.Boombox = false
+			syncBoomboxPlacedAttribute(profile)
+			feedback(player, durable and "BoomboxPlaced" or "BoomboxInstallSaving", {
+				title = durable and "BOOMBOX READY" or "BOOMBOX READY — SAVING",
+				text = durable
+					and "Boombox set up! Turn it on to start earning while the song plays."
+					or "The boombox is set up while Roblox confirms the installation save.",
+			})
+			broadcastState()
+			if profile.data.pendingPartStage == 0 and profile.data.pendingTaskUpgradeId ~= "" then
+				profile.taskUpgradeDeliveryStep = "WaitingDelivery"
+				queueDelivery(profile, "TaskUpgrade", 0, profile.data.pendingTaskUpgradeId)
+			elseif profile.data.pendingPartStage == 0
+				and profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced
+			then
+				profile.chemistryDeliveryStep = "WaitingDelivery"
+				queueDelivery(profile, "ChemistrySetup", 0)
+			end
 		end
 		return true
 	elseif eventKey == "BoomboxCarryLost"
@@ -4775,36 +5068,65 @@ local function reportPlayerAction(eventKey, player, metadata)
 		feedback(player, "DeliveryPicked", { text = "Carry the component crate to the garage installation bay." })
 		broadcastState()
 		return true
-	elseif eventKey == "MachinePartInstalled" and profile.data.pendingPartStage > 0
-		and profile.partDeliveryStep == "Install"
-	then
+	elseif eventKey == "MachinePartInstalled" then
 		local requestedStage = finiteInteger(metadata.stage, 0, 0, #Config.MachineStages)
-		if requestedStage ~= profile.data.pendingPartStage or requestedStage ~= profile.data.machineStage + 1 then
+		local operationKind = TransactionRuntime.logicalOperationKind(
+			"InstallMachineStage",
+			requestedStage
+		)
+		if not operationKind or requestedStage <= 0 then
 			return false
 		end
-		profile.data.machineStage = requestedStage
-		profile.data.pendingPartStage = 0
-		profile.partDeliveryStep = nil
-		profile.deliveryQueued.MachinePart = false
-		markDirty(profile)
-		player:SetAttribute("MachineStage", requestedStage)
-		local definition = Config.MachineStages[requestedStage]
-		feedback(player, "MachineStage", {
-			title = definition.name .. " installed",
-			text = string.format("Time Machine construction is now %d%% complete.", definition.progress),
-			progress = definition.progress,
-		})
-		broadcastState()
-		task.defer(saveProfile, player, false)
-		if profile.data.boomboxPurchased and not profile.data.boomboxPlaced then
-			profile.boomboxDeliveryStep = "WaitingDelivery"
-			queueDelivery(profile, "Boombox", 0)
-		elseif profile.data.pendingTaskUpgradeId ~= "" then
-			profile.taskUpgradeDeliveryStep = "WaitingDelivery"
-			queueDelivery(profile, "TaskUpgrade", 0, profile.data.pendingTaskUpgradeId)
-		elseif profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced then
-			profile.chemistryDeliveryStep = "WaitingDelivery"
-			queueDelivery(profile, "ChemistrySetup", 0)
+		local accepted, durable, appliedNow = TransactionRuntime.commitPersistentTransition(
+			profile,
+			operationKind,
+			requestedStage,
+			function()
+				profile.data.machineStage = requestedStage
+				profile.data.pendingPartStage = 0
+				return {
+					machineStage = requestedStage,
+					pendingPartStage = 0,
+				}
+			end,
+			function()
+				return profile.data.pendingPartStage == requestedStage
+					and requestedStage == profile.data.machineStage + 1
+					and profile.partDeliveryStep == "Install",
+					"MachineInstallNotAuthorized"
+			end
+		)
+		if not accepted then
+			return false
+		end
+		if appliedNow then
+			profile.partDeliveryStep = nil
+			profile.deliveryQueued.MachinePart = false
+			player:SetAttribute("MachineStage", requestedStage)
+			local definition = Config.MachineStages[requestedStage]
+			feedback(player, durable and "MachineStage" or "MachineStageSaving", {
+				title = durable
+					and (definition.name .. " installed")
+					or (definition.name .. " installed — saving"),
+				text = durable
+					and string.format("Time Machine construction is now %d%% complete.", definition.progress)
+					or string.format(
+						"Time Machine construction is %d%% complete while Roblox confirms the save.",
+						definition.progress
+					),
+				progress = definition.progress,
+			})
+			broadcastState()
+			if profile.data.boomboxPurchased and not profile.data.boomboxPlaced then
+				profile.boomboxDeliveryStep = "WaitingDelivery"
+				queueDelivery(profile, "Boombox", 0)
+			elseif profile.data.pendingTaskUpgradeId ~= "" then
+				profile.taskUpgradeDeliveryStep = "WaitingDelivery"
+				queueDelivery(profile, "TaskUpgrade", 0, profile.data.pendingTaskUpgradeId)
+			elseif profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced then
+				profile.chemistryDeliveryStep = "WaitingDelivery"
+				queueDelivery(profile, "ChemistrySetup", 0)
+			end
 		end
 		return true
 	end
@@ -4907,47 +5229,6 @@ end
 reportAction.Event:Connect(reportPlayerAction)
 registerAction.Event:Connect(function() end)
 
-local function adjustAllowance(subject, rawDelta, reason)
-	local delta = tonumber(rawDelta)
-	if not delta or delta ~= delta or delta == math.huge or delta == -math.huge or math.abs(delta) > 2_000_000_000 then
-		return false, "Invalid allowance adjustment"
-	end
-	delta = if delta >= 0 then math.floor(delta + 0.5) else math.ceil(delta - 0.5)
-	local recipients = {}
-	if typeof(subject) == "Instance" and subject:IsA("Player") then
-		local profile = profiles[subject]
-		if not profile or not profile.loaded or profile.releasing then
-			return false, "Profile is not loaded"
-		end
-		table.insert(recipients, profile)
-	elseif subject == nil then
-		recipients = presentProfiles()
-	else
-		return false, "Invalid allowance recipient"
-	end
-	if #recipients == 0 then
-		return false, "No loaded player profiles"
-	end
-	for _, profile in ipairs(recipients) do
-		if profile.data.allowance + delta < 0 then
-			return false, "Insufficient allowance"
-		end
-	end
-	for _, profile in ipairs(recipients) do
-		setAllowance(profile, profile.data.allowance + delta)
-		feedback(profile.player, "Currency", {
-			allowance = delta,
-			reason = tostring(reason or "Allowance adjustment"),
-		})
-		task.defer(saveProfile, profile.player, false)
-	end
-	broadcastState()
-	if #recipients == 1 then
-		return true, recipients[1].data.allowance
-	end
-	return true, #recipients
-end
-
 local function boomboxFailure(message, remaining, retryAfter)
 	return {
 		ok = false,
@@ -4961,7 +5242,7 @@ local function announceBoomboxReady(profile, automatic)
 	if not profile or not profile.loaded or profile.releasing
 		or not partyIsHost(profile.player)
 		or not profile.data.boomboxPurchased or not profile.data.boomboxPlaced
-		or profile.boomboxPlayback
+		or profile.boomboxPlayback or TransactionRuntime.boomboxSettlementPending(profile)
 	then
 		return false
 	end
@@ -5003,6 +5284,28 @@ local function beginBoomboxPlayback(player, requestedSource)
 			feedback(player, "BoomboxError", { message = message, text = message })
 		end
 		return boomboxFailure(message)
+	end
+	if TransactionRuntime.boomboxSettlementPending(profile) then
+		-- A prior full-song promise must be made durable before another playback
+		-- can mint indexed beat operations. If only the persistent intent remains,
+		-- make one synchronous recovery attempt; unresolved journal work remains
+		-- fail-closed and the maintenance/reconciliation workers will retry it.
+		if type(profile.data.boomboxPendingSettlement) == "table"
+			and not TransactionRuntime.boomboxValueReconciliationPending(
+				profile,
+				profile.data.boomboxPendingSettlement.sessionId
+			)
+			and TransactionRuntime.recoverPendingBoomboxSettlement
+		then
+			TransactionRuntime.recoverPendingBoomboxSettlement(profile, true)
+		end
+		if TransactionRuntime.boomboxSettlementPending(profile) then
+			local message = "The previous full-song payout is still saving. The boombox will unlock automatically."
+			if not automatic then
+				feedback(player, "BoomboxError", { message = message, text = message })
+			end
+			return boomboxFailure(message)
+		end
 	end
 	if profile.boomboxPlayback then
 		return boomboxFailure("Your boombox song is already playing.")
@@ -5075,14 +5378,346 @@ local function beginBoomboxPlayback(player, requestedSource)
 	}
 end
 
-local function creditBoomboxTick(profile, playback)
-	playback.paidTicks += 1
-	playback.totalPaid += Config.Boombox.PayoutPerTick
-	setAllowance(profile, profile.data.allowance + Config.Boombox.PayoutPerTick)
-	return Config.Boombox.PayoutPerTick
+function TransactionRuntime.creditBoomboxTick(profile, playback, requestedTickIndex)
+	if not playback or playback.settling == true then
+		return 0, false, "BoomboxSettlementActive"
+	end
+	if playback.creditInFlight == true then
+		return 0, false, "BoomboxTickBusy"
+	end
+	local tickIndex = finiteInteger(
+		requestedTickIndex,
+		finiteInteger(playback and playback.paidTicks, 0, 0, 10_000) + 1,
+		1,
+		finiteInteger(Config.Boombox.MaximumPaidTicks, 1, 1, 10_000)
+	)
+	local operationKind = playback and TransactionRuntime.logicalOperationKind(
+		"BoomboxTick",
+		tostring(playback.sessionId) .. ":" .. tostring(tickIndex)
+	) or nil
+	if not operationKind then
+		return 0, false, "InvalidBoomboxTick"
+	end
+	playback.creditInFlight = true
+	local payout = finiteInteger(Config.Boombox.PayoutPerTick, 0, 0, 2_000_000_000)
+	local accepted, _, appliedNow, status, operationRecord = TransactionRuntime.commitPersistentTransition(
+		profile,
+		operationKind,
+		payout,
+		function()
+			setAllowance(profile, profile.data.allowance + payout)
+			return {
+				allowance = profile.data.allowance,
+				paidTicks = tickIndex,
+				totalPaid = finiteInteger(playback.totalPaid, 0, 0, 2_000_000_000) + payout,
+				playbackSessionId = playback.sessionId,
+			}
+		end,
+		function()
+			return profile.boomboxPlayback == playback
+				and boomboxPlaybackOwner == profile.player
+				and playback.paidTicks == tickIndex - 1,
+				"BoomboxTickNotAuthorized"
+		end
+	)
+	if not accepted then
+		playback.creditInFlight = false
+		return 0, false, status
+	end
+	local result = operationRecord and operationRecord.result or {}
+	playback.paidTicks = math.max(
+		finiteInteger(playback.paidTicks, 0, 0, 10_000),
+		finiteInteger(result.paidTicks, tickIndex, tickIndex, 10_000)
+	)
+	playback.totalPaid = math.max(
+		finiteInteger(playback.totalPaid, 0, 0, 2_000_000_000),
+		finiteInteger(result.totalPaid, playback.totalPaid + payout, 0, 2_000_000_000)
+	)
+	playback.creditInFlight = false
+	return appliedNow and payout or 0, true, status
 end
 
-local function boomboxPayoutTick(player, sessionId)
+function TransactionRuntime.settleCompletedBoombox(profile, playback)
+	if not profile or not playback or profile.boomboxPlayback ~= playback
+		or boomboxPlaybackOwner ~= profile.player
+	then
+		return false, false, "BoomboxSettlementNotAuthorized"
+	end
+	playback.settling = true
+	while playback.creditInFlight == true do
+		task.wait(0.05)
+		if profile.boomboxPlayback ~= playback or profile.releasing or profile.leaseLost then
+			return false, false, "BoomboxSettlementClosed"
+		end
+	end
+	local maximumTicks = finiteInteger(Config.Boombox.MaximumPaidTicks, 1, 1, 10_000)
+	local payoutPerTick = finiteInteger(Config.Boombox.PayoutPerTick, 0, 0, 2_000_000_000)
+	local intent = profile.data.boomboxPendingSettlement
+	if type(intent) == "table" and intent.sessionId ~= playback.sessionId then
+		return false, false, "DifferentBoomboxSettlementPending"
+	end
+	if type(intent) ~= "table" then
+		local paidTicks = finiteInteger(playback.paidTicks, 0, 0, maximumTicks)
+		local totalPaid = finiteInteger(playback.totalPaid, 0, 0, 2_000_000_000)
+		intent = {
+			sessionId = playback.sessionId,
+			settlementValue = math.max(0, maximumTicks - paidTicks) * payoutPerTick,
+			paidTicks = paidTicks,
+			totalPaid = totalPaid,
+			completedAt = unixNow(),
+		}
+		profile.data.boomboxPendingSettlement = intent
+		playback.settlementIntentDurable = false
+		markDirty(profile)
+	end
+	local settlementValue = finiteInteger(intent.settlementValue, 0, 0, 2_000_000_000)
+	playback.settlementValue = settlementValue
+	playback.expectedPaidTicks = maximumTicks
+	playback.expectedTotal = math.min(
+		2_000_000_000,
+		finiteInteger(intent.totalPaid, 0, 0, 2_000_000_000) + settlementValue
+	)
+
+	-- Persist the completion qualification itself before relying on any spawned
+	-- retry. PlayerRemoving, BindToClose, and lease-loss cleanup may destroy the
+	-- Sound/playback table, but the next lease owner can always recover this
+	-- immutable server-authored intent.
+	if playback.settlementIntentDurable ~= true then
+		local intentSaved, intentFailure = TransactionRuntime.safeSave(profile)
+		if not intentSaved then
+			return false, false, "CompletionIntentSavePending:" .. tostring(intentFailure)
+		end
+		playback.settlementIntentDurable = true
+	end
+
+	-- A beat whose value is live but whose save is still ambiguous already
+	-- contributes to intent.totalPaid. Never run a zero-value fast path or a
+	-- catch-up mutation until that exact tick record is durable.
+	if TransactionRuntime.boomboxValueReconciliationPending(profile, playback.sessionId)
+		or TransactionRuntime.hasBlockingReconciliation(profile)
+	then
+		return true, false, "BoomboxTickReconciliationPending"
+	end
+
+	if settlementValue == 0 then
+		profile.data.boomboxPendingSettlement = false
+		markDirty(profile)
+		local cleared, clearFailure = TransactionRuntime.safeSave(profile)
+		if not cleared then
+			-- Keep the durable intent visible in live state so a new playback
+			-- cannot start until the metadata-only clear is also confirmed.
+			profile.data.boomboxPendingSettlement = intent
+			markDirty(profile)
+			return true, false, "BoomboxSettlementClearPending:" .. tostring(clearFailure)
+		end
+		playback.paidTicks = maximumTicks
+		playback.totalPaid = math.max(
+			finiteInteger(playback.totalPaid, 0, 0, 2_000_000_000),
+			finiteInteger(intent.totalPaid, 0, 0, 2_000_000_000)
+		)
+		return true, true, "NoSettlementNeeded"
+	end
+	local operationKind = TransactionRuntime.logicalOperationKind(
+		"BoomboxSettle",
+		tostring(playback.sessionId)
+	)
+	if not operationKind then
+		return false, false, "InvalidBoomboxSettlement"
+	end
+	local accepted, durable, _, status, operationRecord = TransactionRuntime.commitPersistentTransition(
+		profile,
+		operationKind,
+		settlementValue,
+		function()
+			setAllowance(profile, profile.data.allowance + settlementValue)
+			profile.data.boomboxPendingSettlement = false
+			return {
+				allowance = profile.data.allowance,
+				paidTicks = maximumTicks,
+				totalPaid = playback.expectedTotal,
+				playbackSessionId = playback.sessionId,
+				settlementValue = settlementValue,
+			}
+		end,
+		function()
+			local currentIntent = profile.data.boomboxPendingSettlement
+			return profile.boomboxPlayback == playback
+				and boomboxPlaybackOwner == profile.player
+				and playback.settling == true
+				and type(currentIntent) == "table"
+				and currentIntent.sessionId == playback.sessionId
+				and currentIntent.settlementValue == settlementValue,
+				"BoomboxSettlementNotAuthorized"
+		end
+	)
+	if not accepted then
+		-- The completion intent is already durable. A transient value-operation
+		-- refusal therefore finishes as save-pending and is recovered without the
+		-- old Player/Sound object; it is never converted into a partial payout.
+		return true, false, "BoomboxSettlementDeferred:" .. tostring(status)
+	end
+	local result = operationRecord and operationRecord.result or {}
+	playback.paidTicks = maximumTicks
+	playback.totalPaid = math.max(
+		finiteInteger(playback.totalPaid, 0, 0, 2_000_000_000),
+		finiteInteger(result.totalPaid, playback.expectedTotal, 0, 2_000_000_000)
+	)
+	if durable and type(profile.data.boomboxPendingSettlement) == "table" then
+		-- An already-committed logical retry can bypass mutate. Retire a stale
+		-- completion marker only after its own lease-owned write is verified.
+		local staleIntent = profile.data.boomboxPendingSettlement
+		profile.data.boomboxPendingSettlement = false
+		markDirty(profile)
+		local cleared = TransactionRuntime.safeSave(profile)
+		if not cleared then
+			profile.data.boomboxPendingSettlement = staleIntent
+			markDirty(profile)
+			durable = false
+			status = "BoomboxSettlementClearPending"
+		end
+	end
+	return true, durable, status
+end
+
+-- Recover a completed song without any dependency on the old Sound, Player
+-- callback, or server process. The persistent intent and logical operation key
+-- make retries exactly-once across reconciliation, release, and a new lease.
+function TransactionRuntime.recoverPendingBoomboxSettlement(profile, announce)
+	if not profile or not profile.loaded or profile.releasing or profile.leaseLost then
+		return false, false, "ProfileNotWritable"
+	end
+	if profile.boomboxPlayback then
+		return false, false, "LiveBoomboxPlaybackOwnsSettlement"
+	end
+	local intent = profile.data.boomboxPendingSettlement
+	if type(intent) ~= "table" then
+		if TransactionRuntime.boomboxValueReconciliationPending(profile, nil) then
+			return true, false, "BoomboxReconciliationPending"
+		end
+		return true, true, "NoPendingBoomboxSettlement"
+	end
+	if profile.boomboxSettlementRecoveryInFlight == true then
+		return false, false, "BoomboxSettlementRecoveryBusy"
+	end
+	profile.boomboxSettlementRecoveryInFlight = true
+
+	local function finish(accepted, durable, status)
+		profile.boomboxSettlementRecoveryInFlight = false
+		return accepted, durable, status
+	end
+	local sessionId = tostring(intent.sessionId or "")
+	local operationKind = TransactionRuntime.logicalOperationKind("BoomboxSettle", sessionId)
+	if not operationKind then
+		return finish(false, false, "InvalidBoomboxSettlement")
+	end
+	if TransactionRuntime.boomboxValueReconciliationPending(profile, sessionId)
+		or TransactionRuntime.hasBlockingReconciliation(profile)
+	then
+		return finish(true, false, "BoomboxReconciliationPending")
+	end
+
+	local settlementValue = finiteInteger(intent.settlementValue, 0, 0, 2_000_000_000)
+	local totalPaid = finiteInteger(intent.totalPaid, 0, 0, 2_000_000_000)
+	local expectedTotal = math.min(2_000_000_000, totalPaid + settlementValue)
+	local maximumTicks = finiteInteger(Config.Boombox.MaximumPaidTicks, 1, 1, 10_000)
+	local existing = TransactionRuntime.findLogicalOperation(profile, operationKind)
+
+	if existing and existing.state == "Committed" then
+		-- The allowance transition is already terminal. Only the stale recovery
+		-- marker remains, so clearing it must never invoke the value callback.
+		local savedIntent = intent
+		profile.data.boomboxPendingSettlement = false
+		markDirty(profile)
+		local cleared, clearFailure = TransactionRuntime.safeSave(profile)
+		if not cleared then
+			profile.data.boomboxPendingSettlement = savedIntent
+			markDirty(profile)
+			return finish(true, false, "BoomboxSettlementClearPending:" .. tostring(clearFailure))
+		end
+		local result = existing.result or {}
+		expectedTotal = finiteInteger(result.totalPaid, expectedTotal, 0, 2_000_000_000)
+	elseif existing and existing.state == "NeedsReconciliation" then
+		TransactionRuntime.deferReconciliationSave(profile, existing.id, 0)
+		return finish(true, false, "BoomboxReconciliationPending")
+	elseif settlementValue == 0 then
+		local savedIntent = intent
+		profile.data.boomboxPendingSettlement = false
+		markDirty(profile)
+		local cleared, clearFailure = TransactionRuntime.safeSave(profile)
+		if not cleared then
+			profile.data.boomboxPendingSettlement = savedIntent
+			markDirty(profile)
+			return finish(true, false, "BoomboxSettlementClearPending:" .. tostring(clearFailure))
+		end
+	else
+		local accepted, durable, _, status, operationRecord =
+			TransactionRuntime.commitPersistentTransition(
+				profile,
+				operationKind,
+				settlementValue,
+				function()
+					setAllowance(profile, profile.data.allowance + settlementValue)
+					profile.data.boomboxPendingSettlement = false
+					return {
+						allowance = profile.data.allowance,
+						paidTicks = maximumTicks,
+						totalPaid = expectedTotal,
+						playbackSessionId = sessionId,
+						settlementValue = settlementValue,
+					}
+				end,
+				function()
+					local currentIntent = profile.data.boomboxPendingSettlement
+					return type(currentIntent) == "table"
+						and currentIntent.sessionId == sessionId
+						and currentIntent.settlementValue == settlementValue,
+						"BoomboxSettlementNotAuthorized"
+				end
+			)
+		if not accepted then
+			return finish(true, false, "BoomboxSettlementDeferred:" .. tostring(status))
+		end
+		if operationRecord and operationRecord.result then
+			expectedTotal = finiteInteger(
+				operationRecord.result.totalPaid,
+				expectedTotal,
+				0,
+				2_000_000_000
+			)
+		end
+		if not durable then
+			if announce == true then
+				feedback(profile.player, "BoomboxPayoutSaving", {
+					title = "FULL PAYOUT EARNED — SAVING",
+					text = string.format(
+						"The completed song earned $%d. Roblox is confirming the save; it cannot be paid twice.",
+						expectedTotal
+					),
+					earned = expectedTotal,
+					reason = tostring(status),
+				})
+			end
+			return finish(true, false, status)
+		end
+	end
+
+	if announce == true then
+		feedback(profile.player, "BoomboxFinished", {
+			title = "FULL PAYOUT SAVED",
+			text = string.format(
+				"The completed song payout is secure: $%d allowance.",
+				expectedTotal
+			),
+			earned = expectedTotal,
+			cooldown = math.max(0, profile.data.boomboxNextPlayAt - unixNow()),
+			reason = "Recovered",
+		})
+	end
+	broadcastState()
+	return finish(true, true, "Recovered")
+end
+
+local function boomboxPayoutTick(player, sessionId, requestedTickIndex)
 	local profile = typeof(player) == "Instance" and player:IsA("Player") and profiles[player] or nil
 	if not profile or not profile.loaded or profile.releasing then
 		return boomboxFailure("Profile is not loaded.")
@@ -5099,13 +5734,19 @@ local function boomboxPayoutTick(player, sessionId)
 	if not profile.data.boomboxPurchased or not profile.data.boomboxPlaced then
 		return boomboxFailure("The boombox is not set up.")
 	end
-	if playback.paidTicks >= Config.Boombox.MaximumPaidTicks then
+	local tickIndex = finiteInteger(requestedTickIndex, 0, 0, Config.Boombox.MaximumPaidTicks)
+	if tickIndex <= 0 or tickIndex > playback.paidTicks + 1 then
+		return boomboxFailure("That payout tick is missing or out of order.")
+	end
+	if playback.paidTicks >= Config.Boombox.MaximumPaidTicks
+		and tickIndex > playback.paidTicks
+	then
 		return boomboxFailure("Every payout for this song has already been awarded.")
 	end
 
 	local currentTime = serverNow()
 	local elapsed = currentTime - playback.startedAt
-	local dueAt = playback.startedAt + (playback.paidTicks + 1) * Config.Boombox.PayoutInterval
+	local dueAt = playback.startedAt + tickIndex * Config.Boombox.PayoutInterval
 	if currentTime + BOOMBOX_TICK_EARLY_TOLERANCE < dueAt then
 		local retryAfter = dueAt - currentTime
 		return boomboxFailure("That payout tick is too early.", 0, retryAfter)
@@ -5114,7 +5755,11 @@ local function boomboxPayoutTick(player, sessionId)
 		return boomboxFailure("The payout window for this song has ended.")
 	end
 
-	local awarded = creditBoomboxTick(profile, playback)
+	local awarded, accepted, tickStatus =
+		TransactionRuntime.creditBoomboxTick(profile, playback, tickIndex)
+	if not accepted then
+		return boomboxFailure("That payout could not be committed safely (" .. tostring(tickStatus) .. ").")
+	end
 	broadcastState()
 	return {
 		ok = true,
@@ -5123,6 +5768,96 @@ local function boomboxPayoutTick(player, sessionId)
 		remainingTicks = Config.Boombox.MaximumPaidTicks - playback.paidTicks,
 		allowance = profile.data.allowance,
 	}
+end
+
+local function finalizeBoomboxPlayback(profile, playback, endedReason, suppressFeedback, durable)
+	if playback.finalized == true then
+		return {
+			ok = true,
+			earned = playback.totalPaid,
+			paidTicks = playback.paidTicks,
+			nextPlayAt = profile.data.boomboxNextPlayAt,
+		}
+	end
+	playback.finalized = true
+	if profile.boomboxPlayback == playback then
+		profile.boomboxPlayback = nil
+	end
+	if boomboxPlaybackOwner == profile.player then
+		boomboxPlaybackOwner = nil
+	end
+	local earned = if durable == false
+		then math.max(
+			finiteInteger(playback.totalPaid, 0, 0, 2_000_000_000),
+			finiteInteger(playback.expectedTotal, 0, 0, 2_000_000_000)
+		)
+		else playback.totalPaid
+	local paidTicks = if durable == false
+		then math.max(
+			finiteInteger(playback.paidTicks, 0, 0, 10_000),
+			finiteInteger(playback.expectedPaidTicks, 0, 0, 10_000)
+		)
+		else playback.paidTicks
+	local remaining = math.max(0, profile.data.boomboxNextPlayAt - unixNow())
+	if not suppressFeedback then
+		if durable == false then
+			feedback(profile.player, "BoomboxPayoutSaving", {
+				title = "FULL PAYOUT EARNED — SAVING",
+				text = string.format(
+					"The song earned its full $%d. Roblox is confirming the save; it cannot be paid twice.",
+					earned
+				),
+				earned = earned,
+				cooldown = remaining,
+				reason = endedReason,
+			})
+		else
+			feedback(profile.player, "BoomboxFinished", {
+				text = string.format("The song finished and earned $%d allowance.", earned),
+				earned = earned,
+				cooldown = remaining,
+				reason = endedReason,
+			})
+		end
+	end
+	broadcastState()
+	if durable ~= false and not profile.releasing and not suppressFeedback then
+		task.defer(saveProfile, profile.player, false)
+	end
+	return {
+		ok = true,
+		earned = earned,
+		paidTicks = paidTicks,
+		cooldown = remaining,
+		nextPlayAt = profile.data.boomboxNextPlayAt,
+		savePending = durable == false,
+	}
+end
+
+local function scheduleBoomboxSettlement(profile, playback, endedReason, suppressFeedback)
+	if playback.settlementScheduled == true or playback.finalized == true then
+		return
+	end
+	playback.settlementScheduled = true
+	task.spawn(function()
+		for _ = 1, 120 do
+			task.wait(0.5)
+			if not profile.loaded or profile.releasing or profile.leaseLost
+				or profile.boomboxPlayback ~= playback or playback.finalized == true
+			then
+				playback.settlementScheduled = false
+				return
+			end
+			local accepted, durable = TransactionRuntime.settleCompletedBoombox(profile, playback)
+			if accepted then
+				playback.settlementScheduled = false
+				finalizeBoomboxPlayback(profile, playback, endedReason, suppressFeedback, durable)
+				return
+			end
+		end
+		playback.settlementScheduled = false
+		warn("[CooperGame] Full boombox payout is still waiting for profile reconciliation")
+	end)
 end
 
 local function endBoomboxPlayback(profile, sessionId, reason, suppressFeedback)
@@ -5135,43 +5870,46 @@ local function endBoomboxPlayback(profile, sessionId, reason, suppressFeedback)
 	end
 	local endedReason = string.sub(tostring(reason or "Stopped"), 1, 48)
 	local elapsed = serverNow() - playback.startedAt
-	-- Sound.Ended and the tenth scheduled tick occur at the same instant. If the
-	-- complete track won that race, award only that one final due tick. Early
-	-- stops never enter this branch, and the hard tick cap remains unchanged.
-	if endedReason == "Completed"
-		and playback.paidTicks == Config.Boombox.MaximumPaidTicks - 1
-		and elapsed >= Config.Boombox.TrackDuration - BOOMBOX_FINAL_TICK_TOLERANCE
-		and elapsed <= Config.Boombox.TrackDuration + BOOMBOX_FINAL_TICK_TOLERANCE
-	then
-		creditBoomboxTick(profile, playback)
+	local completionReason = endedReason == "Completed"
+		or endedReason == "Watchdog"
+		or endedReason == "PlayerLeaving"
+		or endedReason == "Shutdown"
+	local completedTrack = playback.completionQualified == true
+		or (completionReason
+			and elapsed >= Config.Boombox.TrackDuration - BOOMBOX_FINAL_TICK_TOLERANCE)
+	if completedTrack then
+		playback.completionQualified = true
+		playback.ending = true
+		local accepted, durable, status =
+			TransactionRuntime.settleCompletedBoombox(profile, playback)
+		if accepted then
+			return finalizeBoomboxPlayback(
+				profile,
+				playback,
+				endedReason,
+				suppressFeedback,
+				durable
+			)
+		end
+		if not suppressFeedback and playback.settlementNoticeSent ~= true then
+			playback.settlementNoticeSent = true
+			feedback(profile.player, "BoomboxPayoutSaving", {
+				title = "FINAL PAYOUT SAVING",
+				text = "The full song completed. Your remaining beat payments are being secured automatically.",
+				reason = tostring(status),
+			})
+		end
+		scheduleBoomboxSettlement(profile, playback, endedReason, suppressFeedback)
+		return {
+			ok = true,
+			pending = true,
+			earned = playback.totalPaid,
+			paidTicks = playback.paidTicks,
+			nextPlayAt = profile.data.boomboxNextPlayAt,
+		}
 	end
 
-	profile.boomboxPlayback = nil
-	if boomboxPlaybackOwner == profile.player then
-		boomboxPlaybackOwner = nil
-	end
-	local earned = playback.totalPaid
-	local paidTicks = playback.paidTicks
-	local remaining = math.max(0, profile.data.boomboxNextPlayAt - unixNow())
-	if not suppressFeedback then
-		feedback(profile.player, "BoomboxFinished", {
-			text = string.format("The song finished and earned $%d allowance.", earned),
-			earned = earned,
-			cooldown = remaining,
-			reason = endedReason,
-		})
-	end
-	broadcastState()
-	if not profile.releasing and not suppressFeedback then
-		task.defer(saveProfile, profile.player, false)
-	end
-	return {
-		ok = true,
-		earned = earned,
-		paidTicks = paidTicks,
-		cooldown = remaining,
-		nextPlayAt = profile.data.boomboxNextPlayAt,
-	}
+	return finalizeBoomboxPlayback(profile, playback, endedReason, suppressFeedback, true)
 end
 
 local function endBoomboxPlaybackForPlayer(player, sessionId, reason)
@@ -5184,14 +5922,11 @@ serverAPI.OnInvoke = function(operation, arg1, arg2, arg3, arg4)
 		return snapshotFor(typeof(arg1) == "Instance" and arg1:IsA("Player") and arg1 or nil)
 	elseif operation == "ReportAction" and typeof(arg1) == "Instance" and arg1:IsA("Player") then
 		return reportPlayerAction(tostring(arg2), arg1, arg3)
-	elseif operation == "AdjustCurrency" then
-		return adjustAllowance(arg1, arg2, arg4 or arg3)
-	elseif operation == "SpendAllowance" then
-		local amount = tonumber(arg2)
-		if not amount or amount <= 0 then
-			return false, "Allowance cost must be positive"
-		end
-		return adjustAllowance(arg1, -amount, arg3)
+	elseif operation == "AdjustCurrency" or operation == "SpendAllowance" then
+		-- These broad legacy BindableFunction routes have no active caller and
+		-- cannot express a stable retry identity. All current rewards, payouts,
+		-- purchases, and installs use named server-authored operations instead.
+		return false, "DeprecatedOperation: use a named authoritative value operation"
 	elseif operation == "OrderMachinePart" then
 		local player = typeof(arg1) == "Instance" and arg1:IsA("Player") and arg1 or nil
 		return orderMachinePart(player and profiles[player], arg2)
@@ -5217,7 +5952,7 @@ serverAPI.OnInvoke = function(operation, arg1, arg2, arg3, arg4)
 	elseif operation == "BeginBoomboxPlayback" then
 		return beginBoomboxPlayback(arg1, arg2)
 	elseif operation == "BoomboxPayoutTick" then
-		return boomboxPayoutTick(arg1, arg2)
+		return boomboxPayoutTick(arg1, arg2, arg3)
 	elseif operation == "EndBoomboxPlayback" then
 		return endBoomboxPlaybackForPlayer(arg1, arg2, arg3)
 	elseif operation == "InstallMachineStage" and typeof(arg2) == "Instance" and arg2:IsA("Player") then
@@ -5402,9 +6137,15 @@ requestEvent.OnServerEvent:Connect(function(player, action, payload)
 		broadcastState()
 	elseif action == "OrderMachinePart" then
 		local definition = nextMachinePart(hostProfile() or profile)
-		local ordered, reason = orderMachinePart(profile, definition and definition.stage or nil)
+		local ordered, reason, _, _, savePending =
+			orderMachinePart(profile, definition and definition.stage or nil)
 		if not ordered then
 			feedback(player, "Error", { text = tostring(reason or "That component could not be ordered.") })
+			return
+		end
+		if savePending == true then
+			-- commitHostPurchase already emitted the neutral save-pending notice.
+			-- Do not contradict it with a green delivery-success toast yet.
 			return
 		end
 		feedback(player, "OrderPlaced", {
@@ -5823,6 +6564,16 @@ local function loadPlayer(player)
 			bankInputNextAt[previousPlayer] = nil
 			requestNextAt[previousPlayer] = nil
 			snapshotNextAt[previousPlayer] = nil
+		end
+		-- Normally PlayerRemoving retires the old Sound session after persisting
+		-- its completion intent. If a transient pre-intent playback survived, bind
+		-- it to the replacement Player so its watchdog can finish instead of
+		-- comparing forever against the disconnected Player instance.
+		if previousPlayer
+			and retained.boomboxPlayback
+			and boomboxPlaybackOwner == previousPlayer
+		then
+			boomboxPlaybackOwner = player
 		end
 		retained.player = player
 		retained.detached = false
@@ -6361,8 +7112,22 @@ function TransactionRuntime.playerLifecycle.onPlayerRemoving(player)
 		cancelBankHackSession(profile, "Player left the server.", false)
 	end
 	if profile and profile.boomboxPlayback then
-		endBoomboxPlayback(profile, profile.boomboxPlayback.sessionId, "PlayerLeaving", true)
-	elseif boomboxPlaybackOwner == player then
+		local departingPlayback = profile.boomboxPlayback
+		endBoomboxPlayback(profile, departingPlayback.sessionId, "PlayerLeaving", true)
+		local intent = profile.data.boomboxPendingSettlement
+		if profile.boomboxPlayback == departingPlayback
+			and type(intent) == "table"
+			and intent.sessionId == departingPlayback.sessionId
+		then
+			-- The spawned settlement loop is not allowed to own completion across
+			-- host grace. The profile intent is the durable/live recovery owner.
+			departingPlayback.finalized = true
+			profile.boomboxPlayback = nil
+		end
+	end
+	if boomboxPlaybackOwner == player
+		and (not profile or profile.boomboxPlayback == nil)
+	then
 		boomboxPlaybackOwner = nil
 	end
 	TransactionRuntime.playerLifecycle.resetSharedActorForDeparture(player.UserId)
@@ -6434,7 +7199,19 @@ function TransactionRuntime.playerLifecycle.onClose()
 	for player, profile in pairs(profiles) do
 		if profile.loaded or profile.leaseOwned then
 			if profile.boomboxPlayback then
-				endBoomboxPlayback(profile, profile.boomboxPlayback.sessionId, "Shutdown", true)
+				local closingPlayback = profile.boomboxPlayback
+				endBoomboxPlayback(profile, closingPlayback.sessionId, "Shutdown", true)
+				local intent = profile.data.boomboxPendingSettlement
+				if profile.boomboxPlayback == closingPlayback
+					and type(intent) == "table"
+					and intent.sessionId == closingPlayback.sessionId
+				then
+					closingPlayback.finalized = true
+					profile.boomboxPlayback = nil
+				end
+			end
+			if boomboxPlaybackOwner == player then
+				boomboxPlaybackOwner = nil
 			end
 			local targetPlayer = player
 			local targetProfile = profile
@@ -6472,6 +7249,20 @@ function TransactionRuntime.runMaintenanceLoop()
 			end
 			completeSecretBunkerIfReady(sharedHostProfile)
 			if not sharedHostProfile.boomboxPlayback
+				and type(sharedHostProfile.data.boomboxPendingSettlement) == "table"
+				and sharedHostProfile.boomboxSettlementRecoveryInFlight ~= true
+			then
+				-- Recovery can yield for a lease-owned save. Keep the main
+				-- maintenance cadence responsive while a per-profile guard
+				-- prevents duplicate settlement workers.
+				task.spawn(
+					TransactionRuntime.recoverPendingBoomboxSettlement,
+					sharedHostProfile,
+					true
+				)
+			end
+			if not sharedHostProfile.boomboxPlayback
+				and not TransactionRuntime.boomboxSettlementPending(sharedHostProfile)
 				and sharedHostProfile.data.boomboxPurchased
 				and sharedHostProfile.data.boomboxPlaced
 				and sharedHostProfile.data.boomboxNextPlayAt > 0

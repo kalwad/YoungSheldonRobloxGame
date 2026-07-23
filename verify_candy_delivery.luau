@@ -43,6 +43,17 @@ local function countPlain(source, token)
 	end
 end
 
+local function section(source, firstToken, nextToken, label)
+	local first = string.find(source, firstToken, 1, true)
+	check(first ~= nil, label .. " start is missing")
+	local after = first and string.find(source, nextToken, first + #firstToken, true) or nil
+	check(after ~= nil, label .. " end is missing")
+	if not first or not after then
+		return ""
+	end
+	return string.sub(source, first, after - 1)
+end
+
 local function contextContaining(source, anchorTokens, requiredTokens, radius, label)
 	for _, anchor in ipairs(anchorTokens) do
 		local cursor = 1
@@ -145,31 +156,112 @@ for _, token in ipairs({
 	has(mainSource, token, "Family server is missing " .. token)
 end
 has(mainSource, "CooperGameProfileLoaded", "Candy delivery must wait for the authoritative profile")
-has(mainSource, "local candyBatchReady = chemistrySetupPlaced", "Schema-11 sanitizer does not restore ready batches")
-has(mainSource, "and not candyDeliveryActive", "Legacy active delivery contracts must win over impossible simultaneous ready state")
-local producedSource = contextContaining(
+local sanitizerSource = section(
 	mainSource,
-	{ "local function createCandyBatch" },
-	{ "candyBatchReady", "candyBatchToken", "GenerateGUID", "markDirty", "saveProfile" },
-	5200,
-	"Reaction completion must create and immediately persist one durable ready-batch token"
+	"local function sanitizeData(raw)",
+	"local function profileKey(player)",
+	"Candy profile sanitizer"
+)
+for _, marker in ipairs({
+	"local candyDeliveryActive = raw.candyDeliveryActive == true",
+	"local candyDeliveryToken = candyDeliveryActive",
+	"#raw.candyDeliveryToken >= 8",
+	"#raw.candyDeliveryToken <= 96",
+	"or (candyDeliveryActive and HttpService:GenerateGUID(false) or \"\")",
+	"local candyBatchReady = not candyDeliveryActive",
+	"and raw.candyBatchReady == true",
+	"local candyBatchToken = candyBatchReady",
+	"#raw.candyBatchToken >= 8",
+	"#raw.candyBatchToken <= 96",
+	"or (candyBatchReady and HttpService:GenerateGUID(false) or \"\")",
+}) do
+	has(sanitizerSource, marker, "Schema-12 candy sanitizer is missing " .. marker)
+end
+local activeSanitizeAt = string.find(
+	sanitizerSource,
+	"local candyDeliveryActive = raw.candyDeliveryActive == true",
+	1,
+	true
+)
+local readySanitizeAt = string.find(
+	sanitizerSource,
+	"local candyBatchReady = not candyDeliveryActive",
+	1,
+	true
+)
+check(
+	activeSanitizeAt and readySanitizeAt and activeSanitizeAt < readySanitizeAt,
+	"An active delivery contract must be sanitized before and take precedence over a simultaneous ready batch"
+)
+
+local persistentTransitionSource = section(
+	mainSource,
+	"function TransactionRuntime.commitPersistentTransition",
+	"local function pickHiddenLocation",
+	"Persistent transition helper"
+)
+for _, marker in ipairs({
+	"local existing = TransactionRuntime.findLogicalOperation(profile, kind)",
+	"TransactionRuntime.commitProfileValueOperation(",
+	"existing and existing.id or nil",
+	"if accepted and not durable",
+	'"TransactionReconciliation"',
+}) do
+	has(
+		persistentTransitionSource,
+		marker,
+		"Persistent transitions are missing duplicate/replay/durability handling: " .. marker
+	)
+end
+
+local producedSource = section(
+	mainSource,
+	"local function createCandyBatch",
+	"local function beginCandyDelivery",
+	"Candy production transition"
 )
 has(producedSource, 'metadata.productKind ~= "BlueRockCandy"', "Only the trusted BlueRockCandy product may create a ready batch")
-has(producedSource, "profile.data.candyDeliveryActive == true", "A new reaction batch must be blocked by an active delivery")
-has(producedSource, "profile.data.candyBatchReady == true", "Reaction completion retries must reuse an existing ready batch")
-has(producedSource, "saveProfile(profile.player, false)", "Finished candy must be saved before relying on the physical tray")
-
-local collectionTransitionSource = contextContaining(
-	mainSource,
-	{ "local function beginCandyDelivery" },
-	{ "reportedToken", "candyBatchReady", "candyBatchToken", "candyDeliveryActive", "candyDeliveryToken" },
-	5200,
-	"Collection must atomically move the exact ready token into the buyer contract"
+has(producedSource, 'tostring(metadata.productionKey or "")', "Candy production needs a server-authored reaction key")
+has(producedSource, 'TransactionRuntime.logicalOperationKind("CandyProduce", productionKey)', "Candy production needs a stable logical replay key")
+check(
+	countPlain(producedSource, "TransactionRuntime.commitPersistentTransition(") == 1,
+	"Candy production must use exactly one journaled persistent transition"
 )
-has(collectionTransitionSource, "reportedToken ~= profile.data.candyBatchToken", "Collection must reject a stale or forged ready-batch token")
+has(producedSource, "profile.data.candyBatchReady = true", "Candy production must persist the finished batch")
+has(producedSource, "profile.data.candyBatchToken = batchToken", "Candy production must persist its generated token")
+has(producedSource, "profile.data.candyDeliveryActive ~= true", "A new reaction batch must be blocked by an active delivery")
+has(producedSource, "profile.data.candyBatchReady ~= true", "A new reaction must not overwrite an uncollected batch")
+has(producedSource, '"CandyProductionNotAuthorized"', "Candy production is missing an authoritative denial result")
+has(producedSource, "operationRecord.result.batchToken", "A replay must return the original committed batch token")
+has(producedSource, "if appliedNow then", "Candy-ready feedback must only run for the first applied transition")
+check(
+	not string.find(producedSource, "saveProfile(", 1, true)
+		and not string.find(producedSource, "task.defer(saveProfile", 1, true),
+	"Candy production must rely on commitPersistentTransition durability, not a deferred direct save"
+)
+
+local collectionTransitionSource = section(
+	mainSource,
+	"local function beginCandyDelivery",
+	"local function completeCandyDelivery",
+	"Candy collection transition"
+)
+has(collectionTransitionSource, 'TransactionRuntime.logicalOperationKind("CandyCollect", reportedToken)', "Collection needs a stable token-derived replay key")
+check(
+	countPlain(collectionTransitionSource, "TransactionRuntime.commitPersistentTransition(") == 1,
+	"Candy collection must use exactly one journaled persistent transition"
+)
 has(collectionTransitionSource, "profile.data.candyBatchReady = false", "Collection must consume ready state")
 has(collectionTransitionSource, 'profile.data.candyBatchToken = ""', "Collection must consume the ready token")
 has(collectionTransitionSource, "profile.data.candyDeliveryToken = reportedToken", "Collection must reuse the same one-time token for delivery")
+has(collectionTransitionSource, "profile.data.candyBatchToken == reportedToken", "Collection must reject a stale or forged ready-batch token")
+has(collectionTransitionSource, '"CandyCollectionNotAuthorized"', "Collection is missing an authoritative denial result")
+has(collectionTransitionSource, "if appliedNow then", "A replayed collection must recover instead of duplicating its start presentation")
+check(
+	not string.find(collectionTransitionSource, "saveProfile(", 1, true)
+		and not string.find(collectionTransitionSource, "task.defer(saveProfile", 1, true),
+	"Candy collection must rely on commitPersistentTransition durability, not a deferred direct save"
+)
 local readyClearAt = string.find(collectionTransitionSource, "profile.data.candyBatchReady = false", 1, true)
 local activeSetAt = string.find(collectionTransitionSource, "profile.data.candyDeliveryActive = true", 1, true)
 check(readyClearAt ~= nil and activeSetAt ~= nil and readyClearAt < activeSetAt, "Ready state must be consumed before delivery becomes active")
@@ -190,18 +282,25 @@ hasAny(mainSource, {
 	'ensureServerEvent("BindableEvent", "CandyDeliveryCompleted")',
 	'ensureServerEvent("BindableEvent", "CandyBatchDelivered")',
 }, "Candy completion must enter the Family server through a server-only BindableEvent")
-local payoutSource = contextContaining(
+local payoutSource = section(
 	mainSource,
-	{ completionEventName or "CandyBatchDelivered" },
-	{ "candyDeliveryActive", "candyBatchesSold", "setAllowance", "candyDeliveryConfig.Payout" },
-	3900,
-	"Candy payout path must validate active state, count the sale, and award allowance"
+	"local function completeCandyDelivery",
+	"local hostWorldActionEvents",
+	"Candy sale transition"
+)
+has(payoutSource, 'TransactionRuntime.logicalOperationKind("CandySale", reportedToken)', "Candy sale needs a stable token-derived replay key")
+check(
+	countPlain(payoutSource, "TransactionRuntime.commitPersistentTransition(") == 1,
+	"Candy sale must use exactly one journaled persistent transition"
 )
 has(payoutSource, "profile.data.candyDeliveryActive", "Candy payout must consume the persistent active state")
 has(payoutSource, "profile.data.candyDeliveryToken", "Candy payout must validate and consume the one-time batch token")
 has(payoutSource, "reportedToken", "Candy payout must reject a missing or replayed batch token")
 has(payoutSource, "profile.data.candyBatchesSold", "Candy payout must persist the completed sale count")
 has(payoutSource, "candyDeliveryConfig.Payout", "Candy payout must use the configured server value")
+has(payoutSource, "profile.data.candyDeliveryToken == reportedToken", "Candy sale authorization must require the exact active token")
+has(payoutSource, '"CandyDeliveryNotAuthorized"', "Candy sale is missing an authoritative denial result")
+has(payoutSource, "if appliedNow then", "Duplicate candy-sale callbacks must not repeat feedback or presentation")
 check(countPlain(payoutSource, "setAllowance(") == 1, "Candy completion context has more than one allowance mutation")
 local activeClearAt = string.find(payoutSource, "profile.data.candyDeliveryActive = false", 1, true)
 local tokenClearAt = string.find(payoutSource, 'profile.data.candyDeliveryToken = ""', 1, true)
@@ -210,6 +309,11 @@ check(
 	activeClearAt ~= nil and tokenClearAt ~= nil and allowanceAt ~= nil
 		and activeClearAt < allowanceAt and tokenClearAt < allowanceAt,
 	"Candy active state and one-time token must be consumed before allowance is awarded"
+)
+check(
+	not string.find(payoutSource, "saveProfile(", 1, true)
+		and not string.find(payoutSource, "task.defer(saveProfile", 1, true),
+	"Candy sale must commit token consumption, statistic, and payout through one durable transition"
 )
 
 local snapshotSource = contextContaining(
@@ -527,6 +631,24 @@ for _, token in ipairs({
 }) do
 	has(bunkerSource, token, "Durable/fair chemistry output is missing " .. token)
 end
+local chemistryReactionSource = contextContaining(
+	bunkerSource,
+	{ "local productionKey = string.format(" },
+	{ "CandyBatchProduced", "productionKey = productionKey", "batchToken", "candyPresentation.queuePlayer" },
+	5600,
+	"Each completed chemistry reaction must submit one stable server-authored production key"
+)
+has(chemistryReactionSource, "player.UserId", "Candy production key must be scoped to the authoritative player")
+has(chemistryReactionSource, "token", "Candy production key must be scoped to one chemistry reaction")
+has(
+	chemistryReactionSource,
+	"productionKey = productionKey",
+	"The bunker must pass the reaction key to the journaled CandyBatchProduced transition"
+)
+check(
+	countPlain(chemistryReactionSource, "CandyBatchProduced") == 1,
+	"One chemistry reaction must issue exactly one production transition callback"
+)
 has(bunkerSource, "readyBatchToken", "Bunker must reconstruct the physical tray from the saved snapshot token")
 has(bunkerSource, "presentationSerial == candyPresentation.serial", "An expired tray lease must be cancellation-safe")
 has(bunkerSource, "The shared output tray retracted for the next chemist", "Lease expiry must explain that the durable batch remains saved")

@@ -407,6 +407,11 @@ Config.ProfileDefaults = {
 	boomboxPlaced = false,
 	boomboxNextPlayAt = 0,
 	boomboxAutoplayPurchased = false,
+	-- A completed song can finish while an earlier indexed beat payment is still
+	-- reconciling. Runtime stores the remaining full-song settlement contract
+	-- here so leave/shutdown recovery cannot silently turn a $300 session into a
+	-- partial payout. `false` is the canonical empty state.
+	boomboxPendingSettlement = false,
 	taskAutomationInstalled = {},
 	pendingTaskUpgradeId = "",
 	bankHackSuccesses = 0,

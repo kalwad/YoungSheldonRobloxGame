@@ -1,7 +1,10 @@
 # Remote, Prompt, and Server-Boundary Security Matrix
 
-Audit date: 2026-07-22  
-Method: static inventory of active local Luau sources; no Studio, published server, MemoryStore, DataStore, or exploit-client execution in this batch.
+Audit date: 2026-07-23
+Method: static inventory of active local Luau sources. The eight-phase local
+gate and deterministic contracts passed; no current-candidate Studio,
+published server, MemoryStore, DataStore, or exploit-client execution is
+claimed.
 
 ## Status meaning
 
@@ -12,6 +15,22 @@ Method: static inventory of active local Luau sources; no Studio, published serv
 
 Server-to-client-only remotes are listed so the inventory is complete. Bindables are server-only in Roblox and cannot be fired directly by an ordinary client; they still require typed, allowlisted contracts because a compromised or incorrect server script can invoke them.
 
+## Current automated inventory status
+
+- `bash tools/verify_milestone1_local.sh` passed its client-authority scan across
+  all 13 active client sources and confirmed that retired/future runtime
+  surfaces remain disabled. The same run compiled `140/140` Luau sources,
+  passed `130/130` deterministic checks, and passed the `27/27` compiler-register
+  matrix.
+- `verify_milestone1_remote_inventory.luau` is a new read-only Studio audit. It
+  checks literal client action/call-site drift, server allowlists and guards,
+  server-to-client ownership, physical prompt registries, door and bunker
+  guards, server-only bindables, and privileged debug/scenario surfaces. It
+  compiles but is **NOT RUN** against the current Studio or published
+  candidate.
+- Passing that static verifier will not convert any published malformed
+  payload, replay, flood, ticket, proximity, or multiplayer row to PASS.
+
 ## Client-to-server network surface
 
 | Surface | Accepted client actions | Source-verified server controls | Status and open work |
@@ -21,7 +40,7 @@ Server-to-client-only remotes are listed so the inventory is complete. Bindables
 | `ReplicatedStorage.CooperInteractionsRemotes.Request` → `CooperInteractions.server.luau` | `HeldAction` (`Throw`, `Drop`, `Solve`), `TerminalCommand`, `TerminalClose`, `CubeMove`, `CubeReshuffle`, `CubeGiveUpThrow`, `CubeClose` | Action/payload types; per-action cooldowns; held-object ownership; cube session ID and ownership; approved cube face; live cube/computer distance; active terminal session; command nonblank/truncated/control-stripped before reporting; give-up throw validates held/near loose cube | **SOURCE VERIFIED / runtime PARTIAL.** Needs moved-part/instance spoof, oversized table/string, NaN, flood, reset, simultaneous pickup, and network-lag tests. `TerminalClose` intentionally only clears caller state. |
 | `ReplicatedStorage.CooperYardRideablesRemotes.RideablesEvent` → `CooperYardRideables.server.luau` | `SwingPump`, `ResetSwing`, `TrikeControl`, `ResetTrike` | Player must occupy the correct seat; per-action rate bounds; finite numeric checks; input clamps; prompt use checks living humanoid/not seated and 11/12-stud distance; server owns assembly updates | **SOURCE VERIFIED / runtime PARTIAL.** Needs NaN/infinity/flood, ownership churn, death/reset, streaming, mobile/controller, and collision/path tests. |
 | `ReplicatedStorage.CooperMovementRemotes.SprintIntent` → `CooperMovement.server.luau` | Boolean sprint intent | Strict boolean; stop intent accepted safely; token bucket for starts; living, healthy, unseated humanoid; stamina/exhaustion; named/modal movement locks; server computes stamina and rewrites authoritative speed | **SOURCE VERIFIED / runtime PARTIAL.** Needs local WalkSpeed tamper, flood, death/reset, overlapping lock, latency, mobile/controller, and four-player tests. |
-| `ReplicatedStorage.CooperPartyLobby.Remotes.Request` `RemoteFunction` → `lobby/CooperLobby.server.luau` | `CreateParty`, `PlaySolo`, `SetReady`, `InviteFriends`, `Launch`, `LeaveParty`, `Rejoin`, `Refresh` | Strict action allowlist; typed ready payload; per-action minimum gaps plus token bucket; separately throttled refresh; server-owned party/host/readiness; host-only invite/launch; party lifecycle/size/readiness/presence checks; MemoryStore compare/update revisions; opaque expiring one-use house admission tickets; safe failure reason codes | **SOURCE VERIFIED / published BLOCKED.** Real reserved-server launch, stale/replayed ticket, outsider, partial teleport, MemoryStore contention, host/guest reconnect, and ready/start order tests are not proven by static source. This is the critical M1 gate. |
+| `ReplicatedStorage.CooperPartyLobby.Remotes.Request` `RemoteFunction` → `lobby/CooperLobby.server.luau` | `CreateParty`, `PlaySolo`, `SetReady`, `InviteFriends`, `Launch`, `LeaveParty`, `Rejoin`, `Refresh` | Strict action allowlist; typed ready payload; per-action minimum gaps plus token bucket; separately throttled refresh; server-owned party/host/readiness; host-only invite/launch; party lifecycle/size/readiness/presence checks; MemoryStore compare/update revisions; opaque expiring one-use house admission tickets; safe failure reason codes; one shared bounded retry budget for synchronous `TeleportAsync` failure or asynchronous `TeleportInitFailed`, reusing the original reservation, session manifest, tickets, `TeleportOptions`, and launch token and rejecting stale/duplicate callbacks | **SOURCE VERIFIED / published BLOCKED.** Deterministic ordering, idempotency, ticket, grace, and synchronous/asynchronous bounded-retry contracts pass. Real reserved-server launch, stale/replayed ticket, outsider, partial teleport, MemoryStore contention, host/guest reconnect, and Ready/Start behavior are not proven by static or fake services. This is the critical M1 gate. |
 | `ReplicatedStorage.CooperFamilyDialogue.Session` → `CooperFamilyDialogue.server.luau` | `Close` | Only `Close` mutates state; it releases the caller's own active session; prompt opens session only within 12 studs and honors NPC exclusivity/dance guard | **PARTIAL.** Close creates no value and needs no expensive work, but it has no explicit rate/log. Test spam, reset, two-player contention, and spoofed action. |
 
 ## Server-to-client-only remotes
@@ -53,13 +72,13 @@ ProximityPrompt configuration is not a security boundary by itself. The server m
 
 | Surface | Callers / purpose | Current validation | Status |
 |---|---|---|---|
-| `ServerScriptService.CooperGameServerEvents.ReportAction` | interaction/world scripts report authoritative task actions | Family server validates player/profile/party, action/task context and payload fields before progression | **PARTIAL.** Server-only boundary is correct; operation-ID coverage and fault injection are incomplete. |
+| `ServerScriptService.CooperGameServerEvents.ReportAction` | interaction/world scripts report authoritative task actions and paid physical acknowledgements | Family server validates player/profile/party, action/task context and payload fields before progression; enumerated task rewards and paid install acknowledgements use named persistent operations | **PARTIAL.** Server-only boundary and local operation identities are correct; caller fault, duplicate/out-of-order callback, disconnect, and isolated persistence execution remain. |
 | `RegisterAction` | registers server action/catalog metadata | Server-only typed/action registration | **PARTIAL.** Audit every registrant and reject duplicate/unknown definitions with diagnostics. |
 | `RequestDelivery` | family server asks task world for an ordinary paid/task delivery | Request key/snapshot/catalog/session checks in world; retry exists because bindables do not retain startup messages | **PARTIAL.** Needs duplicate, stale, starvation/fairness, leave/rejoin, and interrupted-delivery tests. |
 | `RequestBunkerConstruction` | family server starts bunker construction | Bunker construction server validates authoritative payload/state | **PARTIAL.** Needs duplicate/stale operation and cleanup/streaming tests. |
 | `RunTaskAutomation` | family server starts a configured robot job | World checks catalog/snapshot/owner and task context | **PARTIAL.** Needs server-owned robot outcome reason codes, path/fault tests, and exactly-once completion. |
-| `CandyDeliveryChanged` | task world reports candy buyer/delivery state | Family side reconciles authoritative token/state | **PARTIAL.** Needs duplicate/out-of-order/fail-then-succeed tests. |
-| `CooperGameServerEvents.API` `BindableFunction` | bunker/world queries and host-authoritative operations | Action-specific validation is implemented server-side | **PARTIAL.** Inventory and type-contract tests should enumerate every API operation; no caller provenance exists beyond server-only scope. |
+| `CandyDeliveryChanged` | task world reports candy buyer/delivery state | Family side validates owner/session/batch identity; candy production, collection, and sale have stable server-owned persistent operation kinds | **PARTIAL.** Deterministic identity tests pass; runtime duplicate/out-of-order/fail-then-succeed, distance, disconnect, and save-fault tests remain. |
+| `CooperGameServerEvents.API` `BindableFunction` | bunker/world queries and host-authoritative operations | Action-specific validation is implemented server-side; candy lifecycle, indexed boombox ticks, exact `$300` completed-playback settlement, and paid installs use named persistent operations; broad `AdjustCurrency` and `SpendAllowance` operations fail closed as deprecated | **PARTIAL.** Deterministic boombox missing-tick/save/retry/end-race cases settle to exactly `$300` without overpayment. The value-operation verifier and complete inventory compile but are NOT RUN in Studio; no caller provenance exists beyond server-only scope, and runtime type/replay/fault tests remain. |
 | `CooperMovementAPI.SetLock`, `SetSpeedMultiplier`, `ReleaseSource`, `StateChanged` | server scripts coordinate movement locks/multipliers | Player/source type, trimmed source length, boolean/range/finite validation; named ownership prevents accidental unlock | **SOURCE VERIFIED / runtime PARTIAL.** Server scripts are trusted; test overlapping sources, teardown, throws, death, and nil releases. |
 | Door/refrigerator `AutomationDoorCommand` functions | robots hold/release doors | Command/action/hold-count validation | **PARTIAL.** Server-only, but no caller identity; ensure all calls are catalog-owned and teardown cannot strand a hold. Garage is not yet unified. |
 | `lobby.CooperLobbyStudioBridge.Launch` | Studio-only local house preview launch | Created by the Studio preview path and called only after lobby server validation | **BLOCKED for production proof.** `verify_production_build_surface.luau` must prove the bridge and scenario controls are absent/inaccessible in a published candidate. |
@@ -83,7 +102,10 @@ Any future state-changing path must validate on the server, at minimum:
 ## Priority remediation and execution order
 
 1. Close the published lobby launch/ticket/reconnect gate; static source is not enough.
-2. Wire and test production operation IDs for task rewards, purchases, penalties, survival, discoveries, stats, and ending credit.
+2. Execute isolated persistence, retry, reconnect, concurrent-server, and full
+   regression tests for the now-journaled Milestone 1 value paths. Require
+   operation IDs for every future penalty, survival, discovery, statistic, and
+   ending operation before those features activate.
 3. Execute the new front/patio/garage/bunker prompt guards under multi-client flood, distance spoof, reset/death, obstruction, and automation timing; source validation is complete but runtime evidence is not.
 4. Build automated malformed-payload, NaN/infinity, large-string/table, arbitrary-instance, replay, and flood tests for every client-to-server row.
 5. Run `verify_production_build_surface.luau` against a published private candidate and actively probe guessed debug/scenario names.

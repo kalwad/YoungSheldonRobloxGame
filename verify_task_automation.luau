@@ -251,7 +251,7 @@ check(next(defaults.taskAutomationInstalled) == nil, "Fresh profiles must not re
 check(defaults.pendingTaskUpgradeId == "", "Fresh profiles must not begin with a paid delivery pending")
 check(defaults.bankHackSuccesses == 0, "Fresh profiles must begin with zero successful bank hacks")
 check(state:GetAttribute("SchemaVersion") == 12, "Shared State does not expose schema 12")
-check(state:GetAttribute("FoundationContract") == "PersonalV4", "Task automation must preserve the PersonalV4 foundation contract")
+check(state:GetAttribute("FoundationContract") == "PartyV1", "Task automation must preserve the PartyV1 shared-session contract")
 check(state:GetAttribute("SupportsTaskAutomation") == true, "Shared State does not advertise task automation")
 check(state:GetAttribute("SupportsMedfordBankHack") == true, "Shared State does not advertise Medford Bank hacking")
 
@@ -310,8 +310,14 @@ end
 lacks(saveSource, "if releasing and attempt < maximumAttempts then", "Normal economy saves must retry transient DataStore failures too")
 lacks(saveSource, "or (not ok and not releasing)", "Normal economy saves must not stop after their first failed write")
 
-local automationSnapshotSource = section(serverSource, "local function automationSnapshot(profile)", "local function deliverySnapshot", "Automation snapshot")
+local automationSnapshotSource = section(
+	serverSource,
+	"local function automationSnapshot(profile, viewerProfile)",
+	"local function deliverySnapshot(profile, viewerProfile)",
+	"Automation snapshot"
+)
 for _, marker in ipairs({
+	"local activeRecord = partySession.task",
 	"catalog = catalog",
 	"installedCount = installedCount",
 	"totalCount = #Config.TaskAutomationUpgrades",
@@ -339,8 +345,32 @@ for _, marker in ipairs({
 }) do
 	has(automationSnapshotSource, marker, "Automation snapshot is missing " .. marker)
 end
+ordered(automationSnapshotSource, {
+	"canOrder = profile ~= nil",
+	"and viewerProfile ~= nil",
+	"and partyIsHost(viewerProfile.player)",
+	"and partyCanProgress()",
+}, "Only the active PartyV1 host may order a task robot")
 
-local deliverySnapshotSource = section(serverSource, "local function deliverySnapshot(profile)", "local function snapshotFor", "Delivery snapshot")
+local deliverySnapshotSource = section(
+	serverSource,
+	"local function deliverySnapshot(profile, viewerProfile)",
+	"local function snapshotFor",
+	"PartyV1 delivery snapshot"
+)
+for _, marker in ipairs({
+	"viewerProfile = viewerProfile or profile",
+	"local viewerIsHost = viewerProfile ~= nil and partyIsHost(viewerProfile.player)",
+	"local ownerUserId = profile.player and profile.player.UserId or partySession.hostUserId",
+}) do
+	has(deliverySnapshotSource, marker, "Shared delivery ownership is missing " .. marker)
+end
+local taskUpgradeDeliverySnapshotSource = section(
+	deliverySnapshotSource,
+	"elseif profile.data.pendingTaskUpgradeId ~= \"\" then",
+	"elseif profile.data.chemistrySetupPurchased",
+	"Task-upgrade delivery snapshot"
+)
 for _, marker in ipairs({
 	"profile.data.pendingTaskUpgradeId ~= \"\"",
 	"kind = \"TaskUpgrade\"",
@@ -350,11 +380,35 @@ for _, marker in ipairs({
 	"then (definition and definition.installTarget or nil)",
 	"\"Delivery_TaskUpgrade_\" .. tostring(profile.player.UserId)",
 	"else \"DeliveryDropZone\"",
+	"targetHint = viewerIsHost and",
+	"hostOnly = true",
+	"ownerUserId = ownerUserId",
 }) do
-	has(deliverySnapshotSource, marker, "Task-upgrade delivery snapshot is missing " .. marker)
+	has(taskUpgradeDeliverySnapshotSource, marker, "Task-upgrade delivery snapshot is missing " .. marker)
 end
+local viewerSnapshotSource = section(
+	serverSource,
+	"local function snapshotFor(player)",
+	"local function sendSnapshot(player)",
+	"PartyV1 per-viewer snapshot"
+)
+has(
+	viewerSnapshotSource,
+	"delivery = deliverySnapshot(worldProfile, profile)",
+	"Party snapshots do not pass host delivery state through the individual viewer's permissions"
+)
+has(
+	viewerSnapshotSource,
+	"automation = automationSnapshot(worldProfile, profile)",
+	"Party snapshots do not pass host automation state through the individual viewer's permissions"
+)
 
-local orderSource = section(serverSource, "local function orderTaskUpgrade(profile, requestedUpgradeId)", "local function reportPlayerAction", "Task-upgrade order")
+local orderSource = section(
+	serverSource,
+	"local function orderTaskUpgrade(profile, requestedUpgradeId)",
+	"local function orderSecretBunker(profile)",
+	"Task-upgrade order"
+)
 for _, marker in ipairs({
 	"local definition = automationById[upgradeId]",
 	"profile.data.taskAutomationInstalled[upgradeId] == true",
@@ -362,22 +416,54 @@ for _, marker in ipairs({
 	"profile.data.pendingPartStage > 0",
 	"profile.data.boomboxPurchased and not profile.data.boomboxPlaced",
 	"profile.data.allowance < price",
+	"local purchased, durable, transactionStatus = TransactionRuntime.commitHostPurchase(",
+	"TransactionRuntime.commitHostPurchase(",
+	'"PurchaseTaskUpgrade:" .. upgradeId',
 	"feedback(profile.player, \"TaskUpgradeOrdered\"",
-	"task.defer(saveProfile, profile.player, false)",
+	"if not purchased then",
+	"if not durable then",
+	"return true, definition.name, price, true",
 }) do
 	has(orderSource, marker, "Authoritative task-upgrade ordering is missing " .. marker)
 end
 lacks(orderSource, "task.wait", "Atomic task-upgrade ordering must not yield")
 ordered(orderSource, {
+	"TransactionRuntime.commitHostPurchase(",
 	"setAllowance(profile, profile.data.allowance - price)",
 	"profile.data.pendingTaskUpgradeId = upgradeId",
+	"if not purchased then",
+	"if not durable then",
+	"return true, definition.name, price, true",
 	"profile.taskUpgradeDeliveryStep = \"WaitingDelivery\"",
-	"markDirty(profile)",
 	"queueDelivery(profile, \"TaskUpgrade\", 0, upgradeId)",
 	"feedback(profile.player, \"TaskUpgradeOrdered\"",
 	"broadcastState()",
-	"task.defer(saveProfile, profile.player, false)",
-}, "Upgrade purchase must debit, persist, queue, announce, and save in that order")
+}, "Upgrade purchase must commit its debit and entitlement before queuing or announcing the delivery")
+lacks(
+	orderSource,
+	"task.defer(saveProfile",
+	"Task-upgrade ordering must rely on commitHostPurchase durability, not a deferred direct save"
+)
+
+local persistentTransitionSource = section(
+	serverSource,
+	"function TransactionRuntime.commitPersistentTransition",
+	"local function pickHiddenLocation",
+	"Persistent transition helper"
+)
+for _, marker in ipairs({
+	"local existing = TransactionRuntime.findLogicalOperation(profile, kind)",
+	"TransactionRuntime.commitProfileValueOperation(",
+	"existing and existing.id or nil",
+	"if accepted and not durable",
+	'"TransactionReconciliation"',
+}) do
+	has(
+		persistentTransitionSource,
+		marker,
+		"Robot installation durability/replay support is missing " .. marker
+	)
+end
 
 local reportSource = section(serverSource, "local function reportPlayerAction(eventKey, player, metadata)", "reportAction.Event:Connect", "World-report handler")
 for _, marker in ipairs({
@@ -388,15 +474,18 @@ for _, marker in ipairs({
 	"eventKey == \"TaskUpgradeCratePicked\"",
 	"profile.taskUpgradeDeliveryStep = \"Install\"",
 	"eventKey == \"TaskUpgradeInstalled\"",
-	"profile.data.taskAutomationInstalled[pendingUpgradeId] = true",
+	'"InstallTaskUpgrade"',
+	"TransactionRuntime.commitPersistentTransition(",
+	"profile.data.taskAutomationInstalled[reportedUpgradeId] = true",
 	"profile.data.pendingTaskUpgradeId = \"\"",
-	"feedback(player, \"TaskUpgradeInstalled\"",
-	"local activeRecord = profile.task",
-	"activeRecord.id == pendingUpgrade.taskId",
+	'"TaskUpgradeInstallNotAuthorized"',
+	"if appliedNow then",
+	"feedback(player, durable and \"TaskUpgradeInstalled\" or \"TaskUpgradeInstallSaving\"",
+	"local activeRecord = partySession.task",
+	"activeRecord.id == installDefinition.taskId",
 	"destroyManualCarryForAutomation(player, activeRecord.id)",
-	"armTaskAutomation(activeRecord, pendingUpgrade)",
-	"launchTaskAutomation(profile, activeRecord, pendingUpgrade)",
-	"task.defer(saveProfile, player, false)",
+	"armTaskAutomation(activeRecord, installDefinition)",
+	"launchTaskAutomation(profile, activeRecord, installDefinition)",
 	"eventKey == \"TaskUpgradeCarryLost\"",
 	"queueDelivery(profile, \"TaskUpgrade\", 0, pendingUpgradeId)",
 	"if record.automated then",
@@ -404,26 +493,51 @@ for _, marker in ipairs({
 }) do
 	has(reportSource, marker, "Task-upgrade lifecycle/manual rejection is missing " .. marker)
 end
-ordered(reportSource, {
-	"eventKey == \"TaskUpgradeInstalled\"",
-	"profile.data.taskAutomationInstalled[pendingUpgradeId] = true",
+
+local taskUpgradeInstallSource = section(
+	reportSource,
+	'elseif eventKey == "TaskUpgradeInstalled"',
+	'elseif eventKey == "TaskUpgradeCarryLost"',
+	"Task-upgrade install transition"
+)
+check(
+	countPlain(taskUpgradeInstallSource, "TransactionRuntime.commitPersistentTransition(") == 1,
+	"A task robot installation must use exactly one journaled persistent transition"
+)
+ordered(taskUpgradeInstallSource, {
+	"TransactionRuntime.logicalOperationKind(",
+	'"InstallTaskUpgrade"',
+	"TransactionRuntime.commitPersistentTransition(",
+	"profile.data.taskAutomationInstalled[reportedUpgradeId] = true",
 	"profile.data.pendingTaskUpgradeId = \"\"",
+	"pendingUpgrade ~= nil",
+	"reportedUpgradeId == pendingUpgradeId",
+	"profile.taskUpgradeDeliveryStep == \"Install\"",
+	"if not accepted then",
+	"if appliedNow then",
 	"profile.taskUpgradeDeliveryStep = nil",
-	"markDirty(profile)",
-	"feedback(player, \"TaskUpgradeInstalled\"",
+	"feedback(player, durable and \"TaskUpgradeInstalled\" or \"TaskUpgradeInstallSaving\"",
 	"broadcastState()",
-	"task.defer(saveProfile, player, false)",
-}, "Installation entitlement must be committed and saved before returning")
-ordered(reportSource, {
-	"feedback(player, \"TaskUpgradeInstalled\"",
-	"local activeRecord = profile.task",
-	"activeRecord.id == pendingUpgrade.taskId",
+}, "Robot entitlement must be durably committed before ephemeral delivery state and presentation are finalized")
+ordered(taskUpgradeInstallSource, {
+	"feedback(player, durable and \"TaskUpgradeInstalled\" or \"TaskUpgradeInstallSaving\"",
+	"local activeRecord = partySession.task",
+	"activeRecord.id == installDefinition.taskId",
 	"destroyManualCarryForAutomation(player, activeRecord.id)",
-	"armTaskAutomation(activeRecord, pendingUpgrade)",
-	"launchTaskAutomation(profile, activeRecord, pendingUpgrade)",
+	"armTaskAutomation(activeRecord, installDefinition)",
+	"launchTaskAutomation(profile, activeRecord, installDefinition)",
 	"broadcastState()",
-	"task.defer(saveProfile, player, false)",
 }, "Installing a matching robot mid-chore must clean obsolete carry state and immediately transfer that task to server automation")
+lacks(
+	taskUpgradeInstallSource,
+	"task.defer(saveProfile",
+	"Robot installation must rely on commitPersistentTransition durability, not a deferred direct save"
+)
+lacks(
+	taskUpgradeInstallSource,
+	"markDirty(",
+	"Robot installation must not create an unjournaled entitlement save path"
+)
 
 local carryCleanupSource = section(serverSource, "local function destroyManualCarryForAutomation", "-- The hidden prop is rendered locally", "Automation carry cleanup")
 for _, marker in ipairs({
@@ -452,7 +566,7 @@ end
 
 local launchSource = section(serverSource, "local function launchTaskAutomation(profile, record, definition)", "local function startNextTask", "Server automation launcher")
 for _, marker in ipairs({
-	"profile.task ~= record",
+	"partySession.task ~= record",
 	"record.automated ~= true",
 	"record.automationUpgradeId ~= definition.id",
 	"local runId = string.format(",
@@ -472,9 +586,11 @@ for _, marker in ipairs({
 	"feedback(profile.player, \"TaskAutomationStarted\"",
 	"runTaskAutomation:Fire(profile.player, definition.id, metadata)",
 	"completeTask(profile, record)",
-	"task.delay(definition.duration, function()",
+	"task.spawn(function()",
 	"profiles[profile.player] == profile",
 	"profile.automationRuns[runId] == record",
+	"record.automationVisualRemaining",
+	"if partyCanProgress() and hostProfile() == profile then",
 	"profile.automationRuns[runId] = nil",
 	"definition.id == \"BeerBot\"",
 	"stockAutomatedBeer()",
@@ -490,29 +606,85 @@ ordered(launchSource, {
 	"profile.automationRuns[runId] = record",
 	"runTaskAutomation:Fire(profile.player, definition.id, metadata)",
 	"completeTask(profile, record)",
-	"task.delay(definition.duration, function()",
+	"task.spawn(function()",
 	"profile.automationRuns[runId] = nil",
 }, "A robot must accept and reward once before its physical background run is cleaned up")
 
-local taskStartSource = section(serverSource, "local function startNextTask(profile)", "local function scheduleNextTask", "Task director")
+local taskStartSource = section(serverSource, "local function startNextTask(profile)", "local function scheduleNextTask", "Durable task director")
 for _, marker in ipairs({
+	"partyIsHost(profile.player)",
+	"partySession.task",
+	"profile.data.calmTaskCheckpoint",
 	"local automationDefinition = automationByTaskId[id]",
 	"profile.data.taskAutomationInstalled[automationDefinition.id] == true",
 	"automationRunIsActive(profile, automationDefinition.id)",
-	"profile.nextTaskAt = serverNow() + 1",
+	"partySession.nextTaskAt = serverNow() + 1",
+	"local eligibility = captureTaskEligibility(profile.data.totalTasks + 1)",
+	"eligibility.memberSet[profile.player.UserId] ~= true",
+	"profile.data.calmTaskCheckpoint = {",
+	"eligibleUserIds = table.clone(eligibility.userIds)",
+	"markDirty(profile)",
+	"TransactionRuntime.commitCalmTaskStart(profile, false)",
+}) do
+	has(taskStartSource, marker, "New tasks do not enter the durable shared scheduler: " .. marker)
+end
+
+local taskExposureSource = section(
+	serverSource,
+	"function TransactionRuntime.exposeCalmTaskCheckpoint",
+	"function TransactionRuntime.commitCalmTaskStart",
+	"Durable task exposure"
+)
+for _, marker in ipairs({
+	"if partySession.task or not partyCanProgress() or hostProfile() ~= profile then",
+	"TransactionRuntime.checkpointValidation(profile, checkpoint)",
+	"eligibility = TransactionRuntime.eligibilityFromCheckpoint(checkpoint)",
+	"eligibilityResolutionByUserId = {}",
+	"rewardOperationIdsByUserId = {}",
 	"armTaskAutomation(record, automationDefinition)",
-	"profile.task = record",
+	"-- CALM_TASK_START_EXPOSURE_AFTER_DURABLE_SAVE",
+	"partySession.task = record",
+	"feedback(nil, \"TaskStarted\"",
 	"if record.automated then",
 	"launchTaskAutomation(profile, record, automationDefinition)",
 }) do
-	has(taskStartSource, marker, "New tasks do not enter the shared automation launcher: " .. marker)
+	has(taskExposureSource, marker, "Durable task exposure/automation transfer is missing " .. marker)
 end
 ordered(taskStartSource, {
+	"local eligibility = captureTaskEligibility(profile.data.totalTasks + 1)",
+	"eligibleUserIds = table.clone(eligibility.userIds)",
+	"markDirty(profile)",
+	"TransactionRuntime.commitCalmTaskStart(profile, false)",
+}, "A new shared chore must capture and persist its immutable earners before exposure")
+ordered(taskExposureSource, {
+	"eligibility = TransactionRuntime.eligibilityFromCheckpoint(checkpoint)",
 	"armTaskAutomation(record, automationDefinition)",
-	"profile.task = record",
-	"feedback(profile.player, \"TaskStarted\"",
+	"-- CALM_TASK_START_EXPOSURE_AFTER_DURABLE_SAVE",
+	"partySession.task = record",
+	"feedback(nil, \"TaskStarted\"",
 	"launchTaskAutomation(profile, record, automationDefinition)",
-}, "A new automated chore must be armed, made current, announced, then launched")
+}, "A recovered or new automated chore must be armed, made shared, announced, then launched")
+
+local eligibilitySource = section(
+	serverSource,
+	"-- M1_TASK_ELIGIBILITY_CONTRACT",
+	"function TransactionRuntime.checkpointValidation",
+	"Immutable task eligibility"
+)
+for _, marker in ipairs({
+	"local function captureTaskEligibility(version)",
+	"partySession.activePlayers",
+	"partySession.expectedMembers[userId] == true",
+	"profile.loaded and not profile.releasing and not profile.leaseLost",
+	"profile.detached ~= true",
+	"table.sort(userIds)",
+	"userIds = table.freeze(userIds)",
+	"memberSet = table.freeze(memberSet)",
+	"record.eligibility.memberSet[userId] ~= true",
+	"record.eligibilityResolutionByUserId[userId]",
+}) do
+	has(eligibilitySource, marker, "Immutable shared-task eligibility is incomplete")
+end
 
 local beerStockSource = section(serverSource, "stockAutomatedBeer = function()", "completeTask = function(profile, expectedRecord)", "Authoritative BeerBot stocking")
 for _, marker in ipairs({
@@ -532,31 +704,71 @@ has(
 
 local completeSource = section(serverSource, "completeTask = function(profile, expectedRecord)", "local function bankRoundCount", "Task completion")
 ordered(completeSource, {
-	"local record = expectedRecord or profile.task",
-	"profile.task ~= record",
+	"local record = expectedRecord or partySession.task",
+	"partySession.task ~= record",
 	"local reward = finiteInteger(definition.reward",
-	"setAllowance(profile, profile.data.allowance + reward)",
-	"profile.data.totalTasks += 1",
-	"profile.task = nil",
-	"markDirty(profile)",
+	'record.status = "Completing"',
+	"for _, userId in ipairs(record.eligibility.userIds) do",
+	"local operationKind = \"TaskReward:\" .. tostring(record.logicalId)",
+	"TransactionRuntime.reserveProfileValueOperation(",
+	"TransactionRuntime.commitProfileValueOperation(",
+	"setAllowance(recipient, recipient.data.allowance + reward)",
+	"recipient.data.totalTasks += 1",
+	"recipient.data.cycleIndex = math.floor(recipient.data.totalTasks / #Config.TaskOrder) + 1",
+	"recipient.data.cycleTaskIndex = (recipient.data.totalTasks % #Config.TaskOrder) + 1",
+	"recipient.data.calmTaskCheckpoint = nil",
+	"if not allResolved then",
+	'record.status = "Completed"',
+	"partySession.completedTasks += 1",
+	"partySession.task = nil",
 	"Config.TaskDirector.AutomatedNextDelay",
-	"feedback(profile.player, \"TaskComplete\"",
+	"feedback(recipient.player, \"TaskComplete\"",
 	"automated = record.automated == true",
-	"task.defer(saveProfile, profile.player, false)",
-}, "Automatic chores must use the ordinary authoritative reward/save path")
+}, "Automatic chores must use immutable party eligibility and the exactly-once reward journal")
 for _, marker in ipairs({
-	"local automatedBankProof = record.automated == true",
+	"local automationProfile = hostProfile()",
+	"local automatedBankProof = automationProfile ~= nil and record.automated == true",
 	"record.automationUpgradeId == \"HackerBot\"",
-	"profile.data.taskAutomationInstalled.HackerBot == true",
+	"automationProfile.data.taskAutomationInstalled.HackerBot == true",
 	"type(record.bankAutomationRunId) == \"string\"",
 	"record.bankAutomationRunId == record.automationRunId",
-	"profile.automationRuns[record.automationRunId] == record",
+	"automationProfile.automationRuns[record.automationRunId] == record",
 	"local manualBankProof = record.automated ~= true and record.bankHackValidated == true",
 	"if (not automatedBankProof and not manualBankProof) or record.bankSuccessCounted == true then",
 }) do
 	has(completeSource, marker, "Bank automation is missing its separate server-only completion proof: " .. marker)
 end
 lacks(completeSource, "stockAutomatedBeer()", "Beer must be stocked when BeerBot visibly finishes, not when it merely accepts the chore")
+lacks(
+	completeSource,
+	"task.defer(saveProfile",
+	"Robot rewards must use the schema-12 operation journal instead of deferred direct saves"
+)
+lacks(
+	completeSource,
+	"setAllowance(profile, profile.data.allowance + reward)",
+	"Robot rewards must pay each immutable eligible profile rather than only the host"
+)
+
+local rewardOrderingSource = section(
+	completeSource,
+	"local payoutUserIds = {}",
+	"local allResolved = true",
+	"Exactly-once shared reward ordering"
+)
+ordered(rewardOrderingSource, {
+	"if userId ~= partySession.hostUserId then",
+	"table.insert(payoutUserIds, userId)",
+	"table.insert(payoutUserIds, partySession.hostUserId)",
+	"for _, userId in ipairs(payoutUserIds) do",
+	"if userId == partySession.hostUserId then",
+	"local everyGuestTerminal = true",
+	'guestResolution.status ~= "Committed" and guestResolution.status ~= "Forfeited"',
+	"if not everyGuestTerminal then",
+	"local operationKind = \"TaskReward:\" .. tostring(record.logicalId)",
+	"if userId == partySession.hostUserId then",
+	"recipient.data.calmTaskCheckpoint = nil",
+}, "Guest rewards must resolve before the host advances and clears the calm-task checkpoint")
 
 local descriptionSource = section(serverSource, "local function taskDescription(profile)", "local function hiddenSnapshot", "Task presentation")
 for _, marker in ipairs({
@@ -676,7 +888,7 @@ has(clientSource, "MedfordBankHack = \"cyan\"", "HackerBot guidance has no reada
 
 local terminalSource = section(clientSource, "function renderTerminal()", "terminalBack.Activated:Connect", "Computer terminal")
 for _, marker in ipairs({
-	"\"Buy Task Robots\"",
+	"\"Buy Task Robots (Host)\"",
 	"showPage(\"Automation\")",
 	"terminalPage == \"Automation\"",
 	"automationData(snapshot)",
@@ -774,7 +986,12 @@ end
 local taskUpgradePriorityAt = string.find(guidanceSource, "tostring(delivery.kind or \"\") == \"TaskUpgrade\"", 1, true)
 local boomboxPriorityAt = string.find(guidanceSource, "tostring(delivery.kind or \"\") == \"Boombox\"", 1, true)
 check(taskUpgradePriorityAt and boomboxPriorityAt and taskUpgradePriorityAt < boomboxPriorityAt, "Carried task robots must outrank boombox and chore arrows")
-local arrowRetrySource = section(clientSource, "local function updateArrow(snapshot)", "RunService.RenderStepped:Connect", "Stream-safe task guidance")
+local arrowRetrySource = section(
+	clientSource,
+	"local function updateArrow(snapshot)",
+	"game:GetService(\"RunService\").RenderStepped:Connect(function()",
+	"Stream-safe task guidance"
+)
 for _, marker in ipairs({
 	"workspace.DescendantAdded:Connect",
 	"arrowResolveScheduled",
@@ -795,7 +1012,11 @@ local dirtyDishesSource = section(clientSource, "local function updateDirtyDishe
 has(dirtyDishesSource, "upgradeNoticeUi.automationRun(snapshot, \"MaryDishes\") ~= nil", "Dirty dishes must remain visible until DishBot physically finishes")
 
 local promptSource = section(clientSource, "local function updateWorldPrompts(snapshot)", "-- Task stations can stream", "Client task prompts")
-has(promptSource, "local manualTask = not taskIsAutomated(taskData) and taskData or nil", "Automated tasks do not suppress manual world prompts")
+ordered(promptSource, {
+	"local activeParty = partyUx.isActive(snapshot)",
+	"local manualTask = activeParty and partyUx.ownsCarrier(taskData)",
+	"and not taskIsAutomated(taskData) and taskData or nil",
+}, "Only the active PartyV1 carrier may receive manual task prompts")
 for _, manualAnchor in ipairs({
 	"DishesPromptAnchor",
 	"TrashPickupAnchor",
@@ -816,8 +1037,11 @@ for _, marker in ipairs({
 	"local automated = taskIsAutomated(taskData)",
 	"AUTOMATION ",
 	"ROBOT WORKING",
-	"AUTOMATIC REWARD",
-	"taskDescription.Text = tostring(taskData.description)",
+	"local description = tostring(taskData.description)",
+	"if tonumber(taskData.carrierUserId) and not partyUx.ownsCarrier(taskData) then",
+	"elseif tonumber(taskData.actorUserId) and tonumber(taskData.actorUserId) ~= player.UserId then",
+	"taskDescription.Text = description",
+	"SHARED AUTO REWARD: EACH PLAYER +$%d",
 }) do
 	has(applySource, marker, "Automated-task HUD is missing " .. marker)
 end
@@ -1133,10 +1357,20 @@ for _, marker in ipairs({
 	"upgradeId = upgradeId",
 	"then \"TaskUpgradeDeliverySpawned\"",
 	"then { upgradeId = upgradeId }",
-	"report(spawnedEvent, player, spawnedMetadata)",
+	"local accepted = invokeFamily(\"ReportAction\", player, spawnedEvent, spawnedMetadata)",
+	"if accepted ~= true then",
+	"clearDeliveryRecord(record, true)",
+	"return nil",
 }) do
 	has(worldSpawnSource, marker, "Physical task-upgrade crate is missing " .. marker)
 end
+ordered(worldSpawnSource, {
+	"local accepted = invokeFamily(\"ReportAction\", player, spawnedEvent, spawnedMetadata)",
+	"if accepted ~= true then",
+	"clearDeliveryRecord(record, true)",
+	"return nil",
+	"return tool",
+}, "A paid robot crate must be accepted by the profile authority before it remains in the world")
 local worldEnqueueSource = section(worldSource, "enqueueDelivery = function", "requestDelivery.Event:Connect", "Task-upgrade queue admission")
 for _, marker in ipairs({
 	"kind ~= \"TaskUpgrade\"",

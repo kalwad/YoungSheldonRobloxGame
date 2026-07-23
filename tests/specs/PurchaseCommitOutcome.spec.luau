@@ -1,0 +1,33 @@
+local Outcome = require("../support/PurchaseCommitOutcome")
+
+return function(test)
+	test:test("accepted save-pending purchase is success and is never retryable", function()
+		local result = Outcome.classify(true, false, "SavePendingAccepted")
+		test:truthy(result.ok)
+		test:truthy(result.accepted)
+		test:falsy(result.durable)
+		test:truthy(result.savePending)
+		test:falsy(result.retryable)
+		test:equal(result.status, "SavePendingAccepted")
+	end)
+
+	test:test("durable accepted purchase is a terminal success", function()
+		local result = Outcome.classify(true, true, "Committed")
+		test:truthy(result.ok)
+		test:truthy(result.accepted)
+		test:truthy(result.durable)
+		test:falsy(result.savePending)
+		test:falsy(result.retryable)
+	end)
+
+	test:test("only a rejected transient purchase can be classified retryable", function()
+		local busy = Outcome.classify(false, false, "TransactionBusy")
+		test:falsy(busy.ok)
+		test:falsy(busy.accepted)
+		test:truthy(busy.retryable)
+
+		local denied = Outcome.classify(false, false, "InsufficientAllowance")
+		test:falsy(denied.ok)
+		test:falsy(denied.retryable)
+	end)
+end

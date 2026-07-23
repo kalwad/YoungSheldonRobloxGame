@@ -1577,6 +1577,8 @@ local function boomboxStatus(snapshot)
 	elseif boomboxIsPlaying(boombox) then
 		-- Backward-compatible fallback for a pre-occupancy server snapshot.
 		return "Playing"
+	elseif boombox.payoutSaving == true or tostring(boombox.status or "") == "SavingPayout" then
+		return "SavingPayout"
 	end
 	return boomboxCooldownRemaining(snapshot) > 0 and "Cooldown" or "Ready"
 end
@@ -2602,6 +2604,11 @@ function renderTerminal()
 				.. "STATUS: IN USE" .. string.char(10) .. string.char(10)
 				.. "Someone else is using the shared living-room boombox. Their song is playing; your allowance is not earning during their session."
 			treeLine("WAIT FOR THE CURRENT SONG", false)
+		elseif status == "SavingPayout" then
+			terminalBody.Text = "BOOMBOX INSTALLED" .. string.char(10)
+				.. "STATUS: SAVING FULL-SONG PAYOUT" .. string.char(10) .. string.char(10)
+				.. "Roblox is confirming the previous party's allowance. It cannot be paid twice, and the power button will unlock automatically."
+			treeLine("PAYOUT SAVE IN PROGRESS — PLEASE WAIT", false).TextColor3 = COLORS.yellow
 		elseif status == "Cooldown" then
 			local remaining = boomboxCooldownRemaining(snapshot)
 			terminalBody.Text = "BOOMBOX INSTALLED" .. string.char(10)
@@ -2630,7 +2637,9 @@ function renderTerminal()
 				terminalBody.Text ..= string.char(10) .. string.char(10)
 					.. string.format("AUTOPLAY UPGRADE: $%d", autoplayPrice) .. string.char(10)
 					.. "Automatically starts the same full music, dance, lights, and allowance session whenever your cooldown finishes while you are online."
-				if authorityBlock then
+				if status == "SavingPayout" then
+					treeLine("AVAILABLE AFTER PAYOUT SAVE", false).TextColor3 = COLORS.yellow
+				elseif authorityBlock then
 					treeLine(authorityBlock, false).TextColor3 = partyUx.isActive(snapshot) and COLORS.yellow or COLORS.orange
 				elseif boombox.canUpgradeAutoplay == true and allowance >= autoplayPrice then
 					treeFile("", false, string.format("Buy Boombox Autoplay — $%d", autoplayPrice), function()
@@ -4109,6 +4118,13 @@ feedbackEvent.OnClientEvent:Connect(function(packet)
 		showToast("BOOMBOX PARTY STARTED", packet.text or "Music, disco lights, and automatic allowance are running.", COLORS.purple, 3.5)
 	elseif kind == "BoomboxFinished" then
 		finishBoomboxIncome(packet)
+	elseif kind == "BoomboxPayoutSaving" then
+		showToast(
+			packet.title or "FULL PAYOUT EARNED — SAVING",
+			packet.text or "Your completed-song payout is being saved safely.",
+			COLORS.yellow,
+			5
+		)
 	elseif kind == "BoomboxIncome" or kind == "BoomboxTick" then
 		queueBoomboxIncome(packet)
 	elseif kind == "BoomboxError" then
@@ -4117,6 +4133,13 @@ feedbackEvent.OnClientEvent:Connect(function(packet)
 		and string.find(string.lower(tostring(packet.reason or packet.text or "")), "boombox", 1, true)
 	then
 		queueBoomboxIncome(packet)
+	elseif kind == "TransactionReconciliation" then
+		showToast(
+			packet.title or "SAVING PROGRESS",
+			packet.text or "Roblox is confirming this change. You do not need to try it again.",
+			COLORS.yellow,
+			5
+		)
 	elseif kind == "Error" then
 		showToast("CAN'T DO THAT", packet.text or "", COLORS.red, 3.5)
 	elseif kind ~= "ProfileLoaded" then

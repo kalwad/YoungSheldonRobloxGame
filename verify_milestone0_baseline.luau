@@ -1,9 +1,11 @@
 --!nonstrict
--- Read-only Studio edit/runtime audit for the Milestone 0 production baseline.
+-- Read-only Studio edit/runtime audit for Milestone 0 regressions.
 --
--- Run from the Studio command bar or the Studio automation bridge. This audit
--- never creates, destroys, renames, reparents, or edits an Instance. Source
--- checks therefore use a small deterministic checksum that can run in Luau.
+-- Run this against either the frozen schema-11/cap-1 rollback or the current
+-- schema-12/cap-4 Milestone 1 house. The historical rollback keeps its exact
+-- 25-source hashes; the current house must retain those 25 gameplay roles plus
+-- the five explicitly approved Milestone 1 sources. This audit never mutates an
+-- Instance, profile, DataStore, MemoryStore, or published place.
 
 local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
@@ -77,9 +79,29 @@ local function resolvePath(path)
 	return current
 end
 
+local installedConfigModule = resolvePath("ReplicatedStorage.CooperGame.Config")
+local installedConfigSource = nil
+if installedConfigModule and installedConfigModule:IsA("ModuleScript") then
+	local readable, source = pcall(function()
+		return installedConfigModule.Source
+	end)
+	if readable and type(source) == "string" then
+		installedConfigSource = source
+	end
+end
+local inspectingMilestone0Rollback =
+	sourceContains(installedConfigSource, "Config.SchemaVersion = 11")
+local inspectingCurrentMilestone1 =
+	sourceContains(installedConfigSource, "Config.SchemaVersion = 12")
+check(
+	inspectingMilestone0Rollback ~= inspectingCurrentMilestone1,
+	"Config must unambiguously identify schema 11 rollback or schema 12 Milestone 1"
+)
+
 -- These checksums correspond to the canonical local mirrors after the schema-11
 -- Milestone 0 contract was added. Any intentional source edit must update the
--- matching byte count/checksum in this audit in the same change.
+-- matching byte count/checksum in a dedicated rollback change. They are not
+-- expected to match the forward schema-12 implementation.
 local canonicalScripts = {
 	{
 		path = "Workspace.CooperHouseEnvironment.CooperHouse.ExteriorDetails.InteractiveDenPatioDoor.PatioDoorController",
@@ -260,6 +282,35 @@ local canonicalScripts = {
 
 check(#canonicalScripts == 25, "Canonical script manifest must contain exactly 25 entries")
 
+local milestone1Additions = {
+	{
+		path = "ReplicatedStorage.CooperGame.TransactionLedger",
+		className = "ModuleScript",
+		marker = "Ledger.VERSION = 1",
+	},
+	{
+		path = "ReplicatedStorage.CooperPartyProtocol",
+		className = "ModuleScript",
+		marker = "Protocol.VERSION = 1",
+	},
+	{
+		path = "ReplicatedStorage.CooperUITheme",
+		className = "ModuleScript",
+		marker = "Theme.VERSION = 1",
+	},
+	{
+		path = "ServerScriptService.CooperMovement",
+		className = "Script",
+		marker = "Server-authoritative Cooper player movement and sprint stamina.",
+	},
+	{
+		path = "StarterPlayer.StarterPlayerScripts.CooperSprint",
+		className = "LocalScript",
+		marker = "Shift/gamepad sprint input, 64px mobile toggle, and transient stamina HUD.",
+	},
+}
+check(#milestone1Additions == 5, "Milestone 1 must add exactly five approved house sources")
+
 local publishRoots = {
 	Workspace,
 	ServerScriptService,
@@ -283,7 +334,15 @@ end
 -- bridge into these roots. The exact allowlist therefore belongs to edit mode;
 -- runtime still verifies every canonical source below plus live state/NPCs.
 if not RunService:IsRunning() then
-	check(actualScriptCount == 25, "Publishable Studio roots must contain exactly 25 active/config scripts, found " .. actualScriptCount)
+	local expectedScriptCount = inspectingCurrentMilestone1 and 30 or 25
+	check(
+		actualScriptCount == expectedScriptCount,
+		string.format(
+			"Publishable Studio roots must contain exactly %d active/config scripts for this baseline, found %d",
+			expectedScriptCount,
+			actualScriptCount
+		)
+	)
 end
 
 local expectedPaths = {}
@@ -307,21 +366,49 @@ for _, specification in ipairs(canonicalScripts) do
 		if readable and type(result) == "string" then
 			source = result
 			canonicalSources[specification.path] = source
-			check(#source == specification.bytes, string.format(
-				"%s source byte count drifted: expected %d, found %d",
-				specification.path,
-				specification.bytes,
-				#source
-			))
-			check(sourceHash(source) == specification.hash, string.format(
-				"%s source checksum drifted: expected %s, found %s",
-				specification.path,
-				specification.hash,
-				sourceHash(source)
-			))
-			check(sourceContains(source, specification.marker), specification.path .. " lost marker " .. specification.marker)
+			if inspectingMilestone0Rollback then
+				check(#source == specification.bytes, string.format(
+					"%s source byte count drifted: expected %d, found %d",
+					specification.path,
+					specification.bytes,
+					#source
+				))
+				check(sourceHash(source) == specification.hash, string.format(
+					"%s source checksum drifted: expected %s, found %s",
+					specification.path,
+					specification.hash,
+					sourceHash(source)
+				))
+				check(sourceContains(source, specification.marker), specification.path .. " lost marker " .. specification.marker)
+			else
+				check(#source > 100, specification.path .. " is empty or placeholder source")
+			end
 		else
 			check(false, specification.path .. " Source is unreadable; run this audit from a Studio command/plugin context")
+		end
+	end
+end
+
+if inspectingCurrentMilestone1 then
+	for _, specification in ipairs(milestone1Additions) do
+		check(not expectedPaths[specification.path], "Duplicate Milestone 1 Studio path: " .. specification.path)
+		expectedPaths[specification.path] = true
+		local instance = resolvePath(specification.path)
+		check(instance ~= nil, "Milestone 1 source is missing: " .. specification.path)
+		if instance then
+			check(instance.ClassName == specification.className, specification.path .. " has the wrong class")
+			if instance:IsA("BaseScript") then
+				check(instance.Enabled == true, specification.path .. " is disabled")
+			end
+			local readable, source = pcall(function()
+				return instance.Source
+			end)
+			check(readable and type(source) == "string", specification.path .. " Source is unreadable")
+			if readable and type(source) == "string" then
+				canonicalSources[specification.path] = source
+				check(#source > 100, specification.path .. " is empty or placeholder source")
+				check(sourceContains(source, specification.marker), specification.path .. " lost marker " .. specification.marker)
+			end
 		end
 	end
 end
@@ -372,9 +459,11 @@ local expectedTaskOrder = {
 }
 
 if Config then
-	check(Config.SchemaVersion == 11, "Milestone 0 requires profile schema 11")
-	check(Config.DataStoreName == "CooperFamilyTasks_v2", "Schema 11 must retain the established production DataStore")
-	check(Config.ReleasePlayerCap == 1, "Config.ReleasePlayerCap must pin Milestone 0 to solo play")
+	local expectedSchema = inspectingCurrentMilestone1 and 12 or 11
+	local expectedPlayerCap = inspectingCurrentMilestone1 and 4 or 1
+	check(Config.SchemaVersion == expectedSchema, "Unexpected profile schema for the selected baseline")
+	check(Config.DataStoreName == "CooperFamilyTasks_v2", "The established production DataStore must be retained")
+	check(Config.ReleasePlayerCap == expectedPlayerCap, "Config.ReleasePlayerCap does not match the selected baseline")
 	check(type(Config.Tasks) == "table" and #Config.Tasks == 5, "Config.Tasks must contain exactly five tasks")
 	check(type(Config.TaskOrder) == "table" and #Config.TaskOrder == 5, "Config.TaskOrder must contain exactly five tasks")
 	for index, taskId in ipairs(expectedTaskOrder) do
@@ -408,7 +497,7 @@ if Config then
 	check(Config.MachineStages and Config.MachineStages[11] and Config.MachineStages[11].progress == 100, "Machine stage 11 must reach 100 percent")
 
 	local expectedFeatures = {
-		Lobby = false,
+		Lobby = inspectingCurrentMilestone1,
 		Horror = false,
 		SecretExploration = false,
 		TimeMachineFinale = false,
@@ -420,20 +509,26 @@ if Config then
 	if type(Config.Features) == "table" then
 		for featureName, value in pairs(Config.Features) do
 			featureCount += 1
-			check(expectedFeatures[featureName] ~= nil, "Unexpected Milestone 0 feature flag: " .. tostring(featureName))
-			check(value == false, "Milestone 0 feature flag must remain false: " .. tostring(featureName))
+			check(expectedFeatures[featureName] ~= nil, "Unexpected future feature flag: " .. tostring(featureName))
+			check(value == expectedFeatures[featureName], "Incorrect baseline feature flag: " .. tostring(featureName))
 		end
 	end
 	check(featureCount == 6, "Config.Features must contain exactly six flags")
-	for featureName in pairs(expectedFeatures) do
-		check(Config.Features and Config.Features[featureName] == false, "Missing or enabled feature flag: " .. featureName)
+	for featureName, expectedValue in pairs(expectedFeatures) do
+		check(Config.Features and Config.Features[featureName] == expectedValue, "Missing or incorrect feature flag: " .. featureName)
+	end
+	if inspectingCurrentMilestone1 then
+		check(table.isfrozen(Config.Features), "Milestone 1 Config.Features must be frozen")
+		check(type(Config.Party) == "table" and table.isfrozen(Config.Party), "Milestone 1 Config.Party must be frozen")
+		check(Config.Party and Config.Party.MaxMembers == 4, "Milestone 1 party size must be four")
+		check(Config.Party and Config.Party.HostOnlyPersistentPurchases == true, "Milestone 1 purchases must remain host-only")
 	end
 
 	local defaults = Config.ProfileDefaults
 	check(type(defaults) == "table", "Config.ProfileDefaults is missing")
 	if type(defaults) == "table" then
 		local expectedFutureDefaults = {
-			schemaVersion = 11,
+			schemaVersion = expectedSchema,
 			cycleIndex = 1,
 			cycleTaskIndex = 1,
 			postRevealCyclesCompleted = 0,
@@ -456,10 +551,16 @@ if Config then
 				tostring(defaults[fieldName])
 			))
 		end
-		check(defaults.allowance == 0 and defaults.machineStage == 0 and defaults.pendingPartStage == 0, "Schema 11 granted core progression to a fresh profile")
-		check(defaults.boomboxPurchased == false and defaults.boomboxAutoplayPurchased == false, "Schema 11 granted a fresh boombox entitlement")
-		check(type(defaults.taskAutomationInstalled) == "table" and next(defaults.taskAutomationInstalled) == nil, "Schema 11 granted task automation to a fresh profile")
-		check(defaults.secretBunkerPurchased == false and defaults.chemistrySetupPurchased == false, "Schema 11 granted bunker progression to a fresh profile")
+		check(defaults.allowance == 0 and defaults.machineStage == 0 and defaults.pendingPartStage == 0, "Baseline granted core progression to a fresh profile")
+		check(defaults.boomboxPurchased == false and defaults.boomboxAutoplayPurchased == false, "Baseline granted a fresh boombox entitlement")
+		check(type(defaults.taskAutomationInstalled) == "table" and next(defaults.taskAutomationInstalled) == nil, "Baseline granted task automation to a fresh profile")
+		check(defaults.secretBunkerPurchased == false and defaults.chemistrySetupPurchased == false, "Baseline granted bunker progression to a fresh profile")
+		if inspectingCurrentMilestone1 then
+			local journal = defaults.operationJournal
+			check(type(journal) == "table" and journal.version == 1, "Schema 12 operation journal is missing")
+			check(journal and type(journal.pending) == "table" and next(journal.pending) == nil, "Fresh schema 12 profile has pending operations")
+			check(journal and type(journal.committed) == "table" and next(journal.committed) == nil, "Fresh schema 12 profile has committed operations")
+		end
 	end
 
 	check(Config.Mode == nil and Config.Stability == nil and Config.Chapters == nil, "Retired panic/crisis campaign fields returned to CooperGame.Config")
@@ -494,11 +595,20 @@ if type(televisionSource) == "string" then
 end
 
 -- Creator Dashboard owns the published Maximum Visitor Count. An already-open
--- Studio edit DataModel keeps its old read-only MaxPlayers cache, so verify the
--- frozen release contract in Studio and the engine-reported value in live play.
-local releaseCapacityIsOne = Players.MaxPlayers == 1
-	 or (RunService:IsStudio() and Config and Config.ReleasePlayerCap == 1)
-check(releaseCapacityIsOne, "Milestone 0 release capacity must be one player; current MaxPlayers is " .. tostring(Players.MaxPlayers))
+-- Studio edit DataModel keeps its old read-only MaxPlayers cache, so Studio
+-- verifies the frozen config contract while live play must match the engine
+-- value exactly.
+local expectedReleaseCap = inspectingCurrentMilestone1 and 4 or 1
+local releaseCapacityMatches = Players.MaxPlayers == expectedReleaseCap
+	or (RunService:IsStudio() and Config and Config.ReleasePlayerCap == expectedReleaseCap)
+check(
+	releaseCapacityMatches,
+	string.format(
+		"Release capacity must be %d for this baseline; current MaxPlayers is %s",
+		expectedReleaseCap,
+		tostring(Players.MaxPlayers)
+	)
+)
 
 local gameServer = ServerScriptService:FindFirstChild("CooperGame")
 check(gameServer and gameServer:IsA("Script"), "ServerScriptService.CooperGame is missing")
@@ -522,9 +632,6 @@ if type(gameServerSource) == "string" then
 		"domeDiscovered = raw.domeDiscovered == true",
 		"endingCompleted = raw.endingCompleted == true",
 		"postgameUnlocked = raw.postgameUnlocked == true",
-		"profile.data.totalTasks += 1",
-		"profile.data.cycleIndex = math.floor(profile.data.totalTasks / #Config.TaskOrder) + 1",
-		"profile.data.cycleTaskIndex = (profile.data.totalTasks % #Config.TaskOrder) + 1",
 		"state:SetAttribute(\"SchemaVersion\", Config.SchemaVersion)",
 		"state:SetAttribute(\"ReleasePlayerCap\", Config.ReleasePlayerCap)",
 		"player:SetAttribute(\"CooperGameSchemaVersion\", Config.SchemaVersion)",
@@ -532,15 +639,159 @@ if type(gameServerSource) == "string" then
 		check(sourceContains(gameServerSource, marker), "Schema migration/task-cycle source marker is missing: " .. marker)
 	end
 
-	local incrementAt = string.find(gameServerSource, "profile.data.totalTasks += 1", 1, true)
-	local cycleAt = string.find(gameServerSource, "profile.data.cycleIndex = math.floor(profile.data.totalTasks / #Config.TaskOrder) + 1", 1, true)
-	local taskIndexAt = string.find(gameServerSource, "profile.data.cycleTaskIndex = (profile.data.totalTasks % #Config.TaskOrder) + 1", 1, true)
-	local clearTaskAt = string.find(gameServerSource, "profile.task = nil", incrementAt or 1, true)
-	check(
-		incrementAt and cycleAt and taskIndexAt and clearTaskAt
-			and incrementAt < cycleAt and cycleAt < taskIndexAt and taskIndexAt < clearTaskAt,
-		"Task completion must increment totalTasks and refresh both cycle fields before clearing the task"
-	)
+	if inspectingMilestone0Rollback then
+		local incrementAt = string.find(gameServerSource, "profile.data.totalTasks += 1", 1, true)
+		local cycleAt = string.find(
+			gameServerSource,
+			"profile.data.cycleIndex = math.floor(profile.data.totalTasks / #Config.TaskOrder) + 1",
+			1,
+			true
+		)
+		local taskIndexAt = string.find(
+			gameServerSource,
+			"profile.data.cycleTaskIndex = (profile.data.totalTasks % #Config.TaskOrder) + 1",
+			1,
+			true
+		)
+		local clearTaskAt = string.find(gameServerSource, "profile.task = nil", incrementAt or 1, true)
+		check(
+			incrementAt and cycleAt and taskIndexAt and clearTaskAt
+				and incrementAt < cycleAt and cycleAt < taskIndexAt and taskIndexAt < clearTaskAt,
+			"Rollback task completion must update cycle fields before clearing its solo task"
+		)
+	else
+		for _, marker in ipairs({
+			"M1_SHARED_TASK_SESSION_CONTRACT",
+			"M1_TASK_ELIGIBILITY_CONTRACT",
+			"local function captureTaskEligibility(version)",
+			"local eligibility = captureTaskEligibility(profile.data.totalTasks + 1)",
+			"eligibleUserIds = table.clone(eligibility.userIds)",
+			"TransactionRuntime.commitCalmTaskStart(profile, false)",
+			"CALM_TASK_START_EXPOSURE_AFTER_DURABLE_SAVE",
+			"local nextCursor = ((checkpoint.hostOrdinal - 1) % #Config.TaskOrder) + 1",
+			"partySession.taskCursor = nextCursor",
+			"partySession.taskCursor = profile.data.totalTasks % #Config.TaskOrder",
+			"eligibility = TransactionRuntime.eligibilityFromCheckpoint(checkpoint)",
+			"record.status = \"Completing\"",
+			"local operationKind = \"TaskReward:\" .. tostring(record.logicalId)",
+			"TransactionRuntime.commitProfileValueOperation(",
+			"setAllowance(recipient, recipient.data.allowance + reward)",
+			"recipient.data.totalTasks += 1",
+			"recipient.data.cycleIndex = math.floor(recipient.data.totalTasks / #Config.TaskOrder) + 1",
+			"recipient.data.cycleTaskIndex = (recipient.data.totalTasks % #Config.TaskOrder) + 1",
+			"recipient.data.calmTaskCheckpoint = nil",
+			"record.status = \"Completed\"",
+			"partySession.completedTasks += 1",
+			"partySession.task = nil",
+		}) do
+			check(sourceContains(gameServerSource, marker), "Milestone 1 shared-task marker is missing: " .. marker)
+		end
+		for _, forbiddenPersonalScheduler in ipairs({
+			"profile.taskCursor",
+			"profile.nextTaskAt",
+			"local record = profile.task",
+			"local activeTask = profile.task",
+			"not profile.task and",
+			"profile.task ~= bankSession.record",
+		}) do
+			check(
+				not sourceContains(gameServerSource, forbiddenPersonalScheduler),
+				"Milestone 1 restored profile-local task state: " .. forbiddenPersonalScheduler
+			)
+		end
+		local exposureStartAt = string.find(
+			gameServerSource,
+			"function TransactionRuntime.exposeCalmTaskCheckpoint(profile, checkpoint, recovered)",
+			1,
+			true
+		)
+		local exposureEndAt = exposureStartAt and string.find(
+			gameServerSource,
+			"function TransactionRuntime.commitCalmTaskStart(profile, recovered)",
+			exposureStartAt,
+			true
+		) or nil
+		local checkpointCursorAt = exposureStartAt and string.find(
+			gameServerSource,
+			"local nextCursor = ((checkpoint.hostOrdinal - 1) % #Config.TaskOrder) + 1",
+			exposureStartAt,
+			true
+		) or nil
+		local durableExposureAt = exposureStartAt and string.find(
+			gameServerSource,
+			"-- CALM_TASK_START_EXPOSURE_AFTER_DURABLE_SAVE",
+			exposureStartAt,
+			true
+		) or nil
+		local sharedCursorAt = durableExposureAt and string.find(
+			gameServerSource,
+			"partySession.taskCursor = nextCursor",
+			durableExposureAt,
+			true
+		) or nil
+		check(
+			exposureStartAt and exposureEndAt and checkpointCursorAt and durableExposureAt and sharedCursorAt
+				and checkpointCursorAt < durableExposureAt
+				and durableExposureAt < sharedCursorAt
+				and sharedCursorAt < exposureEndAt,
+			"PartyV1 must derive and expose the shared task cursor from the durable host ordinal only after checkpoint save"
+		)
+		local completingAt = string.find(gameServerSource, "record.status = \"Completing\"", 1, true)
+		local valueCommitAt = string.find(
+			gameServerSource,
+			"TransactionRuntime.commitProfileValueOperation(",
+			completingAt or 1,
+			true
+		)
+		local allowanceAt = string.find(
+			gameServerSource,
+			"setAllowance(recipient, recipient.data.allowance + reward)",
+			valueCommitAt or 1,
+			true
+		)
+		local recipientIncrementAt = string.find(
+			gameServerSource,
+			"recipient.data.totalTasks += 1",
+			allowanceAt or 1,
+			true
+		)
+		local recipientCycleAt = string.find(
+			gameServerSource,
+			"recipient.data.cycleIndex = math.floor(recipient.data.totalTasks / #Config.TaskOrder) + 1",
+			recipientIncrementAt or 1,
+			true
+		)
+		local recipientTaskIndexAt = string.find(
+			gameServerSource,
+			"recipient.data.cycleTaskIndex = (recipient.data.totalTasks % #Config.TaskOrder) + 1",
+			recipientCycleAt or 1,
+			true
+		)
+		local checkpointClearAt = string.find(
+			gameServerSource,
+			"recipient.data.calmTaskCheckpoint = nil",
+			recipientTaskIndexAt or 1,
+			true
+		)
+		local completedAt = string.find(gameServerSource, "record.status = \"Completed\"", valueCommitAt or 1, true)
+		local sharedAdvanceAt = string.find(gameServerSource, "partySession.completedTasks += 1", completedAt or 1, true)
+		local sharedCloseAt = string.find(gameServerSource, "partySession.task = nil", sharedAdvanceAt or 1, true)
+		check(
+			completingAt and valueCommitAt and allowanceAt and recipientIncrementAt
+				and recipientCycleAt and recipientTaskIndexAt and checkpointClearAt
+				and completedAt and sharedAdvanceAt and sharedCloseAt
+				and completingAt < valueCommitAt
+				and valueCommitAt < allowanceAt
+				and allowanceAt < recipientIncrementAt
+				and recipientIncrementAt < recipientCycleAt
+				and recipientCycleAt < recipientTaskIndexAt
+				and recipientTaskIndexAt < checkpointClearAt
+				and checkpointClearAt < completedAt
+				and completedAt < sharedAdvanceAt
+				and sharedAdvanceAt < sharedCloseAt,
+			"Shared task completion must claim, journal each recipient's reward and cycle progress, clear the host checkpoint, finalize, advance once, then close"
+		)
+	end
 
 	local stateFeatureMarkers = {
 		FeatureLobbyEnabled = "Lobby",
@@ -575,6 +826,14 @@ if type(gameServerSource) == "string" then
 			local harnessSource = "local HttpService = game:GetService(\"HttpService\")\n"
 				.. "local PROFILE_LEASE_FIELD = \"_sessionLease\"\n"
 				.. "local Config = (function()\n" .. configModule.Source .. "\nend)()\n"
+				.. (inspectingCurrentMilestone1
+					and ("local TransactionLedger = (function()\n"
+						.. tostring(
+							canonicalSources["ReplicatedStorage.CooperGame.TransactionLedger"]
+								or "error(\"TransactionLedger source unavailable\")"
+						)
+						.. "\nend)()\n")
+					or "")
 				.. "local automationById = {}\n"
 				.. "for _, definition in ipairs(Config.TaskAutomationUpgrades) do automationById[definition.id] = definition end\n"
 				.. sanitizerSource
@@ -618,8 +877,9 @@ if type(gameServerSource) == "string" then
 					local migratedOk, migrated, rewrite = pcall(sanitizerOrError, legacy)
 					check(migratedOk and type(migrated) == "table", "Schema-10 profile migration raised an error: " .. tostring(migrated))
 					if migratedOk and type(migrated) == "table" then
-						check(rewrite == true, "Schema-10 profile was not marked for a canonical schema-11 rewrite")
-						check(migrated.schemaVersion == 11, "Schema-10 profile did not migrate to schema 11")
+						local expectedSchema = inspectingCurrentMilestone1 and 12 or 11
+						check(rewrite == true, "Schema-10 profile was not marked for a canonical rewrite")
+						check(migrated.schemaVersion == expectedSchema, "Schema-10 profile did not migrate to the selected baseline")
 						for _, fieldName in ipairs({
 							"allowance",
 							"machineStage",
@@ -648,10 +908,19 @@ if type(gameServerSource) == "string" then
 						check(migrated.firstHorrorRevealed == false and migrated.postRevealCyclesCompleted == 0, "Migration granted horror progress")
 						check(migrated.backroomsDiscovered == false and migrated.domeDiscovered == false, "Migration granted secret discoveries")
 						check(migrated.endingCompleted == false and migrated.endingChoice == "" and migrated.postgameUnlocked == false, "Migration granted ending/postgame progress")
+						if inspectingCurrentMilestone1 then
+							check(
+								type(migrated.operationJournal) == "table"
+									and migrated.operationJournal.version == 1
+									and #migrated.operationJournal.pending == 0
+									and #migrated.operationJournal.committed == 0,
+								"Schema-10 migration did not initialize an empty schema-12 operation journal"
+							)
+						end
 						local rejoinOk, rejoined, rejoinRewrite = pcall(sanitizerOrError, migrated)
 						check(rejoinOk and type(rejoined) == "table", "Migrated profile did not survive an in-memory leave/rejoin round trip")
 						if rejoinOk and type(rejoined) == "table" then
-							check(rejoinRewrite == false, "Canonical schema-11 profile requested another rewrite after rejoin")
+							check(rejoinRewrite == false, "Canonical profile requested another rewrite after rejoin")
 							for _, fieldName in ipairs({
 								"allowance",
 								"machineStage",
@@ -729,20 +998,28 @@ end
 if state and state:IsA("Folder") then
 	if RunService:IsRunning() then
 		local advertisedSchema = state:GetAttribute("SchemaVersion")
-		check(advertisedSchema == 11, "CooperGame.State must advertise schema 11 after synchronization/startup")
+		local expectedSchema = inspectingCurrentMilestone1 and 12 or 11
+		local expectedCap = inspectingCurrentMilestone1 and 4 or 1
+		check(advertisedSchema == expectedSchema, "CooperGame.State advertises the wrong schema after startup")
 		local advertisedPlayerCap = state:GetAttribute("ReleasePlayerCap")
-		check(advertisedPlayerCap == 1, "CooperGame.State must advertise the one-player release cap")
-		for _, attributeName in ipairs({
-			"FeatureLobbyEnabled",
-			"FeatureHorrorEnabled",
-			"FeatureSecretExplorationEnabled",
-			"FeatureTimeMachineFinaleEnabled",
-			"FeaturePostgameEnabled",
-			"FeatureStudioScenarioToolsEnabled",
-		}) do
+		check(advertisedPlayerCap == expectedCap, "CooperGame.State advertises the wrong release cap")
+		local expectedRuntimeFeatures = {
+			FeatureLobbyEnabled = inspectingCurrentMilestone1,
+			FeatureHorrorEnabled = false,
+			FeatureSecretExplorationEnabled = false,
+			FeatureTimeMachineFinaleEnabled = false,
+			FeaturePostgameEnabled = false,
+			FeatureStudioScenarioToolsEnabled = false,
+		}
+		for attributeName, expectedValue in pairs(expectedRuntimeFeatures) do
 			local value = state:GetAttribute(attributeName)
-			check(value == false, attributeName .. " must remain false during Milestone 0")
+			check(value == expectedValue, attributeName .. " has the wrong baseline value")
 		end
+		check(
+			state:GetAttribute("FoundationContract")
+				== (inspectingCurrentMilestone1 and "PartyV1" or "PersonalV4"),
+			"CooperGame.State advertises the wrong foundation contract"
+		)
 	end
 	for _, retiredAttribute in ipairs({
 		"Mode",
@@ -932,9 +1209,13 @@ if #failures > 0 then
 end
 
 local mode = RunService:IsRunning() and "runtime" or "edit"
+local baselineName = inspectingCurrentMilestone1
+	and "schema 12 PartyV1, cap 4, Lobby-only"
+	or "schema 11 PersonalV4 rollback, cap 1, all future flags disabled"
 print(string.format(
-	"[Milestone0BaselineAudit] PASS: %d read-only checks in %s mode; schema 11, six disabled features, five tasks, eleven stages, four approved cutout NPCs, canonical source manifest, and solo release capacity verified",
+	"[Milestone0BaselineAudit] PASS: %d read-only checks in %s mode; %s; five tasks, eleven stages, four approved cutout NPCs, canonical rollback protections, and retired-system absence verified",
 	checkCount,
-	mode
+	mode,
+	baselineName
 ))
 return true

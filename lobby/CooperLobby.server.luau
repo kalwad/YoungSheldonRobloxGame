@@ -23,6 +23,11 @@ assert(Config.RejoinTicketTTLSeconds > 0 and Config.RejoinTicketTTLSeconds <= 30
 
 local isStudio = RunService:IsStudio()
 local STALLED_LAUNCH_RECOVERY_SECONDS = 60
+local TELEPORT_REQUEST_ATTEMPTS = 2
+local TELEPORT_RETRY_DELAY_SECONDS = 0.35
+-- Roblox documents Flooded as a capacity condition that should back off before
+-- retrying. Keep the wait bounded below the 30-second attempt watchdog.
+local TELEPORT_FLOODED_RETRY_DELAY_SECONDS = 15
 local productionConfigured = Config.LobbyPlaceId > 0
 	and Config.HousePlaceId > 0
 	and Config.LobbyPlaceId ~= Config.HousePlaceId
@@ -197,6 +202,18 @@ type TeleportDiagnostic = {
 	action: string,
 }
 local teleportDiagnostics: { [number]: TeleportDiagnostic } = {}
+type TeleportRetryContext = {
+	token: string,
+	placeId: number,
+	options: TeleportOptions,
+	sessionId: string,
+	partyId: string,
+	ticketId: string,
+	attempts: number,
+	maximumAttempts: number,
+	retryScheduled: boolean,
+}
+local teleportRetryContexts: { [number]: TeleportRetryContext } = {}
 
 -- Keep launch diagnostics useful without ever writing an access code, arrival
 -- ticket, invite ticket, or raw TeleportData to the server log. Every caller is
@@ -777,6 +794,7 @@ local function beginTeleportAttempt(
 			teleportFailureMessages[player.UserId] = nil
 			local timeoutDiagnostic = teleportDiagnostics[player.UserId]
 			teleportDiagnostics[player.UserId] = nil
+			teleportRetryContexts[player.UserId] = nil
 			if timeoutDiagnostic then
 				emitLobbyDiagnostic("teleport_failed", "TELEPORT_TIMEOUT", {
 					action = timeoutDiagnostic.action,
@@ -791,6 +809,22 @@ local function beginTeleportAttempt(
 		end
 	end)
 	return token
+end
+
+local function requestTeleportWithContext(player: Player, context: TeleportRetryContext): boolean
+	if player.Parent ~= Players
+		or teleporting[player.UserId] ~= context.token
+		or context.attempts >= context.maximumAttempts
+	then
+		return false
+	end
+	context.attempts += 1
+	local requestAccepted = pcall(function()
+		TeleportService:TeleportAsync(context.placeId, { player }, context.options)
+	end)
+	-- pcall returns every value produced by its callback. TeleportAsync currently
+	-- returns nil, but this boundary promises one boolean even if that API changes.
+	return requestAccepted
 end
 
 local function routePartyMemberToHostLobby(player: Player, party: any): (boolean, string?)
@@ -823,6 +857,7 @@ local function routePartyMemberToHostLobby(player: Player, party: any): (boolean
 			teleporting[player.UserId] = nil
 			teleportFailureMessages[player.UserId] = nil
 			teleportDiagnostics[player.UserId] = nil
+			teleportRetryContexts[player.UserId] = nil
 		end
 		return false, "Roblox could not move you into the host's lobby. Leave the party and ask for a new invite."
 	end
@@ -1192,6 +1227,7 @@ local function rollbackLaunch(
 			teleporting[userId] = nil
 			teleportFailureMessages[userId] = nil
 			teleportDiagnostics[userId] = nil
+			teleportRetryContexts[userId] = nil
 		end
 		-- A delayed failure from an abandoned launch must never remove a newer
 		-- session's reconnect route. Atomically invalidate only our own record.
@@ -1594,9 +1630,48 @@ local function launchParty(player: Player): (boolean, string?, string?)
 			partyId = party.partyId,
 			sessionId = sessionId,
 		})
-		local teleportOk = pcall(function()
-			TeleportService:TeleportAsync(Config.HousePlaceId, { member }, options)
-		end)
+		local retryContext: TeleportRetryContext = {
+			token = teleportToken,
+			placeId = Config.HousePlaceId,
+			options = options,
+			sessionId = sessionId,
+			partyId = party.partyId,
+			ticketId = ticketId,
+			attempts = 0,
+			maximumAttempts = TELEPORT_REQUEST_ATTEMPTS,
+			retryScheduled = false,
+		}
+		teleportRetryContexts[userId] = retryContext
+		local teleportOk = false
+		for attempt = 1, TELEPORT_REQUEST_ATTEMPTS do
+			if attempt > 1
+				and (member.Parent ~= Players or teleporting[userId] ~= teleportToken)
+			then
+				break
+			end
+			teleportOk = requestTeleportWithContext(member, retryContext)
+			if teleportOk then
+				break
+			end
+			if attempt < TELEPORT_REQUEST_ATTEMPTS
+				and member.Parent == Players
+				and teleporting[userId] == teleportToken
+			then
+				-- Reuse the same reserved server, manifest, user-bound ticket,
+				-- TeleportOptions, and attempt token. A transient synchronous
+				-- TeleportService failure therefore cannot mint a second session
+				-- or invalidate the member's original admission identity.
+				emitLobbyDiagnostic("teleport_retry_requested", "TELEPORT_REQUEST_RETRY", {
+					action = "Launch",
+					memberUserId = userId,
+					operationId = operationId,
+					partyId = party.partyId,
+					sessionId = sessionId,
+					userId = player.UserId,
+				})
+				task.wait(TELEPORT_RETRY_DELAY_SECONDS)
+			end
+		end
 		if teleportOk then
 			launchedCount += 1
 		else
@@ -1605,6 +1680,7 @@ local function launchParty(player: Player): (boolean, string?, string?)
 				teleporting[userId] = nil
 				teleportFailureMessages[userId] = nil
 				teleportDiagnostics[userId] = nil
+				teleportRetryContexts[userId] = nil
 			end
 			emitLobbyDiagnostic("teleport_failed", "TELEPORT_REQUEST_FAILED", {
 				action = "Launch",
@@ -1707,9 +1783,10 @@ local function rejoinHouse(player: Player): (boolean, string?)
 	end)
 	if not ok then
 		if teleporting[player.UserId] == teleportToken then
-			teleporting[player.UserId] = nil
-			teleportFailureMessages[player.UserId] = nil
-			teleportDiagnostics[player.UserId] = nil
+				teleporting[player.UserId] = nil
+				teleportFailureMessages[player.UserId] = nil
+				teleportDiagnostics[player.UserId] = nil
+				teleportRetryContexts[player.UserId] = nil
 		end
 		mapRemove("Tickets", "ticket:" .. ticketId)
 		return false, "Roblox could not reconnect you. Please try again."
@@ -1859,25 +1936,119 @@ requestRemote.OnServerInvoke = function(player: Player, action: unknown, payload
 	}
 end
 
-TeleportService.TeleportInitFailed:Connect(function(player: Player, _result, errorMessage: string)
-	if teleporting[player.UserId] then
-		teleporting[player.UserId] = nil
-		local fallback = teleportFailureMessages[player.UserId]
-		teleportFailureMessages[player.UserId] = nil
-		local diagnostic = teleportDiagnostics[player.UserId]
-		teleportDiagnostics[player.UserId] = nil
+TeleportService.TeleportInitFailed:Connect(function(
+	player: Player,
+	result: Enum.TeleportResult,
+	errorMessage: string,
+	placeId: number,
+	teleportOptions: TeleportOptions
+)
+	local userId = player.UserId
+	local token = teleporting[userId]
+	if not token then
+		return
+	end
+	local diagnostic = teleportDiagnostics[userId]
+	local retryContext = teleportRetryContexts[userId]
+	local retryableResult = result == Enum.TeleportResult.Failure
+		or result == Enum.TeleportResult.Flooded
+	local exactRetryOptions = typeof(teleportOptions) == "Instance"
+		and teleportOptions:IsA("TeleportOptions")
+	local retryDataMatches = false
+	if retryContext and exactRetryOptions then
+		local dataOk, returnedData = pcall(function()
+			return teleportOptions:GetTeleportData()
+		end)
+		retryDataMatches = dataOk
+			and type(returnedData) == "table"
+			and returnedData.sessionId == retryContext.sessionId
+			and returnedData.partyId == retryContext.partyId
+			and returnedData.ticketId == retryContext.ticketId
+			and teleportOptions.ReservedServerAccessCode
+				== retryContext.options.ReservedServerAccessCode
+	end
+	if retryContext
+		and retryContext.token == token
+		and retryContext.attempts < retryContext.maximumAttempts
+		and player.Parent == Players
+		and retryableResult
+		and placeId == retryContext.placeId
+		and exactRetryOptions
+		and retryDataMatches
+	then
+		-- TeleportInitFailed supplies a *new* TeleportOptions instance containing
+		-- the exact reserved-server destination and TeleportData for this failed
+		-- attempt. Roblox requires that returned object for a faithful retry; using
+		-- the original object can lose platform-populated destination details.
+		retryContext.options = teleportOptions
+		if retryContext.retryScheduled then
+			return
+		end
+		retryContext.retryScheduled = true
 		if diagnostic then
-			emitLobbyDiagnostic("teleport_failed", "TELEPORT_INIT_FAILED", {
+			emitLobbyDiagnostic("teleport_retry_requested", "TELEPORT_INIT_RETRY", {
 				action = diagnostic.action,
-				memberUserId = player.UserId,
+				memberUserId = userId,
 				operationId = diagnostic.operationId,
 				partyId = diagnostic.partyId,
 				sessionId = diagnostic.sessionId,
-				userId = player.UserId,
+				userId = userId,
 			})
 		end
-		pushState(player, (fallback or "Roblox could not move you yet. Please try again.") .. " (" .. errorMessage .. ")")
+		local retryDelay = if result == Enum.TeleportResult.Flooded
+			then TELEPORT_FLOODED_RETRY_DELAY_SECONDS
+			else TELEPORT_RETRY_DELAY_SECONDS
+		task.delay(retryDelay, function()
+			if player.Parent ~= Players
+				or teleporting[userId] ~= token
+				or teleportRetryContexts[userId] ~= retryContext
+			then
+				return
+			end
+			retryContext.retryScheduled = false
+			if requestTeleportWithContext(player, retryContext) then
+				return
+			end
+			teleporting[userId] = nil
+			local fallback = teleportFailureMessages[userId]
+			teleportFailureMessages[userId] = nil
+			teleportDiagnostics[userId] = nil
+			teleportRetryContexts[userId] = nil
+			if diagnostic then
+				emitLobbyDiagnostic("teleport_failed", "TELEPORT_RETRY_FAILED", {
+					action = diagnostic.action,
+					memberUserId = userId,
+					operationId = diagnostic.operationId,
+					partyId = diagnostic.partyId,
+					sessionId = diagnostic.sessionId,
+					userId = userId,
+				})
+			end
+			pushState(
+				player,
+				(fallback or "Roblox could not move you yet. Please try again.")
+					.. " (" .. tostring(errorMessage) .. ")"
+			)
+		end)
+		return
 	end
+
+	teleporting[userId] = nil
+	local fallback = teleportFailureMessages[userId]
+	teleportFailureMessages[userId] = nil
+	teleportDiagnostics[userId] = nil
+	teleportRetryContexts[userId] = nil
+	if diagnostic then
+		emitLobbyDiagnostic("teleport_failed", "TELEPORT_INIT_FAILED", {
+			action = diagnostic.action,
+			memberUserId = userId,
+			operationId = diagnostic.operationId,
+			partyId = diagnostic.partyId,
+			sessionId = diagnostic.sessionId,
+			userId = userId,
+		})
+	end
+	pushState(player, (fallback or "Roblox could not move you yet. Please try again.") .. " (" .. errorMessage .. ")")
 end)
 
 Players.PlayerAdded:Connect(function(player)
@@ -1926,6 +2097,7 @@ Players.PlayerRemoving:Connect(function(player)
 		teleporting[player.UserId] = nil
 		teleportFailureMessages[player.UserId] = nil
 		teleportDiagnostics[player.UserId] = nil
+		teleportRetryContexts[player.UserId] = nil
 		return
 	end
 	task.spawn(function()

@@ -112,9 +112,35 @@ else
 end
 check(type(Config) == "table", "CooperGame.Config did not return a table")
 check(table.isfrozen(Config), "The top-level gameplay config must remain frozen")
-check(Config.SchemaVersion == 12, "Personal persistence schema must be version 12")
+check(Config.SchemaVersion == 12, "Milestone 1 persistence schema must be version 12")
 check(Config.DataStoreName == "CooperFamilyTasks_v2", "Unexpected profile DataStore name")
 check(Config.DataStoreKeyPrefix == "player_", "Unexpected profile key prefix")
+check(Config.ReleasePlayerCap == 4, "The reserved house must remain capped at four players")
+local expectedFeatures = {
+	Lobby = true,
+	Horror = false,
+	SecretExploration = false,
+	TimeMachineFinale = false,
+	Postgame = false,
+	StudioScenarioTools = false,
+}
+check(type(Config.Features) == "table" and table.isfrozen(Config.Features), "Config.Features must be frozen")
+local featureCount = 0
+for featureName, featureValue in pairs(Config.Features or {}) do
+	featureCount += 1
+	check(expectedFeatures[featureName] ~= nil, "Unexpected future feature flag: " .. tostring(featureName))
+	check(
+		featureValue == expectedFeatures[featureName],
+		string.format("Milestone 1 feature %s has the wrong value", tostring(featureName))
+	)
+end
+check(featureCount == 6, "Config.Features must contain exactly six flags")
+for featureName, expectedValue in pairs(expectedFeatures) do
+	check(Config.Features and Config.Features[featureName] == expectedValue, "Missing feature flag " .. featureName)
+end
+check(type(Config.Party) == "table" and table.isfrozen(Config.Party), "Config.Party must be frozen")
+check(Config.Party and Config.Party.MaxMembers == 4, "The shared house session must support four members")
+check(Config.Party and Config.Party.HostOnlyPersistentPurchases == true, "Boombox ownership must remain host-world state")
 
 local expectedTaskOrder = { "GeorgeBeer", "MaryDishes", "MaryTrash", "MissyPlush", "MedfordBankHack" }
 local expectedRewards = { 55, 30, 40, 70 }
@@ -202,7 +228,14 @@ check(defaults.pendingTaskUpgradeId == "", "Fresh profiles must not begin with a
 check(defaults.bankHackSuccesses == 0, "Fresh profiles must begin with zero successful bank hacks")
 
 check(state:GetAttribute("SchemaVersion") == 12, "Shared state does not expose schema version 12")
-check(state:GetAttribute("FoundationContract") == "PersonalV4", "Shared state lost the PersonalV4 contract")
+check(state:GetAttribute("FoundationContract") == "PartyV1", "Shared state lost the PartyV1 contract")
+check(state:GetAttribute("ReleasePlayerCap") == 4, "Shared state lost the four-player house cap")
+for featureName, expectedValue in pairs(expectedFeatures) do
+	check(
+		state:GetAttribute("Feature" .. featureName .. "Enabled") == expectedValue,
+		"Shared state has the wrong feature value for " .. featureName
+	)
+end
 check(state:GetAttribute("SupportsPaidPartOrdering") == true, "Shared state does not advertise paid machine parts")
 check(state:GetAttribute("SupportsIncomeBoombox") == true, "Shared state does not advertise the income boombox")
 check(state:GetAttribute("SupportsBoombox") == true, "Shared state does not advertise boombox lifecycle support")
@@ -674,6 +707,8 @@ for _, specification in ipairs({
 end
 
 for _, marker in ipairs({
+	"M1_SHARED_TASK_SESSION_CONTRACT",
+	"M1_TASK_ELIGIBILITY_CONTRACT",
 	"local boomboxPlaybackOwner = nil",
 	"local boomboxSessionSerial = 0",
 	"BOOMBOX_TICK_EARLY_TOLERANCE = 0.15",
@@ -682,21 +717,124 @@ for _, marker in ipairs({
 	"boomboxPlaced = boomboxPlaced",
 	"boomboxNextPlayAt = finiteInteger(raw.boomboxNextPlayAt",
 	"boomboxAutoplayPurchased = boomboxPurchased and raw.boomboxAutoplayPurchased == true",
+	"boomboxPendingSettlement = boomboxPendingSettlement",
 	"dataStore:UpdateAsync",
-	"local function boomboxSnapshot(profile)",
+	"local function boomboxSnapshot(profile, viewerProfile)",
 	"autoplayPrice = Config.Boombox.AutoplayUpgradePrice",
 	"autoplayPurchased = autoplayPurchased",
-	"canUpgradeAutoplay = purchased and placed and not autoplayPurchased",
-	"maximumPayout = Config.Boombox.PayoutPerTick * Config.Boombox.MaximumPaidTicks",
+	"canUpgradeAutoplay = viewerProfile ~= nil and partyIsHost(viewerProfile.player)",
 	"syncBoomboxPlacedAttribute(profile)",
-	"profile.taskCursor = profile.data.totalTasks % #Config.TaskOrder",
+	"partySession.taskCursor = profile.data.totalTasks % #Config.TaskOrder",
+	"local worldProfile = hostProfile()",
+	"boombox = boomboxSnapshot(worldProfile, profile)",
 	"profile.data.boomboxPurchased and not profile.data.boomboxPlaced",
 	"queueDelivery(profile, \"Boombox\", 0)",
-	"endBoomboxPlayback(profile, profile.boomboxPlayback.sessionId, \"PlayerLeaving\", true)",
-	"endBoomboxPlayback(profile, profile.boomboxPlayback.sessionId, \"Shutdown\", true)",
+	"endBoomboxPlayback(profile, departingPlayback.sessionId, \"PlayerLeaving\", true)",
+	"endBoomboxPlayback(profile, closingPlayback.sessionId, \"Shutdown\", true)",
 }) do
 	has(familySource, marker, "Family server is missing lifecycle/persistence marker " .. marker)
 end
+
+local sanitizerSection = section(
+	familySource,
+	"local function sanitizeData(raw)",
+	"local function profileKey(player)",
+	"boombox profile sanitizer"
+)
+for _, marker in ipairs({
+	"local boomboxPlaced = raw.boomboxPlaced == true",
+	"local boomboxPurchased = raw.boomboxPurchased == true or boomboxPlaced",
+	"if type(raw.boomboxPendingSettlement) == \"table\" then",
+	"local maximumTicks = finiteInteger(Config.Boombox.MaximumPaidTicks",
+	"local payoutPerTick = finiteInteger(Config.Boombox.PayoutPerTick",
+	"local maximumPayout = math.min(2_000_000_000, maximumTicks * payoutPerTick)",
+	"if boomboxPurchased and boomboxPlaced",
+	"TransactionLedger.logicalKind(\"BoomboxSettle\", settlementSessionId) ~= nil",
+	"totalPaid == paidTicks * payoutPerTick",
+	"totalPaid + settlementValue == maximumPayout",
+	"boomboxPurchased = boomboxPurchased",
+	"boomboxPlaced = boomboxPlaced",
+	"boomboxPendingSettlement = boomboxPendingSettlement",
+}) do
+	has(sanitizerSection, marker, "Boombox sanitizer is missing " .. marker)
+end
+ordered(sanitizerSection, {
+	"local boomboxPlaced = raw.boomboxPlaced == true",
+	"local boomboxPurchased = raw.boomboxPurchased == true or boomboxPlaced",
+	"if boomboxPurchased and boomboxPlaced",
+	"totalPaid + settlementValue == maximumPayout",
+	"boomboxPendingSettlement = {",
+}, "Placed ownership and exact-full-payout validation must precede settlement recovery")
+check(
+	countPlain(sanitizerSection, "totalPaid + settlementValue == maximumPayout") == 1,
+	"Pending settlement sanitizer must enforce exactly one full-song payout equation"
+)
+for _, forbiddenPersonalScheduler in ipairs({
+	"profile.taskCursor",
+	"profile.nextTaskAt",
+	"local record = profile.task",
+	"local activeTask = profile.task",
+	"not profile.task and",
+	"profile.task ~= bankSession.record",
+}) do
+	lacks(
+		familySource,
+		forbiddenPersonalScheduler,
+		"Boombox integration must not restore profile-local task state: " .. forbiddenPersonalScheduler
+	)
+end
+
+local boomboxSnapshotSection = section(
+	familySource,
+	"local function boomboxSnapshot(profile, viewerProfile)",
+	"local function automationSnapshot(profile, viewerProfile)",
+	"shared boombox snapshot"
+)
+for _, marker in ipairs({
+	"viewerProfile = viewerProfile or profile",
+	"local purchased = profile.data.boomboxPurchased == true",
+	"local playback = viewerProfile and viewerProfile.boomboxPlayback or nil",
+	"boomboxPlaybackOwner and profiles[boomboxPlaybackOwner]",
+	"occupiedByOther = occupiedByOther",
+	"local payoutSaving = TransactionRuntime.boomboxSettlementPending(profile)",
+	"elseif payoutSaving then",
+	"payoutSaving = payoutSaving",
+	"canOrder = viewerProfile ~= nil and partyIsHost(viewerProfile.player)",
+	"canUpgradeAutoplay = viewerProfile ~= nil and partyIsHost(viewerProfile.player)",
+	"canPlay = viewerProfile ~= nil and partyIsHost(viewerProfile.player)",
+}) do
+	has(boomboxSnapshotSection, marker, "Shared boombox snapshot is missing " .. marker)
+end
+lacks(
+	boomboxSnapshotSection,
+	"canOrder = not purchased",
+	"Boombox snapshot exposes a host-owned purchase as an ungated personal action"
+)
+check(
+	countPlain(boomboxSnapshotSection, "not payoutSaving") == 2,
+	"Pending payout persistence must block both autoplay upgrades and playback readiness"
+)
+
+local purchaseCoordinatorSection = section(
+	familySource,
+	"function TransactionRuntime.commitHostPurchase(profile, operationKind, price, mutate)",
+	"local function orderMachinePart(profile, expectedStage)",
+	"host purchase save-pending contract"
+)
+for _, marker in ipairs({
+	"local accepted, durable",
+	"if accepted and not durable then",
+	"feedback(profile.player, \"TransactionReconciliation\"",
+	"title = \"SAVING PURCHASE\"",
+	"return true, false, \"SavePendingAccepted\"",
+}) do
+	has(purchaseCoordinatorSection, marker, "Host purchase save-pending contract is missing " .. marker)
+end
+ordered(purchaseCoordinatorSection, {
+	"if accepted and not durable then",
+	"feedback(profile.player, \"TransactionReconciliation\"",
+	"return true, false, \"SavePendingAccepted\"",
+}, "An accepted ambiguous purchase must be presented as saving, never as a retryable failure")
 
 local machineOrderSection = section(
 	familySource,
@@ -706,7 +844,9 @@ local machineOrderSection = section(
 )
 has(machineOrderSection, "profile.data.allowance < cost", "Machine ordering has no server balance check")
 has(machineOrderSection, "profile.data.boomboxPurchased and not profile.data.boomboxPlaced", "Machine and boombox deliveries are not mutually exclusive")
+has(machineOrderSection, "hostMutationAllowed(profile)", "Machine ordering does not enforce host-world authority")
 ordered(machineOrderSection, {
+	"hostMutationAllowed(profile)",
 	"setAllowance(profile, profile.data.allowance - cost)",
 	"profile.data.pendingPartStage = definition.stage",
 	"queueDelivery(profile, \"MachinePart\", definition.stage)",
@@ -722,24 +862,37 @@ for _, marker in ipairs({
 	"profile.data.boomboxPurchased",
 	"profile.data.pendingPartStage > 0",
 	"profile.data.allowance < price",
+	"hostMutationAllowed(profile)",
 	"Config.Boombox.Price",
+	"TransactionRuntime.commitHostPurchase(",
 }) do
 	has(purchaseSection, marker, "Boombox purchase is missing " .. marker)
 end
+check(
+	countPlain(purchaseSection, "TransactionRuntime.commitHostPurchase(") == 1,
+	"Boombox ordering must use exactly one durable host-purchase transaction"
+)
 ordered(purchaseSection, {
+	"hostMutationAllowed(profile)",
+	"TransactionRuntime.commitHostPurchase(",
 	"setAllowance(profile, profile.data.allowance - price)",
 	"profile.data.boomboxPurchased = true",
 	"profile.data.boomboxPlaced = false",
 	"profile.data.boomboxNextPlayAt = 0",
+	"if not durable then",
+	"return true, \"Cooper Party Boombox\", price, true",
 	"profile.boomboxDeliveryStep = \"WaitingDelivery\"",
 	"queueDelivery(profile, \"Boombox\", 0)",
+	"feedback(profile.player, \"BoomboxPurchased\"",
 }, "Boombox order must atomically debit, persist ownership, then deliver")
 lacks(purchaseSection, "task.wait", "Atomic boombox purchase path must not yield")
+lacks(purchaseSection, "markDirty(profile)", "Boombox purchase bypasses transaction persistence")
+lacks(purchaseSection, "task.defer(saveProfile", "Boombox purchase appends an unjournaled deferred save")
 
 local autoplayPurchaseSection = section(
 	familySource,
 	"local function upgradeBoomboxAutoplay(profile)",
-	"local function reportPlayerAction",
+	"local function orderTaskUpgrade(profile, requestedUpgradeId)",
 	"autoplay purchase"
 )
 for _, marker in ipairs({
@@ -748,27 +901,34 @@ for _, marker in ipairs({
 	"profile.data.boomboxAutoplayPurchased",
 	"Config.Boombox.AutoplayUpgradePrice",
 	"profile.data.allowance < price",
+	"hostMutationAllowed(profile)",
+	"TransactionRuntime.commitHostPurchase(",
 	"BoomboxAutoplayPurchased",
 	"broadcastState()",
-	"task.defer(saveProfile, profile.player, false)",
 }) do
 	has(autoplayPurchaseSection, marker, "Autoplay purchase is missing " .. marker)
 end
+check(
+	countPlain(autoplayPurchaseSection, "TransactionRuntime.commitHostPurchase(") == 1,
+	"Autoplay purchase must use exactly one durable host-purchase transaction"
+)
 ordered(autoplayPurchaseSection, {
+	"hostMutationAllowed(profile)",
+	"TransactionRuntime.commitHostPurchase(",
 	"setAllowance(profile, profile.data.allowance - price)",
 	"profile.data.boomboxAutoplayPurchased = true",
-	"markDirty(profile)",
 	"feedback(profile.player, \"BoomboxAutoplayPurchased\"",
 	"broadcastState()",
-	"task.defer(saveProfile, profile.player, false)",
-}, "Autoplay purchase must atomically debit, persist, notify, broadcast, then save")
+}, "Autoplay purchase must atomically debit and grant before notifying")
 lacks(autoplayPurchaseSection, "task.wait", "Atomic autoplay purchase path must not yield")
+lacks(autoplayPurchaseSection, "markDirty(profile)", "Autoplay purchase bypasses transaction persistence")
+lacks(autoplayPurchaseSection, "task.defer(saveProfile", "Autoplay purchase appends an unjournaled deferred save")
 
 local reportSection = section(
 	familySource,
 	"local function reportPlayerAction(eventKey, player, metadata)",
-	"local function adjustAllowance",
-	"boombox delivery reports"
+	"local function boomboxFailure(message, remaining, retryAfter)",
+	"persistent delivery installs"
 )
 ordered(reportSection, {
 	"if eventKey == \"BoomboxPlaybackFailed\"",
@@ -781,23 +941,42 @@ for _, marker in ipairs({
 	"BoomboxCarryLost",
 	"profile.data.boomboxPlaced = true",
 	"profile.boomboxDeliveryStep == \"Install\"",
+	"InstallTaskUpgrade",
+	"InstallChemistrySetup",
+	"InstallBoombox",
+	"InstallMachineStage",
 }) do
 	has(reportSection, marker, "Boombox delivery lifecycle is missing " .. marker)
 end
+check(
+	countPlain(reportSection, "TransactionRuntime.commitPersistentTransition(") == 4,
+	"All four persistent installs must use one durable transition each"
+)
+check(
+	countPlain(reportSection, "if appliedNow then") == 4,
+	"Install presentation must run only when its durable transition first applies"
+)
+lacks(reportSection, "setAllowance(", "Install callbacks must never adjust currency")
+lacks(reportSection, "markDirty(profile)", "Install handlers bypass transaction persistence")
+lacks(reportSection, "task.defer(saveProfile", "Install handlers append unjournaled deferred saves")
 
 local beginSection = section(
 	familySource,
 	"local function beginBoomboxPlayback(player, requestedSource)",
-	"local function creditBoomboxTick",
+	"function TransactionRuntime.creditBoomboxTick",
 	"begin playback"
 )
 for _, marker in ipairs({
 	"local playbackSource = requestedSource == \"Autoplay\" and \"Autoplay\" or \"Manual\"",
 	"local automatic = playbackSource == \"Autoplay\"",
+	"hostMutationAllowed(profile)",
 	"automatic and profile.data.boomboxAutoplayPurchased ~= true",
 	"The boombox autoplay upgrade is not installed.",
 	"profile.data.boomboxPurchased",
 	"profile.data.boomboxPlaced",
+	"TransactionRuntime.boomboxSettlementPending(profile)",
+	"TransactionRuntime.recoverPendingBoomboxSettlement(profile, true)",
+	"The previous full-song payout is still saving.",
 	"boomboxPlaybackOwner and boomboxPlaybackOwner ~= player",
 	"profile.data.boomboxNextPlayAt - unixNow()",
 	"boomboxSessionSerial += 1",
@@ -811,6 +990,7 @@ for _, marker in ipairs({
 	has(beginSection, marker, "BeginBoomboxPlayback is missing " .. marker)
 end
 ordered(beginSection, {
+	"hostMutationAllowed(profile)",
 	"automatic and profile.data.boomboxAutoplayPurchased ~= true",
 	"announceBoomboxReady(profile, automatic)",
 	"profile.data.boomboxNextPlayAt = nextPlayAt",
@@ -832,53 +1012,251 @@ check(
 	"BeginBoomboxPlayback must have exactly one ready-event race fallback"
 )
 
+local creditSection = section(
+	familySource,
+	"function TransactionRuntime.creditBoomboxTick(profile, playback, requestedTickIndex)",
+	"function TransactionRuntime.settleCompletedBoombox(profile, playback)",
+	"journaled payout credit"
+)
+for _, marker in ipairs({
+	"local tickIndex = finiteInteger(",
+	"\"BoomboxTick\"",
+	"tostring(playback.sessionId) .. \":\" .. tostring(tickIndex)",
+	"TransactionRuntime.commitPersistentTransition(",
+	"setAllowance(profile, profile.data.allowance + payout)",
+	"playback.paidTicks == tickIndex - 1",
+	"return appliedNow and payout or 0, true, status",
+}) do
+	has(creditSection, marker, "Journaled boombox credit is missing " .. marker)
+end
+check(
+	countPlain(creditSection, "TransactionRuntime.commitPersistentTransition(") == 1
+		and countPlain(creditSection, "setAllowance(profile, profile.data.allowance + payout)") == 1,
+	"Each indexed boombox tick must have exactly one journaled allowance mutation"
+)
+lacks(creditSection, "markDirty(profile)", "Boombox ticks bypass transaction persistence")
+lacks(creditSection, "task.defer(saveProfile", "Boombox ticks append an unjournaled deferred save")
+
 local tickSection = section(
 	familySource,
-	"local function boomboxPayoutTick(player, sessionId)",
-	"local function endBoomboxPlayback(profile, sessionId, reason, suppressFeedback)",
+	"local function boomboxPayoutTick(player, sessionId, requestedTickIndex)",
+	"local function finalizeBoomboxPlayback(profile, playback, endedReason, suppressFeedback, durable)",
 	"payout tick"
 )
 for _, marker in ipairs({
 	"playback.sessionId ~= sessionId",
 	"boomboxPlaybackOwner ~= player",
+	"not partyCanProgress() or not partyIsHost(player) or hostProfile() ~= profile",
+	"local tickIndex = finiteInteger(requestedTickIndex",
+	"tickIndex > playback.paidTicks + 1",
 	"playback.paidTicks >= Config.Boombox.MaximumPaidTicks",
-	"(playback.paidTicks + 1) * Config.Boombox.PayoutInterval",
+	"playback.startedAt + tickIndex * Config.Boombox.PayoutInterval",
 	"currentTime + BOOMBOX_TICK_EARLY_TOLERANCE < dueAt",
 	"Config.Boombox.TrackDuration + BOOMBOX_FINAL_TICK_TOLERANCE",
+	"TransactionRuntime.creditBoomboxTick(profile, playback, tickIndex)",
 }) do
 	has(tickSection, marker, "Boombox payout authorization is missing " .. marker)
 end
 ordered(tickSection, {
 	"playback.paidTicks >= Config.Boombox.MaximumPaidTicks",
 	"currentTime + BOOMBOX_TICK_EARLY_TOLERANCE < dueAt",
-	"local awarded = creditBoomboxTick(profile, playback)",
+	"TransactionRuntime.creditBoomboxTick(profile, playback, tickIndex)",
 }, "Tick cap and timing checks must precede every award")
-check(countPlain(tickSection, "creditBoomboxTick(profile, playback)") == 1, "One tick request can reach more than one credit call")
+check(
+	countPlain(tickSection, "TransactionRuntime.creditBoomboxTick(profile, playback, tickIndex)") == 1,
+	"One indexed tick request can reach more than one credit transaction"
+)
+lacks(tickSection, "setAllowance(", "Payout authorization mutates allowance outside the journal helper")
+lacks(tickSection, "markDirty(profile)", "Payout authorization bypasses transaction persistence")
+lacks(tickSection, "task.defer(saveProfile", "Payout authorization appends an unjournaled deferred save")
 
-local endSection = section(
+local settlementSection = section(
 	familySource,
-	"local function endBoomboxPlayback(profile, sessionId, reason, suppressFeedback)",
-	"local function endBoomboxPlaybackForPlayer",
-	"end playback"
+	"function TransactionRuntime.settleCompletedBoombox(profile, playback)",
+	"-- Recover a completed song without any dependency on the old Sound, Player",
+	"live completed-playback settlement"
 )
 for _, marker in ipairs({
-	"playback.sessionId ~= sessionId",
-	"endedReason == \"Completed\"",
-	"playback.paidTicks == Config.Boombox.MaximumPaidTicks - 1",
-	"Config.Boombox.TrackDuration - BOOMBOX_FINAL_TICK_TOLERANCE",
-	"Config.Boombox.TrackDuration + BOOMBOX_FINAL_TICK_TOLERANCE",
-	"profile.boomboxPlayback = nil",
-	"boomboxPlaybackOwner = nil",
-	"BoomboxFinished",
+	"\"BoomboxSettle\"",
+	"local intent = profile.data.boomboxPendingSettlement",
+	"profile.data.boomboxPendingSettlement = intent",
+	"playback.settlementIntentDurable = false",
+	"TransactionRuntime.safeSave(profile)",
+	"playback.settlementIntentDurable = true",
+	"TransactionRuntime.boomboxValueReconciliationPending(profile, playback.sessionId)",
+	"playback.settlementValue",
+	"setAllowance(profile, profile.data.allowance + settlementValue)",
+	"profile.data.boomboxPendingSettlement = false",
+	"paidTicks = maximumTicks",
 }) do
-	has(endSection, marker, "EndBoomboxPlayback is missing " .. marker)
+	has(settlementSection, marker, "Live completed-playback settlement is missing " .. marker)
 end
-ordered(endSection, {
-	"creditBoomboxTick(profile, playback)",
+ordered(settlementSection, {
+	"profile.data.boomboxPendingSettlement = intent",
+	"playback.settlementIntentDurable = false",
+	"TransactionRuntime.safeSave(profile)",
+	"playback.settlementIntentDurable = true",
+	"TransactionRuntime.boomboxValueReconciliationPending(profile, playback.sessionId)",
+	"TransactionRuntime.commitPersistentTransition(",
+}, "A completed-song intent must be durable and prior ticks reconciled before catch-up value")
+check(
+	countPlain(settlementSection, "setAllowance(profile, profile.data.allowance + settlementValue)") == 1,
+	"Live settlement must contain exactly one journaled catch-up mutation"
+)
+check(
+	countPlain(settlementSection, "TransactionRuntime.commitPersistentTransition(") == 1,
+	"Live settlement must use exactly one persistent catch-up transition"
+)
+
+local recoverySection = section(
+	familySource,
+	"function TransactionRuntime.recoverPendingBoomboxSettlement(profile, announce)",
+	"local function boomboxPayoutTick(player, sessionId, requestedTickIndex)",
+	"detached completed-playback recovery"
+)
+for _, marker in ipairs({
+	"if profile.boomboxPlayback then",
+	"local intent = profile.data.boomboxPendingSettlement",
+	"profile.boomboxSettlementRecoveryInFlight",
+	"TransactionRuntime.logicalOperationKind(\"BoomboxSettle\", sessionId)",
+	"TransactionRuntime.boomboxValueReconciliationPending(profile, sessionId)",
+	"existing and existing.state == \"Committed\"",
+	"existing and existing.state == \"NeedsReconciliation\"",
+	"TransactionRuntime.commitPersistentTransition(",
+	"setAllowance(profile, profile.data.allowance + settlementValue)",
+	"profile.data.boomboxPendingSettlement = false",
+	"feedback(profile.player, \"BoomboxPayoutSaving\"",
+	"title = \"FULL PAYOUT EARNED — SAVING\"",
+	"feedback(profile.player, \"BoomboxFinished\"",
+	"title = \"FULL PAYOUT SAVED\"",
+	"return finish(true, true, \"Recovered\")",
+}) do
+	has(recoverySection, marker, "Detached completed-playback recovery is missing " .. marker)
+end
+check(
+	countPlain(recoverySection, "TransactionRuntime.commitPersistentTransition(") == 1
+		and countPlain(recoverySection, "setAllowance(profile, profile.data.allowance + settlementValue)") == 1,
+	"Detached recovery must have exactly one catch-up transition and one allowance mutation"
+)
+lacks(
+	recoverySection,
+	"boomboxPlaybackOwner ==",
+	"Detached recovery still depends on the departed Player/Sound ownership object"
+)
+
+local finalizeSection = section(
+	familySource,
+	"local function finalizeBoomboxPlayback(profile, playback, endedReason, suppressFeedback, durable)",
+	"local function endBoomboxPlaybackForPlayer",
+	"accepted settlement presentation and cleanup"
+)
+for _, marker in ipairs({
+	"if durable == false then",
+	"feedback(profile.player, \"BoomboxPayoutSaving\"",
+	"title = \"FULL PAYOUT EARNED — SAVING\"",
+	"feedback(profile.player, \"BoomboxFinished\"",
+	"savePending = durable == false",
+	"scheduleBoomboxSettlement(profile, playback, endedReason, suppressFeedback)",
+	"endedReason == \"Completed\"",
+	"endedReason == \"PlayerLeaving\"",
+	"endedReason == \"Shutdown\"",
+	"Config.Boombox.TrackDuration - BOOMBOX_FINAL_TICK_TOLERANCE",
+	"TransactionRuntime.settleCompletedBoombox(profile, playback)",
+	"if accepted then",
 	"profile.boomboxPlayback = nil",
 	"boomboxPlaybackOwner = nil",
-}, "Completed-track final-tick race must settle before session cleanup")
-check(countPlain(endSection, "creditBoomboxTick(profile, playback)") == 1, "Completed end path can apply more than one final-race credit")
+}) do
+	has(finalizeSection, marker, "Accepted settlement lifecycle is missing " .. marker)
+end
+ordered(finalizeSection, {
+	"TransactionRuntime.settleCompletedBoombox(profile, playback)",
+	"if accepted then",
+	"return finalizeBoomboxPlayback(",
+}, "An accepted save-pending settlement must finalize into neutral saving UX")
+lacks(finalizeSection, "setAllowance(", "Playback cleanup/presentation directly mutates allowance")
+lacks(
+	finalizeSection,
+	"TransactionRuntime.commitPersistentTransition(",
+	"Playback cleanup/presentation bypasses the two dedicated settlement helpers"
+)
+
+local reconciliationSection = section(
+	familySource,
+	"function TransactionRuntime.afterReconciliation(profile)",
+	"function TransactionRuntime.deferReconciliationSave",
+	"boombox reconciliation recovery dispatch"
+)
+for _, marker in ipairs({
+	"TransactionRuntime.recoverPendingBoomboxSettlement",
+	"not profile.boomboxPlayback",
+	"TransactionRuntime.recoverPendingBoomboxSettlement(profile, true)",
+}) do
+	has(reconciliationSection, marker, "Reconciliation recovery dispatch is missing " .. marker)
+end
+
+local departureSection = section(
+	familySource,
+	"function TransactionRuntime.playerLifecycle.onPlayerRemoving(player)",
+	"function TransactionRuntime.playerLifecycle.onClose()",
+	"departure settlement detachment"
+)
+for _, marker in ipairs({
+	"local departingPlayback = profile.boomboxPlayback",
+	"endBoomboxPlayback(profile, departingPlayback.sessionId, \"PlayerLeaving\", true)",
+	"local intent = profile.data.boomboxPendingSettlement",
+	"intent.sessionId == departingPlayback.sessionId",
+	"departingPlayback.finalized = true",
+	"profile.boomboxPlayback = nil",
+	"boomboxPlaybackOwner = nil",
+}) do
+	has(departureSection, marker, "Player departure settlement detachment is missing " .. marker)
+end
+ordered(departureSection, {
+	"endBoomboxPlayback(profile, departingPlayback.sessionId, \"PlayerLeaving\", true)",
+	"local intent = profile.data.boomboxPendingSettlement",
+	"departingPlayback.finalized = true",
+	"profile.boomboxPlayback = nil",
+}, "Departure must create/retain the durable intent before detaching transient playback")
+
+local shutdownSection = section(
+	familySource,
+	"function TransactionRuntime.playerLifecycle.onClose()",
+	"function TransactionRuntime.runMaintenanceLoop()",
+	"shutdown settlement detachment"
+)
+for _, marker in ipairs({
+	"endBoomboxPlayback(profile, closingPlayback.sessionId, \"Shutdown\", true)",
+	"local intent = profile.data.boomboxPendingSettlement",
+	"intent.sessionId == closingPlayback.sessionId",
+	"closingPlayback.finalized = true",
+	"profile.boomboxPlayback = nil",
+	"boomboxPlaybackOwner = nil",
+	"saveProfile(targetPlayer, true)",
+}) do
+	has(shutdownSection, marker, "Shutdown settlement detachment is missing " .. marker)
+end
+
+local maintenanceSection = section(
+	familySource,
+	"function TransactionRuntime.runMaintenanceLoop()",
+	"function TransactionRuntime.runSessionHeartbeatLoop()",
+	"pending settlement maintenance recovery"
+)
+for _, marker in ipairs({
+	"not sharedHostProfile.boomboxPlayback",
+	"type(sharedHostProfile.data.boomboxPendingSettlement) == \"table\"",
+	"sharedHostProfile.boomboxSettlementRecoveryInFlight ~= true",
+	"TransactionRuntime.recoverPendingBoomboxSettlement",
+	"not TransactionRuntime.boomboxSettlementPending(sharedHostProfile)",
+}) do
+	has(maintenanceSection, marker, "Maintenance recovery is missing " .. marker)
+end
+ordered(maintenanceSection, {
+	"type(sharedHostProfile.data.boomboxPendingSettlement) == \"table\"",
+	"TransactionRuntime.recoverPendingBoomboxSettlement",
+	"not TransactionRuntime.boomboxSettlementPending(sharedHostProfile)",
+	"announceBoomboxReady(",
+}, "Pending payout recovery must block the next ready/autoplay cycle")
 
 local apiSection = section(
 	familySource,
@@ -896,6 +1274,23 @@ has(
 	"return beginBoomboxPlayback(arg1, arg2)",
 	"Structured API does not forward Manual/Autoplay source into authoritative playback"
 )
+has(
+	apiSection,
+	"return boomboxPayoutTick(arg1, arg2, arg3)",
+	"Structured API does not forward TaskWorld's explicit payout tick index"
+)
+has(
+	apiSection,
+	"operation == \"AdjustCurrency\" or operation == \"SpendAllowance\"",
+	"Legacy generic currency operations do not share an explicit fail-closed branch"
+)
+has(
+	apiSection,
+	"return false, \"DeprecatedOperation: use a named authoritative value operation\"",
+	"Legacy generic currency operations do not fail closed"
+)
+lacks(apiSection, "setAllowance(", "Structured API contains an unjournaled direct currency mutation")
+lacks(familySource, "local function adjustAllowance", "Legacy broad allowance mutation helper must remain retired")
 
 local computerGateAt = string.find(familySource, "or action == \"OrderBoombox\"", 1, true)
 local validSessionAt = computerGateAt and string.find(familySource, "and not validComputerSession(player)", computerGateAt, true) or nil
@@ -930,7 +1325,6 @@ for _, marker in ipairs({
 	"LoadedAudioDuration",
 	"BoomboxPlaybackFailed",
 	"invokeFamily(\"BeginBoomboxPlayback\", player, source)",
-	"invokeFamily(\"BoomboxPayoutTick\", session.player, session.sessionId)",
 	"invokeFamily(\"EndBoomboxPlayback\", session.player, session.sessionId, reason)",
 	"boomboxSound.Ended:Connect",
 	"finishBoomboxPlayback(session, \"Completed\", false)",
@@ -964,11 +1358,28 @@ for _, marker in ipairs({
 	"session.startedAt + tickIndex * session.interval + 0.035",
 	"activeBoomboxSession == session",
 	"not boomboxSound.Playing",
-	"retryAfter > 0 and retryAfter <= 0.35",
+	"local tickAccepted = false",
+	"repeat",
+	"tickAccepted = type(tickResult) == \"table\" and tickResult.ok == true",
+	"math.clamp(retryAfter > 0 and retryAfter + 0.02 or 0.2, 0.05, 0.5)",
+	"until tickAccepted or activeBoomboxSession ~= session or not boomboxSound.Playing",
+	"if not tickAccepted then",
 }) do
 	has(taskPayoutSection, marker, "TaskWorld payout scheduler is missing " .. marker)
 end
-check(countPlain(taskPayoutSection, "BoomboxPayoutTick") == 2, "TaskWorld must make one scheduled tick call and at most one short retry")
+check(
+	countPlain(taskPayoutSection, "BoomboxPayoutTick") == 1,
+	"TaskWorld must retry through one exact indexed payout call site"
+)
+local _, indexedTickCallCount = string.gsub(
+	taskPayoutSection,
+	"\"BoomboxPayoutTick\",%s*session%.player,%s*session%.sessionId,%s*tickIndex",
+	""
+)
+check(
+	indexedTickCallCount == 1,
+	"TaskWorld must pass the explicit tickIndex through the repeated authoritative call"
+)
 
 local discoTimingSection = section(
 	taskWorldSource,
@@ -1055,6 +1466,7 @@ local autoplaySchedulerSection = section(
 for _, marker in ipairs({
 	"not activeBoomboxSession and not boomboxActivationInProgress",
 	"autoplayRetryAt[candidate]",
+	"party and party.isHost == true",
 	"boombox.placed == true",
 	"boombox.autoplayPurchased == true",
 	"boombox.canPlay == true",
@@ -1149,7 +1561,8 @@ for _, marker in ipairs({
 	"boombox.ownsPlayback == true",
 	"return \"Busy\"",
 	"your allowance is not earning",
-	"maximumPayout",
+	"local maximumPayout = math.max(0, math.floor(tonumber(boombox.maximumPayout) or 0))",
+	"Earn up to $\" .. tostring(maximumPayout)",
 	"Delivered by truck. Set it up in the living room.",
 	"PLACE BOOMBOX HERE",
 	"Follow the purple arrow into the living room",
@@ -1162,6 +1575,8 @@ for _, marker in ipairs({
 	"BoomboxReady",
 	"BoomboxStarted",
 	"BoomboxFinished",
+	"BoomboxPayoutSaving",
+	"FULL PAYOUT EARNED — SAVING",
 	"BoomboxAutoplayPurchased",
 	"BOOMBOX AUTOPLAY INSTALLED",
 	"BoomboxError",
@@ -1218,21 +1633,26 @@ has(
 )
 local readyMonitorSection = section(
 	familySource,
-	"task.spawn(function()\n\tlocal nextAutoSave",
-	"\n\nbroadcastState()",
+	"function TransactionRuntime.runMaintenanceLoop()",
+	"function TransactionRuntime.runSessionHeartbeatLoop()",
 	"server boombox-ready monitor"
 )
 ordered(readyMonitorSection, {
-	"profile.loaded",
-	"not profile.boomboxPlayback",
-	"profile.data.boomboxPurchased",
-	"profile.data.boomboxPlaced",
-	"profile.data.boomboxNextPlayAt > 0",
-	"unixNow() >= profile.data.boomboxNextPlayAt",
-	"announceBoomboxReady(profile, profile.data.boomboxAutoplayPurchased == true)",
+	"local sharedHostProfile = hostProfile()",
+	"if partyCanProgress() and sharedHostProfile then",
+	"TransactionRuntime.recoverPendingBoomboxSettlement",
+	"not sharedHostProfile.boomboxPlayback",
+	"not TransactionRuntime.boomboxSettlementPending(sharedHostProfile)",
+	"sharedHostProfile.data.boomboxPurchased",
+	"sharedHostProfile.data.boomboxPlaced",
+	"sharedHostProfile.data.boomboxNextPlayAt > 0",
+	"unixNow() >= sharedHostProfile.data.boomboxNextPlayAt",
+	"announceBoomboxReady(",
+	"sharedHostProfile,",
+	"sharedHostProfile.data.boomboxAutoplayPurchased == true",
 }, "Server loop does not announce each eligible manual/autoplay cooldown transition")
 check(
-	countPlain(familySource, "announceBoomboxReady(profile,") == 3,
+	countPlain(familySource, "announceBoomboxReady(") == 3,
 	"BoomboxReady must have one definition plus only the cooldown monitor and begin-playback race fallback"
 )
 
@@ -1408,14 +1828,29 @@ local clientPromptSection = section(
 )
 for _, marker in ipairs({
 	"local cooldown = boomboxCooldownRemaining(snapshot)",
-	"local boomboxApproachable = boombox.purchased == true",
+	"local boomboxApproachable = activeParty and partyUx.isHost(snapshot) and boombox.purchased == true",
 	"and boombox.placed == true",
 	"and not boomboxIsPlaying(boombox)",
+	"local powerText = if boombox.occupiedByOther == true",
+	"then \"In Use\"",
 	"Cooldown - Ready in \" .. formatCountdown(cooldown)",
 	"configure(\"BoomboxPowerAnchor\", boomboxApproachable, powerText)",
 }) do
 	has(clientPromptSection, marker, "Cooldown-visible power prompt is missing " .. marker)
 end
+ordered(clientPromptSection, {
+	"local activeParty = partyUx.isActive(snapshot)",
+	"local boomboxApproachable = activeParty and partyUx.isHost(snapshot) and boombox.purchased == true",
+	"and boombox.placed == true",
+	"and not boomboxIsPlaying(boombox)",
+	"local powerText = if boombox.occupiedByOther == true",
+	"then \"In Use\"",
+	"elseif boomboxIsPlaying(boombox)",
+	"then \"Now Playing\"",
+	"elseif cooldown > 0",
+	"then \"Cooldown - Ready in \" .. formatCountdown(cooldown)",
+	"configure(\"BoomboxPowerAnchor\", boomboxApproachable, powerText)",
+}, "The power prompt must remain active-party/host gated and present busy, playing, and cooldown states in order")
 lacks(
 	clientPromptSection,
 	"and cooldown <= 0",
@@ -1524,7 +1959,7 @@ if running then
 end
 
 print(string.format(
-	"[BoomboxAudit] PASS: %d non-mutating checks in %s mode; $%d boombox, $%d autoplay, $%d/song cap, %d visual parts, %d lights",
+	"[BoomboxAudit] PASS: %d non-mutating checks in %s mode; schema 12 PartyV1/Lobby-only, $%d boombox, $%d autoplay, $%d/song cap, %d visual parts, %d lights",
 	checks,
 	running and "play" or "edit",
 	boomboxConfig.Price,
