@@ -26,6 +26,7 @@ local EXPECTED_LOBBY_PLACE_ID = 100748614383412
 local EXPECTED_HOUSE_PLACE_ID = 98645411943406
 local MINIMUM_LOBBY_CAPACITY = 4
 local RECOMMENDED_LOBBY_CAPACITY = 50
+local EXPECTED_UI_THEME_VERSION = 1
 
 local function check(condition, message)
 	checkCount += 1
@@ -56,13 +57,28 @@ local function markers(source, label, expected)
 end
 
 local function functionSection(source, functionName)
-	local startMarker = "local function " .. functionName .. "("
-	local startAt = type(source) == "string" and string.find(source, startMarker, 1, true) or nil
+	local startMarkers = {
+		"local function " .. functionName .. "(",
+		"function " .. functionName .. "(",
+		functionName .. " = function(",
+	}
+	local startAt = nil
+	local startMarker = nil
+	if type(source) == "string" then
+		for _, candidate in ipairs(startMarkers) do
+			local candidateAt = string.find(source, candidate, 1, true)
+			if candidateAt and (not startAt or candidateAt < startAt) then
+				startAt = candidateAt
+				startMarker = candidate
+			end
+		end
+	end
 	if not startAt then
 		return nil
 	end
-	local endAt = string.find(source, "\nlocal function ", startAt + #startMarker, true)
-		or string.find(source, "\nreturn ", startAt + #startMarker, true)
+	local markerLength = #(startMarker or "")
+	local endAt = string.find(source, "\nlocal function ", startAt + markerLength, true)
+		or string.find(source, "\nreturn ", startAt + markerLength, true)
 		or (#source + 1)
 	return string.sub(source, startAt, endAt - 1)
 end
@@ -117,6 +133,118 @@ local function directChild(parent, name, className, label)
 		check(child:IsA(className), child:GetFullName() .. " must be a " .. className)
 	end
 	return child
+end
+
+local function linearColorChannel(channel)
+	return if channel <= 0.04045
+		then channel / 12.92
+		else ((channel + 0.055) / 1.055) ^ 2.4
+end
+
+local function relativeLuminance(color)
+	return 0.2126 * linearColorChannel(color.R)
+		+ 0.7152 * linearColorChannel(color.G)
+		+ 0.0722 * linearColorChannel(color.B)
+end
+
+local function contrastRatio(foreground, background)
+	local foregroundLuminance = relativeLuminance(foreground)
+	local backgroundLuminance = relativeLuminance(background)
+	local lighter = math.max(foregroundLuminance, backgroundLuminance)
+	local darker = math.min(foregroundLuminance, backgroundLuminance)
+	return (lighter + 0.05) / (darker + 0.05)
+end
+
+-- CooperUITheme is deliberately installed in both places. The Studio
+-- in-place preview retains the lobby's replicated copy during handoff instead
+-- of cloning a second module that could drift.
+local uiThemeModule = directChild(ReplicatedStorage, "CooperUITheme", "ModuleScript")
+local UITheme, uiThemeSource = loadDataModule(uiThemeModule, "ReplicatedStorage.CooperUITheme")
+if uiThemeSource then
+	markers(uiThemeSource, "CooperUITheme", {
+		"Theme.VERSION = 1",
+		'Theme.ID = "Cooper1980sRecRoom.v1"',
+		"ActionHeight = 60",
+		"MinimumTouchTarget = 56",
+		"Enum.ScreenInsets.CoreUISafeInsets",
+		"return table.freeze(Theme)",
+	})
+end
+if UITheme then
+	check(table.isfrozen(UITheme), "CooperUITheme root must be frozen")
+	check(UITheme.VERSION == EXPECTED_UI_THEME_VERSION, "CooperUITheme version must be 1")
+	check(UITheme.ID == "Cooper1980sRecRoom.v1", "CooperUITheme ID changed")
+	check(type(UITheme.Colors) == "table" and table.isfrozen(UITheme.Colors), "CooperUITheme.Colors must be frozen")
+	check(type(UITheme.Fonts) == "table" and table.isfrozen(UITheme.Fonts), "CooperUITheme.Fonts must be frozen")
+	check(type(UITheme.Metrics) == "table" and table.isfrozen(UITheme.Metrics), "CooperUITheme.Metrics must be frozen")
+	check(
+		type(UITheme.Accessibility) == "table" and table.isfrozen(UITheme.Accessibility),
+		"CooperUITheme.Accessibility must be frozen"
+	)
+	local colors = UITheme.Colors or {}
+	local expectedColors = {
+		Scrim = Color3.fromRGB(25, 18, 13),
+		Cabinet = Color3.fromRGB(104, 55, 31),
+		Screen = Color3.fromRGB(27, 37, 30),
+		ScreenRaised = Color3.fromRGB(42, 54, 40),
+		ScreenSoft = Color3.fromRGB(53, 62, 45),
+		Outline = Color3.fromRGB(181, 153, 91),
+		Cream = Color3.fromRGB(255, 244, 207),
+		Muted = Color3.fromRGB(220, 213, 181),
+		Mustard = Color3.fromRGB(238, 179, 54),
+		MustardText = Color3.fromRGB(48, 31, 10),
+		Avocado = Color3.fromRGB(174, 207, 90),
+		Teal = Color3.fromRGB(133, 208, 197),
+		Rust = Color3.fromRGB(255, 151, 112),
+		Disabled = Color3.fromRGB(75, 76, 62),
+	}
+	for colorName, expectedColor in pairs(expectedColors) do
+		check(colors[colorName] == expectedColor, "CooperUITheme approved color changed: " .. colorName)
+	end
+	local fonts = UITheme.Fonts or {}
+	check(fonts.Body == Enum.Font.Gotham, "CooperUITheme body font changed")
+	check(fonts.Medium == Enum.Font.GothamMedium, "CooperUITheme medium font changed")
+	check(fonts.Strong == Enum.Font.GothamBold, "CooperUITheme strong font changed")
+	check(fonts.Mono == Enum.Font.RobotoMono, "CooperUITheme mono font changed")
+	local metrics = UITheme.Metrics or {}
+	check(metrics.SpacingUnit == 8, "CooperUITheme spacing unit must be 8")
+	check(metrics.MinimumTouchTarget == 56, "CooperUITheme minimum touch target must be 56 pixels")
+	check(metrics.ActionHeight == 60, "CooperUITheme lobby action height must remain 60 pixels")
+	check(
+		type(metrics.ActionHeight) == "number"
+			and type(metrics.MinimumTouchTarget) == "number"
+			and metrics.ActionHeight >= metrics.MinimumTouchTarget,
+		"CooperUITheme action height is below its touch-target minimum"
+	)
+	local accessibility = UITheme.Accessibility or {}
+	check(accessibility.BodyTextContrastMinimum == 4.5, "CooperUITheme body-text contrast contract must be 4.5:1")
+	check(accessibility.LargeTextContrastMinimum == 3, "CooperUITheme large-text contrast contract must be 3:1")
+	check(
+		accessibility.ScreenInsets == Enum.ScreenInsets.CoreUISafeInsets,
+		"CooperUITheme must use CoreUISafeInsets"
+	)
+	check(accessibility.ClipToDeviceSafeArea == true, "CooperUITheme must clip to the device safe area")
+	local bodyContrastMinimum = tonumber(accessibility.BodyTextContrastMinimum) or math.huge
+	for _, pair in ipairs({
+		{ "Cream", "Screen" },
+		{ "Muted", "Screen" },
+		{ "Muted", "ScreenRaised" },
+		{ "MustardText", "Mustard" },
+		{ "Avocado", "ScreenRaised" },
+		{ "Teal", "ScreenRaised" },
+		{ "Rust", "ScreenRaised" },
+		{ "Muted", "Disabled" },
+	}) do
+		local foreground = colors[pair[1]]
+		local background = colors[pair[2]]
+		check(typeof(foreground) == "Color3" and typeof(background) == "Color3", "Contrast pair is missing: " .. pair[1] .. "/" .. pair[2])
+		if typeof(foreground) == "Color3" and typeof(background) == "Color3" then
+			check(
+				contrastRatio(foreground, background) >= bodyContrastMinimum,
+				"CooperUITheme contrast is below 4.5:1 for " .. pair[1] .. "/" .. pair[2]
+			)
+		end
+	end
 end
 
 local starterScripts = StarterPlayer:FindFirstChild("StarterPlayerScripts")
@@ -272,12 +400,61 @@ end
 if isHouse then
 	-- House config and unchanged pre-horror content -------------------------
 	local configModule = directChild(houseRoot, "Config", "ModuleScript")
+	local transactionLedgerModule = directChild(houseRoot, "TransactionLedger", "ModuleScript")
 	local state = directChild(houseRoot, "State", "Folder")
 	local Config, configSource = loadDataModule(configModule, "ReplicatedStorage.CooperGame.Config")
+	local TransactionLedger, transactionLedgerSource = loadDataModule(
+		transactionLedgerModule,
+		"ReplicatedStorage.CooperGame.TransactionLedger"
+	)
+	if transactionLedgerSource then
+		markers(transactionLedgerSource, "CooperTransactionLedger", {
+			"Ledger.VERSION = 1",
+			"Ledger.MAX_COMMITTED = 256",
+			"Ledger.MAX_PENDING = 32",
+			"Ledger.MAX_ROLLED_BACK = 64",
+			"function Ledger.sanitize(",
+			"function Ledger.begin(",
+			"function Ledger.commit(",
+			"function Ledger.markNeedsReconciliation(",
+			"function Ledger.issuedHighWater(",
+			"function Ledger.rollback(",
+			"function Ledger.sessionMatches(",
+			"return table.freeze(Ledger)",
+		})
+	end
+	if TransactionLedger then
+		check(table.isfrozen(TransactionLedger), "TransactionLedger root must be frozen")
+		check(TransactionLedger.VERSION == 1, "TransactionLedger version must be 1")
+		check(
+			type(TransactionLedger.MAX_COMMITTED) == "number" and TransactionLedger.MAX_COMMITTED >= 256,
+			"TransactionLedger must retain at least 256 committed operation records"
+		)
+		check(
+			type(TransactionLedger.MAX_ROLLED_BACK) == "number"
+				and TransactionLedger.MAX_ROLLED_BACK > 0,
+			"TransactionLedger needs a separate bounded rollback tombstone history"
+		)
+		check(
+			type(TransactionLedger.MAX_PENDING) == "number" and TransactionLedger.MAX_PENDING > 0,
+			"TransactionLedger needs a bounded reconciliation queue"
+		)
+	end
 	if Config then
-		check(Config.SchemaVersion == 11, "Milestone 1 must preserve profile schema 11")
+		check(Config.SchemaVersion == 12, "Milestone 1 transaction integration requires profile schema 12")
 		check(Config.DataStoreName == "CooperFamilyTasks_v2", "Milestone 1 must retain the production DataStore")
 		check(Config.ReleasePlayerCap == 4, "House release cap must be four")
+		local defaultJournal = Config.ProfileDefaults and Config.ProfileDefaults.operationJournal
+		check(type(defaultJournal) == "table", "Schema 12 ProfileDefaults.operationJournal is missing")
+		check(defaultJournal and defaultJournal.version == 1, "Fresh operation journal version must be 1")
+		check(
+			defaultJournal and type(defaultJournal.pending) == "table" and next(defaultJournal.pending) == nil,
+			"Fresh operation journal must not contain pending operations"
+		)
+		check(
+			defaultJournal and type(defaultJournal.committed) == "table" and next(defaultJournal.committed) == nil,
+			"Fresh operation journal must not contain committed operations"
+		)
 
 		local expectedFeatures = {
 			Lobby = true,
@@ -314,6 +491,7 @@ if isHouse then
 		check(Config.Party and Config.Party.ProtocolVersion == 1, "Party protocol version must be 1")
 		check(Config.Party and Config.Party.MaxMembers == 4, "Party max must be four")
 		check(Config.Party and Config.Party.HostReconnectGraceSeconds == 60, "Host grace must be exactly 60 seconds")
+		check(Config.Party and Config.Party.GuestReconnectGraceSeconds == 90, "Guest grace must be exactly 90 seconds")
 		check(Config.Party and Config.Party.HostOnlyPersistentPurchases == true, "Persistent world purchases must be host-only")
 		check(Config.Party and Config.Party.LobbyPlaceId == EXPECTED_LOBBY_PLACE_ID, "House config must route back to the published lobby place")
 		check(Config.Party and Config.Party.HousePlaceId == EXPECTED_HOUSE_PLACE_ID, "House place ID changed")
@@ -350,8 +528,23 @@ if isHouse then
 	if gameServerSource then
 		markers(gameServerSource, "CooperGame", {
 			"M1_SHARED_TASK_SESSION_CONTRACT",
+			"M1_TASK_ELIGIBILITY_CONTRACT",
+			"local function sanitizeCalmTaskCheckpoint(raw)",
+			"TransactionRuntime.commitCalmTaskStart(profile, recovered)",
+			"CALM_TASK_START_EXPOSURE_AFTER_DURABLE_SAVE",
+			"TransactionRuntime.armRecoveredEligibilityGrace(profile, record, checkpoint)",
+			"local retainedInGuestGrace = eligibleProfile",
+			"local retainedWhileLoading = loading",
+			"hydrationGraceExpiresAtUnix",
+			"local nextBoundaryUnix = expiresAt",
+			"return nil, \"ProfileLoading\"",
+			"recoveryGraceExpiresAt = recovered == true and checkpoint.recoveryGraceExpiresAt or 0",
+			"return nil, \"RecoveredTaskGraceExpired\"",
+			"recipient.data.calmTaskCheckpoint = nil",
+			"M1_SERVER_TRANSACTION_JOURNAL_CONTRACT",
 			"M1_HOST_ONLY_PURCHASE_GUARD",
 			"M1_HOST_RECONNECT_GRACE_CONTRACT",
+			"M1_GUEST_RECONNECT_GRACE_CONTRACT",
 			"FoundationContract\", \"PartyV1",
 			"PartySessionId",
 			"PartyHostUserId",
@@ -364,6 +557,7 @@ if isHouse then
 			"Protocol.MemoryStoreNames.Sessions",
 			"MemoryStoreService",
 			"HostReconnectGraceSeconds",
+			"GuestReconnectGraceSeconds",
 			"partySession.state = \"HostGrace\"",
 			"partySession.hostGraceDeadline = partySession.pausedAt + partyConfig.HostReconnectGraceSeconds",
 			"task.delay(partyConfig.HostReconnectGraceSeconds, function()",
@@ -379,16 +573,39 @@ if isHouse then
 			"manifest.expiresAt = renewedExpiresAt",
 			"for userId, player in pairs(partySession.activePlayers) do",
 			"local occupiedSlot = partySession.activePlayers[player.UserId]",
+			"local guestReconnectAllowed = not retainedIsHost",
 			"retained.loaded ~= true",
 			"recoverHostWorldState(retained, player)",
 			"closePartyAndReturn(",
 			"reconnectRemaining",
 			"cycleIndex",
-			"rewardedUserIds = {}",
+			"local function captureTaskEligibility(version)",
+			"local eligibility = captureTaskEligibility(partySession.taskSerial)",
+			"eligibilityResolutionByUserId = {}",
+			"rewardOperationIdsByUserId = {}",
 			"record.status = \"Completing\"",
-			"local recipients = presentProfiles()",
-			"if record.rewardedUserIds[userId] ~= true then",
+			"record.completionWorkerActive = true",
+			"if record.completionWorkerActive == true then",
+			"if partySession.task ~= record or record.status ~= \"Completing\" then",
+			"record.status = \"Completed\"",
+			"local everyGuestTerminal = true",
+			"if not everyGuestTerminal then",
+			"The host's totalTasks value is the durable logical-task checkpoint.",
+			"for _, userId in ipairs(record.eligibility.userIds) do",
+			"local recipient, unavailableReason = eligibleProfileForTask(record, userId)",
+			"forfeitTaskEligibility(record, userId, unavailableReason)",
 			"setAllowance(recipient, recipient.data.allowance + reward)",
+			"TransactionRuntime.commitProfileValueOperation(",
+			"TransactionRuntime.reserveProfileValueOperation(",
+			"TransactionRuntime.resumePersistedReconciliations(profile)",
+			"profile.reconciliationScheduled[operationId] ~= nil",
+			"TransactionRuntime.purchaseStillAuthorized(profile, operationKind, price)",
+			"return false, false, \"SavePending\"",
+			"TransactionLedger.markNeedsReconciliation(",
+			"TransactionLedger.sessionMatches(existing, activeSessionId)",
+			"expectedSessionId ~= activeSessionId",
+			"profile.transactionReconciliationBlocked = true",
+			"locked against another charge",
 			"partySession.completedTasks += 1",
 			"math.floor(partySession.completedTasks / #Config.TaskOrder) + 1",
 			"partySession.task = nil",
@@ -399,6 +616,37 @@ if isHouse then
 			"chemistrySetup = chemistrySetupSnapshot(worldProfile, profile)",
 			"automation = automationSnapshot(worldProfile, profile)",
 		})
+		lacks(gameServerSource, "rewardedUserIds", "CooperGame immutable task eligibility")
+		lacks(gameServerSource, "local recipients = presentProfiles()", "CooperGame task completion")
+		lacks(gameServerSource, "payload.operationId", "CooperGame client-supplied value operation id")
+		markers(gameServerSource, "CooperGame guest route cap", {
+			"local function rejoinRouteExpiration(userId, sessionState, renewedExpiresAt, hostGraceExpiresAt)",
+			"and activeProfile.loaded and not activeProfile.releasing",
+			"An expected guest who has not yet arrived keeps the lobby-issued 90-second",
+			"profile.guestGraceDeadline = serverNow() + partyConfig.GuestReconnectGraceSeconds",
+			"expectedDetachedProfile.guestGraceSerial ~= expectedGraceSerial",
+			"serverNow() < (tonumber(profile.guestGraceDeadline) or 0)",
+			"serverNow() < (tonumber(retained.guestGraceDeadline) or 0)",
+			"beginGuestReconnectGrace(profile, player)",
+			"while resolution and resolution.status == \"Committing\"",
+			"profilesByUserId[leavingPlayer.UserId] == profile",
+		})
+		lacks(gameServerSource, "serverNow() <= (tonumber(profile.guestGraceDeadline) or 0)", "Guest task eligibility expiry boundary")
+		lacks(gameServerSource, "serverNow() <= (tonumber(retained.guestGraceDeadline) or 0)", "Guest rejoin expiry boundary")
+		local guestGraceSection = functionSection(gameServerSource, "beginGuestReconnectGrace")
+		if guestGraceSection then
+			local settleAt = string.find(
+				guestGraceSection,
+				'while resolution and resolution.status == "Committing"',
+				1,
+				true
+			)
+			local releaseAt = string.find(guestGraceSection, "local saved = saveProfile(leavingPlayer, true)", 1, true)
+			check(
+				settleAt ~= nil and releaseAt ~= nil and settleAt < releaseAt,
+				"Guest grace must settle a reserved task reward before releasing its profile lease"
+			)
+		end
 
 		-- A profile-local task can silently split the party scheduler or duplicate
 		-- rewards. Persistent delivery fields named taskUpgrade remain valid.
@@ -430,12 +678,104 @@ if isHouse then
 					purchaseFunction .. " must invoke the shared host/progression guard before mutation"
 				)
 				local guardAt = string.find(section, "hostMutationAllowed(profile)", 1, true)
+				local transactionAt = string.find(section, "TransactionRuntime.commitHostPurchase(", 1, true)
 				local debitAt = string.find(section, "setAllowance(profile, profile.data.allowance -", 1, true)
 				check(
-					guardAt ~= nil and (debitAt == nil or guardAt < debitAt),
-					purchaseFunction .. " must authorize the host before any allowance debit"
+					transactionAt ~= nil,
+					purchaseFunction .. " must use the shared schema-12 transaction journal"
+				)
+				check(
+					guardAt ~= nil and transactionAt ~= nil and guardAt < transactionAt
+						and (debitAt == nil or transactionAt < debitAt),
+					purchaseFunction .. " must authorize the host and open a transaction before any debit"
 				)
 			end
+		end
+		local purchaseCommitSection = functionSection(gameServerSource, "TransactionRuntime.commitHostPurchase")
+		check(purchaseCommitSection ~= nil, "Schema-12 purchase commit helper is missing")
+		if purchaseCommitSection then
+			check(
+				contains(
+					purchaseCommitSection,
+					"TransactionRuntime.purchaseStillAuthorized(profile, operationKind, price)"
+				),
+				"Queued purchases must revalidate domain ownership and delivery preconditions inside the serialized transaction"
+			)
+		end
+		local valueCommitSection = functionSection(
+			gameServerSource,
+			"TransactionRuntime.commitProfileValueOperation"
+		)
+		check(valueCommitSection ~= nil, "Profile value-operation commit helper is missing")
+		if type(valueCommitSection) == "string" then
+			local lookupAt = string.find(valueCommitSection, "TransactionLedger.lookup(journal, operationId)", 1, true)
+			local committedRetryAt = string.find(valueCommitSection, 'if existing.state == "Committed" then', 1, true)
+			local reconciliationBlockAt = string.find(
+				valueCommitSection,
+				"if profile.transactionReconciliationBlocked == true then",
+				1,
+				true
+			)
+			local authorizeAt = string.find(valueCommitSection, "local authorizeOk, authorized, denial = pcall(authorize)", 1, true)
+			check(
+				lookupAt ~= nil and committedRetryAt ~= nil and reconciliationBlockAt ~= nil
+					and authorizeAt ~= nil and lookupAt < committedRetryAt
+					and committedRetryAt < reconciliationBlockAt
+					and reconciliationBlockAt < authorizeAt,
+				"Terminal operation retries must return their saved result before mutable domain authorization"
+			)
+		end
+		local completeTaskSection = functionSection(gameServerSource, "completeTask")
+		if completeTaskSection then
+			local casAt = string.find(completeTaskSection, 'record.status = "Completed"', 1, true)
+			local advanceAt = string.find(completeTaskSection, "partySession.completedTasks += 1", 1, true)
+			local closeAt = string.find(completeTaskSection, "partySession.task = nil", 1, true)
+			check(
+				casAt ~= nil and advanceAt ~= nil and closeAt ~= nil and casAt < advanceAt and advanceAt < closeAt,
+				"Shared task finalization must claim Completed before advancing and atomically close the same record"
+			)
+		end
+		local checkpointCommitSection = functionSection(
+			gameServerSource,
+			"TransactionRuntime.commitCalmTaskStart"
+		)
+		check(checkpointCommitSection ~= nil, "CalmTaskStart durable commit helper is missing")
+		if type(checkpointCommitSection) == "string" then
+			local saveAt = string.find(
+				checkpointCommitSection,
+				"durable = TransactionRuntime.safeSave(profile)",
+				1,
+				true
+			)
+			local exposeAt = string.find(
+				checkpointCommitSection,
+				"TransactionRuntime.exposeCalmTaskCheckpoint(profile, checkpoint, recovered)",
+				saveAt or 1,
+				true
+			)
+			check(
+				saveAt ~= nil and exposeAt ~= nil and saveAt < exposeAt,
+				"CalmTaskStart must be durably saved before any task exposure"
+			)
+			check(
+				contains(checkpointCommitSection, "profile.calmTaskCheckpointWriteInFlight")
+					and contains(checkpointCommitSection, "profile.calmTaskCheckpointRetryAt")
+					and contains(checkpointCommitSection, "profile.calmTaskCheckpointRetryCount"),
+				"CalmTaskStart persistence retries need a single-writer bounded backoff"
+			)
+		end
+		local saveProfileSection = functionSection(gameServerSource, "saveProfile")
+		check(saveProfileSection ~= nil, "Serialized profile save helper is missing")
+		if type(saveProfileSection) == "string" then
+			local loopAt = string.find(saveProfileSection, "repeat", 1, true)
+			local revisionAt = string.find(saveProfileSection, "local savedRevision = profile.revision or 0", 1, true)
+			local payloadAt = string.find(saveProfileSection, "local payload = sanitizeData(profile.data)", 1, true)
+			local updateAt = string.find(saveProfileSection, "dataStore:UpdateAsync", 1, true)
+			check(
+				loopAt ~= nil and revisionAt ~= nil and payloadAt ~= nil and updateAt ~= nil
+					and loopAt < revisionAt and revisionAt < payloadAt and payloadAt < updateAt,
+				"Every serialized save retry must snapshot the matching current revision and payload"
+			)
 		end
 		lacks(gameServerSource, "FeatureHorrorEnabled\", true", "CooperGame")
 	end
@@ -676,6 +1016,8 @@ elseif isLobby then
 		check(LobbyConfig.LobbyPlaceId == EXPECTED_LOBBY_PLACE_ID, "LobbyPlaceId must identify the published start place")
 		check(LobbyConfig.LobbyPlaceId ~= LobbyConfig.HousePlaceId, "Lobby and house must be different places")
 		check(LobbyConfig.MinimumPartySize == 1 and LobbyConfig.MaximumPartySize == 4, "Lobby party bounds must be 1–4")
+		check(LobbyConfig.GuestAdmissionGraceSeconds == 90, "Guest admission grace must be exactly 90 seconds")
+		check(LobbyConfig.RejoinTicketTTLSeconds == 90, "Guest rejoin ticket must expire after 90 seconds")
 		check(Protocol and LobbyConfig.MaximumPartySize == Protocol.MAX_PARTY_SIZE, "Lobby and protocol party caps differ")
 		check(LobbyConfig.StudioPreview == true, "Studio preview adapter must remain explicitly configured")
 		if game.PlaceId > 0 then
@@ -708,10 +1050,16 @@ elseif isLobby then
 			"Protocol.MemoryStoreNames.Tickets",
 			"Protocol.MemoryStoreNames.Sessions",
 			"Protocol.MemoryStoreNames.Rejoins",
+			"M1_GUEST_ADMISSION_GRACE_CONTRACT",
 			"lobbyPlaceId = Config.LobbyPlaceId",
 			"housePlaceId = Config.HousePlaceId",
 			"local ticketIdsByUserId",
 			'local ticketId = Protocol.newOpaqueId("arrival")',
+			"local rejoinRouteLifetime = if userId == party.hostUserId",
+			"local arrivalTicketLifetime = if userId == party.hostUserId",
+			"else Config.GuestAdmissionGraceSeconds",
+			"expiresAt = now + arrivalTicketLifetime",
+			"expiresAt = now + rejoinRouteLifetime",
 			"userId = userId",
 			"TeleportService:TeleportAsync(Config.HousePlaceId, { member }, options)",
 			'if action == "CreateParty" then',
@@ -767,11 +1115,14 @@ elseif isLobby then
 			"INVITE FRIENDS",
 			"I'M READY",
 			"START PRIVATE HOUSE",
-			"Enum.ScreenInsets.CoreUISafeInsets",
+			"local UITheme = loadCooperUITheme()",
+			"local THEME = UITheme.Colors",
+			"gui.ScreenInsets = UITheme.Accessibility.ScreenInsets",
+			"gui.ClipToDeviceSafeArea = UITheme.Accessibility.ClipToDeviceSafeArea",
 			"authoritativeSelfReady = state.selfReady == true",
 			"tonumber(state.partyRevision)",
 			"state.launchBlockMessage",
-			"button.Size = UDim2.new(1, 0, 0, 60)",
+			"button.Size = UDim2.new(1, 0, 0, UITheme.Metrics.ActionHeight)",
 			"button.NextSelectionDown",
 			"updateResponsiveLayout",
 			"camera.CameraType = Enum.CameraType.Scriptable",
@@ -780,6 +1131,14 @@ elseif isLobby then
 			"validatedPartyRevision",
 		})
 		lacks(lobbyClientSource, "string.find(readyButton.Text", "CooperLobby client")
+		lacks(lobbyClientSource, "local THEME = table.freeze({", "CooperLobby client")
+		markers(lobbyClientSource, "CooperLobby stale-place fallback", {
+			"if themeModule == nil then",
+			"using embedded v1 compatibility palette for this stale place",
+			'assert(themeModule:IsA("ModuleScript")',
+			"CooperUITheme v1 is required",
+		})
+		lacks(lobbyClientSource, "pcall(require", "CooperLobby theme loader")
 	end
 
 	if running then

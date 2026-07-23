@@ -16,6 +16,7 @@ local Config = {
 	SessionTTLSeconds = 60 * 60,
 	SessionHeartbeatSeconds = 2 * 60,
 	ArrivalTicketTTLSeconds = 180,
+	GuestAdmissionGraceSeconds = 90,
 	RejoinTicketTTLSeconds = 90,
 	RequestCooldownSeconds = 0.25,
 	StatePollSeconds = 1.5,

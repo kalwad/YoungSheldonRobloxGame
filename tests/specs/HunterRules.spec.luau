@@ -1,0 +1,38 @@
+local DeterministicRandom = require("../support/DeterministicRandom")
+local HunterRules = require("../support/HunterRules")
+
+return function(test)
+	test:test("maps each fixed chore to its approved family hunter", function()
+		test:equal(HunterRules.choose("GeorgeBeer", nil, nil), "George")
+		test:equal(HunterRules.choose("MaryDishes", nil, nil), "Mary")
+		test:equal(HunterRules.choose("MaryTrash", nil, nil), "Mary")
+		test:equal(HunterRules.choose("MissyPlush", nil, nil), "Missy")
+	end)
+
+	test:test("bank selection is deterministic", function()
+		local random = DeterministicRandom.fromSequence({ 0, 0.999 })
+		test:equal(HunterRules.choose("MedfordBankHack", random, nil), "George")
+		test:equal(HunterRules.choose("MedfordBankHack", random, nil), "Georgie")
+	end)
+
+	test:test("bank selection avoids the previous hunter when possible", function()
+		local random = DeterministicRandom.fromSequence({ 0 })
+		local selected = HunterRules.choose("MedfordBankHack", random, "George")
+		test:equal(selected, "Mary")
+		test:truthy(HunterRules.isApproved(selected))
+	end)
+
+	test:test("unknown task IDs fail safely without inventing a character", function()
+		local hunter, problem = HunterRules.choose("UnapprovedFutureTask", nil, nil)
+		test:equal(hunter, nil)
+		test:equal(problem, "UnknownTask")
+	end)
+
+	test:test("the approved registry contains exactly the four canonical cutouts", function()
+		test:deepEqual(HunterRules.approvedHunters(), { "George", "Mary", "Missy", "Georgie" })
+		test:falsy(HunterRules.isApproved("Sheldon"))
+		test:falsy(HunterRules.isApproved("Billy"))
+		test:falsy(HunterRules.isApproved("Mandy"))
+		test:falsy(HunterRules.isApproved("Meemaw"))
+	end)
+end

@@ -123,11 +123,11 @@ task count.
 | T04 | Guest finds/returns Missy’s toy | One shared advance; every present member gets `$70` once | NOT RUN | |
 | T05 | Guest completes bank memory game | One shared advance; every present member gets the authoritative cycle reward once | NOT RUN | |
 | T06 | Two clients submit the final interaction simultaneously | Idempotency token accepts one completion only | PARTIAL | Controlled 4-client Studio test: duplicate completion returned false with no second reward; live contention remains |
-| T07 | Guest joins after a task began but before it completes | Reward follows the documented “present at completion” rule exactly once | NOT RUN | |
-| T08 | Guest leaves before completion | Departed guest is not awarded from an absent profile | NOT RUN | |
+| T07 | An original expected guest finishes initial admission after a task began | The immutable snapshot does not change; that guest becomes eligible only for later tasks | NOT RUN | |
+| T08 | Snapshot-eligible guest disconnects before completion | The retained identity is paid once if commit occurs inside the 90-second grace; otherwise it is explicitly forfeited at the exact boundary | NOT RUN | |
 | T09 | Complete a full five-task cycle | Shared cycle/index advances once and remains identical on all snapshots | NOT RUN | |
 | T10 | Repeat with every installed task robot | The existing authoritative acceptance point advances the shared task once; the physical run stays visible and party rewards never duplicate | NOT RUN | |
-| T11 | Complete a task while one present guest profile is still hydrating | Progress waits or records a pending award so every present member receives exactly one reward | NOT RUN | |
+| T11 | Complete a task while one expected guest profile is still hydrating | The loading guest is excluded by DEC-02, the frozen roster never changes, and the UI does not imply an unavailable reward | NOT RUN | |
 
 ## Host authority and persistence tests
 

@@ -85,6 +85,20 @@ Nothing in this export was published or used to overwrite another place.
 | --- | --- | ---: | --- |
 | `2026-07-22_20-39-16_EDT_studio-house-launch-verified.rbxm` | Studio-only house package + bridge + repaired lobby sources/environment | 627701 | `4743727549aada2b2669b03f8d74ae23c42bab10708f3fc34302e05cb0f24a62` |
 
+### Pre-schema-12/UI/security closure safety export — 22:11:28 EDT
+
+This edit-mode export was captured immediately before any attempted Studio
+synchronization of the schema-12 transaction journal, shared UI theme, guest
+grace, eligibility, or physical-prompt security work. It includes the lobby
+environment, lobby protocol/config/server/client, Studio preview bridge and
+inert house package, plus the bunker construction assets referenced by the
+package. It is a rollback point only; it is not a claim that the newer local
+candidate passed or was published.
+
+| File | Scope | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `2026-07-22_22-11-28_EDT_pre-schema12-ui-security-lobby.rbxm` | Complete current lobby authoring surface and inert Studio house preview package | 637247 | `d9f1876505f0fafaa592d3dd8e3a5063068806009747e9645ea686fd3af21096` |
+
 All original seven verified hashes and both closure hashes above were re-read from the stored files with
 SHA-256. The house was published before the final lobby publication; no house
 version number or publication timestamp was supplied for this manifest.

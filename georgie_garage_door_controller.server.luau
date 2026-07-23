@@ -2,6 +2,7 @@
 -- roof_garage_build.luau. The installer copies this source into the live place.
 
 local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
 local doorModel = script.Parent
@@ -9,8 +10,72 @@ local panelsFolder = doorModel:WaitForChild("Panels")
 local collisionBlocker = doorModel:WaitForChild("CollisionBlocker")
 local promptMount = doorModel:WaitForChild("PromptMount")
 local prompt = promptMount:WaitForChild("ProximityPrompt")
+assert(prompt:IsA("ProximityPrompt"), "Garage-door prompt must be a ProximityPrompt")
 
 local MOVE_TIME = 1.55
+local PROMPT_RATE_SECONDS = 0.75
+local PROMPT_DISTANCE_SLACK = 3
+local PROMPT_DISTANCE_HARD_CAP = 18
+local nextPromptAtByPlayer = {}
+
+-- SECURITY: Triggered is only a signal, not proof that the caller is alive or
+-- still beside this moving assembly. Keep the live server distance hard-capped
+-- even if a prompt property is accidentally enlarged at runtime.
+local function livePlayerRoot(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") or player.Parent ~= Players then
+		return nil
+	end
+	local partyState = player:GetAttribute("CooperPartyState")
+	if player:GetAttribute("CooperPartyMember") ~= true
+		or player:GetAttribute("CooperGameProfileLoaded") ~= true
+		or (partyState ~= "Active" and partyState ~= "HostGrace")
+	then
+		return nil
+	end
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not character or not character:IsDescendantOf(Workspace)
+		or not humanoid or humanoid.Health <= 0
+		or not root or not root:IsA("BasePart") or not root:IsDescendantOf(character)
+	then
+		return nil
+	end
+	return root
+end
+
+local function promptWorldPosition()
+	local anchor = prompt.Parent
+	if anchor and anchor:IsA("Attachment") then
+		return anchor.WorldPosition
+	elseif anchor and anchor:IsA("BasePart") then
+		return anchor.Position
+	end
+	return nil
+end
+
+local function playerCanReachPrompt(player)
+	local root = livePlayerRoot(player)
+	local position = promptWorldPosition()
+	if not root or not position or not prompt.Enabled or not prompt:IsDescendantOf(Workspace) then
+		return false
+	end
+	local maximumDistance = math.clamp(
+		prompt.MaxActivationDistance + PROMPT_DISTANCE_SLACK,
+		4,
+		PROMPT_DISTANCE_HARD_CAP
+	)
+	return (root.Position - position).Magnitude <= maximumDistance
+end
+
+local function consumePromptRate(player)
+	local now = Workspace:GetServerTimeNow()
+	if now < (nextPromptAtByPlayer[player] or 0) then
+		return false
+	end
+	nextPromptAtByPlayer[player] = now + PROMPT_RATE_SECONDS
+	return true
+end
 
 local function requireNumberAttribute(name)
 	local value = doorModel:GetAttribute(name)
@@ -317,6 +382,18 @@ applyAlpha(currentAlpha)
 collisionBlocker.CanCollide = not isOpen
 refreshPrompt()
 
-prompt.Triggered:Connect(function()
+prompt.Triggered:Connect(function(player)
+	local expectedState = isOpen and "Open" or "Closed"
+	if not playerCanReachPrompt(player) or not consumePromptRate(player)
+		or busy or doorModel.Parent == nil
+		or doorModel:GetAttribute("IsOpen") ~= isOpen
+		or doorModel:GetAttribute("DoorState") ~= expectedState
+	then
+		return
+	end
 	moveDoor(not isOpen)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	nextPromptAtByPlayer[player] = nil
 end)

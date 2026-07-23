@@ -101,7 +101,7 @@ else
 end
 
 check(type(Config) == "table" and table.isfrozen(Config), "Gameplay config must be a frozen table")
-check(Config.SchemaVersion == 11, "Medford Bank persistence requires schema 11")
+check(Config.SchemaVersion == 12, "Medford Bank persistence requires schema 12")
 check(Config.DataStoreName == "CooperFamilyTasks_v2", "Schema migration must keep the established profile DataStore")
 check(Config.DataStoreKeyPrefix == "player_", "Schema migration changed the profile key prefix")
 
@@ -247,9 +247,9 @@ check(
 check(math.min(bank.MaximumReward, bank.BaseReward + bank.RewardPerSuccess) > bank.BaseReward, "The second cycle does not pay more than the first")
 
 local defaults = Config.ProfileDefaults
-check(type(defaults) == "table" and defaults.schemaVersion == 11, "Profile defaults are not schema 11")
+check(type(defaults) == "table" and defaults.schemaVersion == 12, "Profile defaults are not schema 12")
 check(defaults.bankHackSuccesses == 0, "Fresh and migrated profiles must begin at bank cycle zero")
-check(state:GetAttribute("SchemaVersion") == 11, "Shared State does not expose schema 11")
+check(state:GetAttribute("SchemaVersion") == 12, "Shared State does not expose schema 12")
 check(state:GetAttribute("SupportsMedfordBankHack") == true, "Shared State does not advertise Medford Bank hacking")
 
 -- Server authority, persistence, and state machine -------------------------
@@ -748,7 +748,7 @@ end
 
 if running then
 	for _, player in ipairs(Players:GetPlayers()) do
-		check(player:GetAttribute("CooperGameSchemaVersion") == 11, player.Name .. " did not load a schema-11 profile")
+		check(player:GetAttribute("CooperGameSchemaVersion") == 12, player.Name .. " did not load a schema-12 profile")
 		local serverEvents = ServerScriptService:FindFirstChild(Config.ServerEventsName)
 		local api = serverEvents and serverEvents:FindFirstChild("API")
 		if api and api:IsA("BindableFunction") then

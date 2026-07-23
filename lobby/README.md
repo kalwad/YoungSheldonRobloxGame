@@ -11,20 +11,32 @@ Install the files with these exact names:
 | Local source | Lobby-place destination |
 | --- | --- |
 | `../CooperPartyProtocol.module.luau` | `ReplicatedStorage.CooperPartyProtocol` |
+| `../CooperUITheme.module.luau` | `ReplicatedStorage.CooperUITheme` |
 | `CooperLobbyConfig.module.luau` | `ReplicatedStorage.CooperLobby.Config` |
 | `CooperLobby.server.luau` | `ServerScriptService.CooperLobby` |
 | `CooperLobby.client.luau` | `StarterPlayer.StarterPlayerScripts.CooperLobby` |
 
 `build_lobby_environment.luau` is a destructive, one-time Studio edit-mode
-builder, not a fifth runtime script. It clears the current house DataModel,
+builder, not a sixth runtime source. It clears the current house DataModel,
 builds the lightweight lobby shell, and creates placeholder source slots. Run
 it only after backups exist and only on the start-place copy being converted to
-the lobby. Synchronize the four canonical sources above immediately afterward.
+the lobby. Synchronize the five canonical sources above immediately afterward.
 Never run it in the reserved Cooper house place or over an installed lobby.
 
 The `ReplicatedStorage.CooperLobby` folder must contain the `Config` ModuleScript.
 The server creates `ReplicatedStorage.CooperPartyLobby` and its three remotes:
 `Request`, `State`, and `ClientCommand`.
+
+`CooperUITheme.module.luau` is the versioned source of the approved late-1980s
+palette, Gotham/Roboto Mono typography, 60-pixel action height, contrast floors,
+and Core UI safe-area contract. Install the same source as
+`ReplicatedStorage.CooperUITheme` in the lobby and reserved house. The current
+house UI is intentionally unchanged by this Milestone 1 consolidation. During
+the in-place Studio house preview, the lobby's replicated theme remains resident
+through the handoff; `StudioHousePreviewPackage` must not contain a second copy
+that could shadow or drift from it. The lobby client has an exact v1 compatibility
+palette only for a stale place where the module is completely absent. A present
+but malformed or wrong-version module fails loudly.
 
 Before publishing, verify the fixed topology in both configs. Roblox always
 sends ordinary experience joins to the start place, and an added
@@ -74,9 +86,10 @@ The house implementation must keep the session manifest alive, set its state to
 TeleportService cannot launch reserved servers in Studio. The lobby therefore
 uses a process-local in-memory adapter in Studio. Party creation, size limits,
 solo ready/host checks, state replication, and adaptive UI can be inspected
-without touching production MemoryStore. Pressing Start reports a successful
-validation preview but does **not** reserve a server, write a session manifest,
-teleport anyone, or grant house authority. Real invitation membership,
+without touching production MemoryStore. Pressing Start opens the verified
+in-place Cooper House package in that same Studio playtest, but does **not**
+reserve a server, write a session manifest, teleport anyone, or grant saved
+production authority. Real invitation membership,
 cross-instance routing, 2/4-player launches, and rejoin routing require the
 privately published Roblox-client tests in the matrix; Studio does not forge
 friends or production invitation tickets.

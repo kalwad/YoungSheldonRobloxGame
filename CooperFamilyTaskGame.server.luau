@@ -17,6 +17,12 @@ assert(root and root:IsA("Folder"), "ReplicatedStorage.CooperGame is missing")
 local configModule = root:WaitForChild("Config", ROOT_TIMEOUT)
 assert(configModule and configModule:IsA("ModuleScript"), "CooperGame.Config is missing")
 local Config = require(configModule)
+local TransactionLedger = require(root:WaitForChild("TransactionLedger", ROOT_TIMEOUT))
+assert(TransactionLedger.VERSION == 1, "CooperGame.TransactionLedger v1 is required")
+assert(
+	tonumber(TransactionLedger.MAX_COMMITTED) and TransactionLedger.MAX_COMMITTED >= 256,
+	"CooperGame.TransactionLedger must retain at least 256 committed operation records"
+)
 local partyProtocolModule = ReplicatedStorage:WaitForChild("CooperPartyProtocol", ROOT_TIMEOUT)
 assert(partyProtocolModule and partyProtocolModule:IsA("ModuleScript"), "CooperPartyProtocol is missing")
 local Protocol = require(partyProtocolModule)
@@ -116,6 +122,7 @@ assert(type(candyDeliveryConfig) == "table", "CooperGame.Config.CandyDelivery is
 assert(type(partyConfig) == "table", "CooperGame.Config.Party is missing")
 assert(tonumber(partyConfig.MaxMembers) == 4, "Milestone 1 parties must support exactly 1-4 players")
 assert(tonumber(partyConfig.HostReconnectGraceSeconds) == 60, "Host reconnect grace must remain 60 seconds")
+assert(tonumber(partyConfig.GuestReconnectGraceSeconds) == 90, "Guest reconnect grace must remain 90 seconds")
 assert(partyConfig.ProtocolVersion == Protocol.VERSION, "House config and party protocol versions differ")
 assert(partyConfig.MaxMembers == Protocol.MAX_PARTY_SIZE, "House and party protocol size caps differ")
 assert(
@@ -168,7 +175,7 @@ local DATA_LOAD_ATTEMPTS = 4
 local DELIVERY_RETRY_INTERVAL_SECONDS = 2
 local RELEASE_SAVE_ATTEMPTS = 4
 local SNAPSHOT_REQUEST_COOLDOWN = 0.75
--- The profile data uses schema v11. This reserved, temporary storage field
+-- The profile data uses schema v12. This reserved, temporary storage field
 -- exists only while a live server owns the key and is removed on clean release.
 -- A lease spans more than two autosave intervals so a single throttled renewal
 -- cannot let another server take ownership from a healthy session.
@@ -264,6 +271,82 @@ local function sameMemberSet(left, right)
 	return true
 end
 
+local function updateMemberRejoinRoute(userId, expiresAt, expectedDetachedProfile, expectedGraceSerial)
+	if RunService:IsStudio() or partySession.studioSynthetic
+		or not partySession.validated or not Protocol.isOpaqueId(partySession.id)
+	then
+		return true
+	end
+	local now = unixNow()
+	local boundedExpiresAt = math.floor(tonumber(expiresAt) or 0)
+	if boundedExpiresAt <= now then
+		-- The route already carries the same authoritative expiry and will be
+		-- rejected by the lobby even if MemoryStore's physical eviction lags.
+		return true
+	end
+	local lifetime = math.max(1, math.min(
+		partyConfig.SessionLifetimeSeconds,
+		boundedExpiresAt - now
+	))
+	if expectedDetachedProfile and (
+		profilesByUserId[userId] ~= expectedDetachedProfile
+		or expectedDetachedProfile.detached ~= true
+		or expectedDetachedProfile.guestGraceSerial ~= expectedGraceSerial
+	) then
+		return true
+	end
+	local guardCancelled = false
+	local ok, result = pcall(function()
+		return rejoinMap:UpdateAsync("rejoin:" .. tostring(userId), function(route)
+			if expectedDetachedProfile and (
+				profilesByUserId[userId] ~= expectedDetachedProfile
+				or expectedDetachedProfile.detached ~= true
+				or expectedDetachedProfile.guestGraceSerial ~= expectedGraceSerial
+			) then
+				guardCancelled = true
+				return nil
+			end
+			if type(route) ~= "table" or route.sessionId ~= partySession.id
+				or type(route.accessCode) ~= "string" or route.accessCode == ""
+			then
+				return nil
+			end
+			route.expiresAt = boundedExpiresAt
+			route.updatedAt = now
+			return route
+		end, lifetime)
+	end)
+	local updated = ok and type(result) == "table" and result.sessionId == partySession.id
+	if not updated and not guardCancelled then
+		warn("[CooperGame] Could not update rejoin route for " .. tostring(userId)
+			.. ": " .. tostring(result))
+	end
+	return updated or guardCancelled
+end
+
+local function rejoinRouteExpiration(userId, sessionState, renewedExpiresAt, hostGraceExpiresAt)
+	local activePlayer = partySession.activePlayers[userId]
+	local activeProfile = profilesByUserId[userId]
+	if activePlayer and activePlayer.Parent == Players
+		and activeProfile and activeProfile.player == activePlayer
+		and activeProfile.loaded and not activeProfile.releasing
+		and not activeProfile.leaseLost and activeProfile.detached ~= true
+		and (dataStore == nil or activeProfile.leaseOwned == true)
+	then
+		return renewedExpiresAt
+	end
+	if userId == partySession.hostUserId and sessionState == "HostGrace" then
+		local expiry = math.floor(tonumber(hostGraceExpiresAt) or 0)
+		return expiry > unixNow() and expiry or nil
+	end
+	-- Detached guest routes are written once, with a serial guard, by the
+	-- disconnect handler. Heartbeats deliberately leave them untouched so an
+	-- in-flight reconnect cannot be shortened back to an old grace deadline.
+	-- An expected guest who has not yet arrived keeps the lobby-issued 90-second
+	-- admission deadline. Merely heartbeating the house must never renew it.
+	return nil
+end
+
 local function syncSessionManifest(sessionState, hostGraceExpiresAt)
 	if RunService:IsStudio() or partySession.studioSynthetic then
 		return true
@@ -316,21 +399,14 @@ local function syncSessionManifest(sessionState, hostGraceExpiresAt)
 		if sessionState == "Closed" then
 			pcall(rejoinMap.RemoveAsync, rejoinMap, key)
 		else
-			local routeOk, routeFailure = pcall(function()
-				return rejoinMap:UpdateAsync(key, function(route)
-					if type(route) ~= "table" or route.sessionId ~= partySession.id
-						or type(route.accessCode) ~= "string" or route.accessCode == ""
-					then
-						return nil
-					end
-					route.expiresAt = renewedExpiresAt
-					route.updatedAt = unixNow()
-					return route
-				end, partyConfig.SessionLifetimeSeconds)
-			end)
-			if not routeOk then
-				warn("[CooperGame] Could not renew rejoin route for " .. tostring(userId)
-					.. ": " .. tostring(routeFailure))
+			local routeExpiresAt = rejoinRouteExpiration(
+				userId,
+				sessionState,
+				renewedExpiresAt,
+				hostGraceExpiresAt
+			)
+			if routeExpiresAt then
+				updateMemberRejoinRoute(userId, routeExpiresAt)
 			end
 		end
 	end
@@ -670,9 +746,69 @@ local function profileDataNeedsCanonicalRewrite(rawData, sanitizedData)
 	return false
 end
 
+local function sanitizeCalmTaskCheckpoint(raw)
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local taskId = type(raw.taskId) == "string" and raw.taskId or ""
+	local logicalId = type(raw.logicalId) == "string" and raw.logicalId or ""
+	local hostUserId = finiteInteger(raw.hostUserId, 0, 1, 9_007_199_254_740_991)
+	local hostOrdinal = finiteInteger(raw.hostOrdinal, 0, 1, 10_000_001)
+	if finiteInteger(raw.version, 0, 0, 100) ~= 1
+		or not taskById[taskId]
+		or #logicalId < 8 or #logicalId > 96
+		or hostUserId <= 0 or hostOrdinal <= 0
+	then
+		return nil
+	end
+	local rawEligible = type(raw.eligibleUserIds) == "table" and raw.eligibleUserIds or {}
+	local eligibleUserIds = {}
+	local seen = {}
+	for _, rawUserId in ipairs(rawEligible) do
+		local userId = finiteInteger(rawUserId, 0, 1, 9_007_199_254_740_991)
+		if userId > 0 and not seen[userId] and #eligibleUserIds < partyConfig.MaxMembers then
+			seen[userId] = true
+			table.insert(eligibleUserIds, userId)
+		end
+	end
+	table.sort(eligibleUserIds)
+	if #eligibleUserIds == 0 or not seen[hostUserId] then
+		return nil
+	end
+	local markerName = type(raw.markerName) == "string" and string.sub(raw.markerName, 1, 64) or ""
+	local plushKind = raw.plushKind == "Rabbit" and "Rabbit" or "Teddy Bear"
+	local bankPreviewStepSeconds = tonumber(raw.bankPreviewStepSeconds)
+	if not bankPreviewStepSeconds or bankPreviewStepSeconds ~= bankPreviewStepSeconds
+		or bankPreviewStepSeconds == math.huge or bankPreviewStepSeconds == -math.huge
+	then
+		bankPreviewStepSeconds = 0.78
+	end
+	return {
+		version = 1,
+		logicalId = logicalId,
+		taskId = taskId,
+		hostUserId = hostUserId,
+		hostOrdinal = hostOrdinal,
+		eligibleUserIds = eligibleUserIds,
+		startedAtUnix = finiteInteger(raw.startedAtUnix, 0, 0, 4_102_444_800),
+		recoveryGraceExpiresAt = finiteInteger(raw.recoveryGraceExpiresAt, 0, 0, 4_102_444_800),
+		markerName = markerName,
+		plushKind = plushKind,
+		bankCycle = finiteInteger(raw.bankCycle, 1, 1, 1_000_001),
+		bankReward = finiteInteger(raw.bankReward, 0, 0, 2_000_000_000),
+		bankPreviewStepSeconds = math.clamp(bankPreviewStepSeconds, 0.05, 10),
+		bankStartingLength = finiteInteger(raw.bankStartingLength, 2, 1, 100),
+	}
+end
+
 local function sanitizeData(raw)
 	local originalRaw = raw
 	raw = type(raw) == "table" and raw or {}
+	-- Schema 12 stores the exactly-once record beside the value it protects.
+	-- TransactionLedger applies strict bounds and drops malformed/duplicate
+	-- records before this profile can be written back to production storage.
+	local operationJournal = TransactionLedger.sanitize(raw.operationJournal)
+	local calmTaskCheckpoint = sanitizeCalmTaskCheckpoint(raw.calmTaskCheckpoint)
 	-- A placed unit necessarily includes its purchase entitlement. This repairs
 	-- an impossible partial save without taking an already-installed item away.
 	local boomboxPlaced = raw.boomboxPlaced == true
@@ -736,6 +872,7 @@ local function sanitizeData(raw)
 		or ""
 	local sanitized = {
 		schemaVersion = Config.SchemaVersion,
+		operationJournal = operationJournal,
 		allowance = finiteInteger(raw.allowance, 0, 0, 2_000_000_000),
 		machineStage = finiteInteger(raw.machineStage, 0, 0, #Config.MachineStages),
 		pendingPartStage = finiteInteger(raw.pendingPartStage, 0, 0, #Config.MachineStages),
@@ -779,6 +916,9 @@ local function sanitizeData(raw)
 		candyDeliveryToken = candyDeliveryToken,
 		candyBatchesSold = finiteInteger(raw.candyBatchesSold, 0, 0, 10_000_000),
 	}
+	if calmTaskCheckpoint then
+		sanitized.calmTaskCheckpoint = calmTaskCheckpoint
+	end
 	return sanitized, profileDataNeedsCanonicalRewrite(originalRaw, sanitized)
 end
 
@@ -1901,17 +2041,19 @@ local function saveProfile(player, releasing)
 		profile.releasing = true
 	end
 	if profile.saving then
-		if not releasing then
-			return true
-		end
-		-- A leaving player must not discard a mutation made after an earlier
-		-- save captured its payload. Wait for that writer, then save any newer
-		-- revision before allowing the profile table to be released.
+		-- Never report a transaction durable merely because an older writer is
+		-- active. Wait for that writer to verify its captured revision; if this
+		-- profile changed while UpdateAsync yielded, its dirty revision is then
+		-- serialized through the same lease before this caller can return true.
 		repeat
 			task.wait(0.05)
-		until not profile.saving or profiles[player] ~= profile
-		if profiles[player] ~= profile then
-			return true
+		until not profile.saving
+		if profile.player and profiles[profile.player] == profile then
+			-- A guest may have reattached to a replacement Player instance while
+			-- the writer was yielding. Continue against the same retained profile.
+			player = profile.player
+		elseif profiles[player] ~= profile then
+			return not profile.dirty and profile.leaseLost ~= true
 		end
 	end
 	local leaseRenewalDue = dataStore ~= nil
@@ -2016,6 +2158,405 @@ local function saveProfile(player, releasing)
 	return writeComplete and not profile.dirty
 end
 
+-- M1_SERVER_TRANSACTION_JOURNAL_CONTRACT
+-- Operation ids are born here, never in a RemoteEvent payload. Every protected
+-- value mutation and its committed record enter the same schema-12 profile
+-- payload before saveProfile performs its lease-checked UpdateAsync write.
+local TransactionRuntime = {}
+
+function TransactionRuntime.activeSessionId()
+	local sessionId = partySession.id
+	if type(sessionId) ~= "string" or sessionId == "" or #sessionId > 160 then
+		return nil
+	end
+	return sessionId
+end
+
+function TransactionRuntime.operationJournalFor(profile)
+	local journal = profile and profile.data and profile.data.operationJournal or nil
+	if type(journal) ~= "table"
+		or type(journal.pending) ~= "table"
+		or type(journal.committed) ~= "table"
+	then
+		journal = TransactionLedger.sanitize(journal)
+		profile.data.operationJournal = journal
+		markDirty(profile)
+	end
+	return journal
+end
+
+function TransactionRuntime.findLogicalOperation(profile, operationKind)
+	local journal = TransactionRuntime.operationJournalFor(profile)
+	for index = #journal.pending, 1, -1 do
+		local record = journal.pending[index]
+		if record.kind == operationKind and record.userId == profile.player.UserId then
+			return record
+		end
+	end
+	for index = #journal.committed, 1, -1 do
+		local record = journal.committed[index]
+		if record.kind == operationKind and record.userId == profile.player.UserId then
+			return record
+		end
+	end
+	return nil
+end
+
+function TransactionRuntime.hasBlockingReconciliation(profile)
+	local journal = profile and profile.data and profile.data.operationJournal or nil
+	if type(journal) ~= "table" or type(journal.pending) ~= "table" then
+		return false
+	end
+	for _, record in ipairs(journal.pending) do
+		if type(record) == "table" and record.state == "NeedsReconciliation" then
+			return true
+		end
+	end
+	return false
+end
+
+function TransactionRuntime.deepCopy(value, seen)
+	if type(value) ~= "table" then
+		return value
+	end
+	seen = seen or {}
+	if seen[value] then
+		return seen[value]
+	end
+	local copy = {}
+	seen[value] = copy
+	for key, child in pairs(value) do
+		copy[TransactionRuntime.deepCopy(key, seen)] = TransactionRuntime.deepCopy(child, seen)
+	end
+	return copy
+end
+
+function TransactionRuntime.safeSave(profile)
+	local currentPlayer = profile and profile.player or nil
+	if not currentPlayer or profiles[currentPlayer] ~= profile then
+		return false, "ProfileDetachedFromRegistry"
+	end
+	local ok, savedOrFailure = pcall(saveProfile, currentPlayer, false)
+	if not ok then
+		return false, tostring(savedOrFailure)
+	end
+	if savedOrFailure == true then
+		return true, nil
+	end
+	return false, "SaveUnconfirmed"
+end
+
+function TransactionRuntime.afterReconciliation(profile)
+	profile.transactionReconciliationBlocked = TransactionRuntime.hasBlockingReconciliation(profile)
+	local currentPlayer = profile.player
+	if currentPlayer and profiles[currentPlayer] == profile and currentPlayer.Parent == Players then
+		if TransactionRuntime.recoverWorld and partyIsHost(currentPlayer) then
+			TransactionRuntime.recoverWorld(profile, currentPlayer)
+		end
+		broadcastState()
+	end
+end
+
+function TransactionRuntime.deferReconciliationSave(profile, operationId, retryNumber, ownsSchedule)
+	profile.reconciliationScheduled = profile.reconciliationScheduled or {}
+	if ownsSchedule ~= true then
+		if profile.reconciliationScheduled[operationId] ~= nil then
+			return
+		end
+		profile.reconciliationScheduled[operationId] = true
+	end
+	retryNumber = finiteInteger(retryNumber, 0, 0, 20)
+	local delaySeconds = retryNumber == 0 and 0 or math.min(2 ^ (retryNumber - 1), 30)
+	task.delay(delaySeconds, function()
+		while profile and profile.transactionInFlight do
+			task.wait(0.05)
+		end
+		local currentPlayer = profile and profile.player or nil
+		if not currentPlayer or profiles[currentPlayer] ~= profile
+			or not profile.loaded or profile.releasing or profile.leaseLost
+		then
+			profile.reconciliationScheduled[operationId] = nil
+			return
+		end
+		local journal = TransactionRuntime.operationJournalFor(profile)
+		local record = TransactionLedger.lookup(journal, operationId)
+		if not record or record.state == "Committed" or record.state == "RolledBack" then
+			profile.reconciliationScheduled[operationId] = nil
+			TransactionRuntime.afterReconciliation(profile)
+			return
+		end
+		local result = record.result
+		if record.state ~= "NeedsReconciliation"
+			or type(result) ~= "table" or result.reconciliationCode ~= "SAVE_UNCONFIRMED"
+		then
+			profile.transactionReconciliationBlocked = true
+			profile.reconciliationScheduled[operationId] = "Manual"
+			warn("[CooperGame] Manual reconciliation required for operation " .. tostring(operationId))
+			return
+		end
+
+		profile.transactionInFlight = true
+		local saved, saveFailure = TransactionRuntime.safeSave(profile)
+		if not saved then
+			profile.transactionInFlight = false
+			warn(string.format(
+				"[CooperGame] Operation %s remains marked NeedsReconciliation after a failed follow-up save: %s",
+				tostring(operationId),
+				tostring(saveFailure)
+			))
+			TransactionRuntime.deferReconciliationSave(profile, operationId, retryNumber + 1, true)
+			return
+		end
+
+		-- Once the value and SAVE_UNCONFIRMED marker have been verified in one
+		-- payload, finalizing the same record requires no second value mutation.
+		-- A failure of this metadata-only write returns it to reconciliation.
+		journal = TransactionRuntime.operationJournalFor(profile)
+		record = TransactionLedger.lookup(journal, operationId)
+		result = record and record.result or nil
+		if record and record.state == "NeedsReconciliation"
+			and type(result) == "table" and result.reconciliationCode == "SAVE_UNCONFIRMED"
+		then
+			local committed = TransactionLedger.commit(journal, operationId, result, unixNow())
+			if committed then
+				markDirty(profile)
+				local metadataSaved = TransactionRuntime.safeSave(profile)
+				if not metadataSaved then
+					TransactionLedger.markNeedsReconciliation(
+						journal,
+						operationId,
+						"Reconciliation metadata save could not be verified",
+						"SAVE_UNCONFIRMED"
+					)
+					markDirty(profile)
+					profile.transactionInFlight = false
+					TransactionRuntime.deferReconciliationSave(profile, operationId, retryNumber + 1, true)
+					return
+				end
+			end
+		end
+		profile.transactionInFlight = false
+		profile.reconciliationScheduled[operationId] = nil
+		TransactionRuntime.afterReconciliation(profile)
+	end)
+end
+
+function TransactionRuntime.resumePersistedReconciliations(profile)
+	local journal = TransactionRuntime.operationJournalFor(profile)
+	local pendingSnapshot = table.clone(journal.pending)
+	local retiredAbandonedReservation = false
+	for _, record in ipairs(pendingSnapshot) do
+		if record.state == "NeedsReconciliation" then
+			TransactionRuntime.deferReconciliationSave(profile, record.id, 0)
+		elseif record.state == "Pending" then
+			-- Authoritative code never yields between reservation and mutation. A
+			-- raw Pending record recovered from storage therefore represents an
+			-- abandoned pre-mutation reservation, not an applied value.
+			TransactionLedger.rollback(journal, record.id, "AbandonedReservationOnLoad", unixNow())
+			retiredAbandonedReservation = true
+		end
+	end
+	if retiredAbandonedReservation then
+		markDirty(profile)
+	end
+end
+
+-- Reserve the immutable identity before any save can yield. The caller may
+-- publish a `Committing` eligibility state immediately, preventing a grace
+-- expiry callback from forfeiting an operation that is already in progress.
+function TransactionRuntime.reserveProfileValueOperation(profile, kind, value, expectedSessionId)
+	if not profile or not profile.loaded or profile.releasing or profile.leaseLost
+		or profile.transactionReconciliationBlocked == true
+	then
+		return nil, "ProfileNotWritable"
+	end
+	local activeSessionId = TransactionRuntime.activeSessionId()
+	if not activeSessionId or activeSessionId ~= expectedSessionId then
+		return nil, "StaleSession"
+	end
+	if profile.transactionInFlight then
+		return nil, "TransactionBusy"
+	end
+	local journal = TransactionRuntime.operationJournalFor(profile)
+	local issuedOk, operationRecord = pcall(
+		TransactionLedger.issue,
+		journal,
+		activeSessionId,
+		kind,
+		profile.player.UserId,
+		finiteInteger(value, 0, -2_000_000_000, 2_000_000_000),
+		finiteInteger(profile.revision, 0, 0, 2_000_000_000),
+		unixNow(),
+		HttpService:GenerateGUID(false)
+	)
+	if not issuedOk then
+		warn("[CooperGame] Could not issue an authoritative operation: " .. tostring(operationRecord))
+		return nil, "OperationIssueFailed"
+	end
+	local beganOk, began, existing = pcall(TransactionLedger.begin, journal, operationRecord)
+	if not beganOk then
+		warn("[CooperGame] Transaction journal rejected a new operation: " .. tostring(began))
+		return nil, "JournalCapacity"
+	end
+	if not began then
+		return existing, "DuplicateOperation"
+	end
+	markDirty(profile)
+	return operationRecord, "Reserved"
+end
+
+-- Returns accepted, durable, appliedNow, operationRecord, statusCode.
+-- accepted means the authoritative mutation is represented in this live
+-- profile. durable means a lease-owned write containing both the value and
+-- committed record was verified. A save failure never invokes mutate again;
+-- the same record moves to NeedsReconciliation and a value-only retry is
+-- forbidden.
+function TransactionRuntime.commitProfileValueOperation(
+	profile,
+	kind,
+	value,
+	operationId,
+	expectedSessionId,
+	mutate,
+	authorize
+)
+	if not profile or not profile.loaded or profile.releasing or profile.leaseLost then
+		return false, false, false, nil, "ProfileNotWritable"
+	end
+	local activeSessionId = TransactionRuntime.activeSessionId()
+	if not activeSessionId or expectedSessionId ~= activeSessionId then
+		return false, false, false, nil, "StaleSession"
+	end
+	if type(kind) ~= "string" or type(mutate) ~= "function" then
+		return false, false, false, nil, "InvalidServerOperation"
+	end
+	while profile.transactionInFlight do
+		task.wait(0.05)
+		if not profile.loaded or profile.releasing or profile.leaseLost
+			or TransactionRuntime.activeSessionId() ~= expectedSessionId
+		then
+			return false, false, false, nil, "StaleOrClosedWhileQueued"
+		end
+	end
+	local journal = TransactionRuntime.operationJournalFor(profile)
+	local existing = type(operationId) == "string" and TransactionLedger.lookup(journal, operationId) or nil
+	if existing then
+		if not TransactionLedger.sessionMatches(existing, activeSessionId) then
+			return false, false, false, existing, "StaleSession"
+		end
+		if existing.kind ~= kind or existing.userId ~= profile.player.UserId
+			or existing.value ~= finiteInteger(value, 0, -2_000_000_000, 2_000_000_000)
+		then
+			return false, false, false, existing, "OperationIdentityMismatch"
+		end
+		-- A retry is answered from the terminal server-issued record before current
+		-- purchase preconditions are evaluated. Entitlement state normally changes
+		-- because the first attempt succeeded; that must not turn an exactly-once
+		-- committed retry into AuthorityRevoked.
+		if existing.state == "Committed" then
+			return true, true, false, existing, "AlreadyCommitted"
+		elseif existing.state == "RolledBack" then
+			return false, true, false, existing, "RolledBack"
+		elseif existing.state == "NeedsReconciliation" then
+			TransactionRuntime.deferReconciliationSave(profile, operationId, 0)
+			return true, false, false, existing, "NeedsReconciliation"
+		elseif existing.state ~= "Pending" then
+			return false, false, false, existing, "InvalidOperationState"
+		end
+	elseif operationId ~= nil then
+		return false, false, false, nil, "UnknownServerOperation"
+	end
+	if profile.transactionReconciliationBlocked == true then
+		-- A profile-wide ambiguous save blocks every new/Pending value mutation,
+		-- but it must not hide an authoritative terminal answer above (including
+		-- the exact NeedsReconciliation record responsible for this flag).
+		return false, false, false, existing, "ProfileNotWritable"
+	end
+
+	-- Authorization protects only a mutation that has not happened yet. Terminal
+	-- retries above return their saved result without running mutable world-state
+	-- preconditions a second time.
+	if authorize ~= nil then
+		local authorizeOk, authorized, denial = pcall(authorize)
+		if not authorizeOk or authorized ~= true then
+			return false, false, false, existing, authorizeOk and tostring(denial or "AuthorityRevoked") or "AuthorityCheckFailed"
+		end
+	end
+
+	if operationId == nil then
+		local reserveStatus
+		existing, reserveStatus = TransactionRuntime.reserveProfileValueOperation(
+			profile,
+			kind,
+			value,
+			expectedSessionId
+		)
+		if not existing then
+			return false, false, false, nil, reserveStatus
+		end
+		operationId = existing.id
+	end
+	if not existing then
+		return false, false, false, nil, "UnknownServerOperation"
+	end
+
+	local operationRecord = existing
+	local beforeData = TransactionRuntime.deepCopy(profile.data)
+	local beforeRevision = profile.revision
+	local beforeDirty = profile.dirty
+	profile.transactionInFlight = true
+	local mutationOk, mutationResult = pcall(mutate, operationRecord)
+	if not mutationOk then
+		-- Restore the exact pre-mutation snapshot, then retire the operation id.
+		-- A callback that changed allowance before throwing cannot leak a debit or
+		-- reward, and the rolled-back id can never be replayed after journal trim.
+		profile.data = beforeData
+		profile.revision = beforeRevision
+		profile.dirty = beforeDirty
+		setAllowance(profile, profile.data.allowance, false)
+		journal = TransactionRuntime.operationJournalFor(profile)
+		TransactionLedger.rollback(journal, operationId, tostring(mutationResult), unixNow())
+		markDirty(profile)
+		TransactionRuntime.safeSave(profile)
+		profile.transactionInFlight = false
+		warn("[CooperGame] Authoritative value mutation failed closed: " .. tostring(mutationResult))
+		return false, false, false, operationRecord, "MutationFailed"
+	end
+
+	local result = type(mutationResult) == "table" and mutationResult or {}
+	local commitOk, committed = pcall(TransactionLedger.commit, journal, operationId, result, unixNow())
+	if not commitOk or not committed then
+		profile.data = beforeData
+		profile.revision = beforeRevision
+		profile.dirty = beforeDirty
+		setAllowance(profile, profile.data.allowance, false)
+		journal = TransactionRuntime.operationJournalFor(profile)
+		TransactionLedger.rollback(journal, operationId, "CommitFailed", unixNow())
+		markDirty(profile)
+		TransactionRuntime.safeSave(profile)
+		profile.transactionInFlight = false
+		return false, false, false, operationRecord, "CommitFailed"
+	end
+
+	markDirty(profile)
+	local durable, saveFailure = TransactionRuntime.safeSave(profile)
+	profile.transactionInFlight = false
+	if not durable then
+		TransactionLedger.markNeedsReconciliation(
+			journal,
+			operationId,
+			"Lease-owned profile save could not be verified: " .. tostring(saveFailure),
+			"SAVE_UNCONFIRMED"
+		)
+		markDirty(profile)
+		profile.transactionReconciliationBlocked = true
+		TransactionRuntime.deferReconciliationSave(profile, operationId, 0)
+		return true, false, true, committed, "NeedsReconciliation"
+	end
+	profile.transactionReconciliationBlocked = false
+	return true, true, true, committed, "Committed"
+end
+
 local function pickHiddenLocation(profile)
 	local previous = partySession.lastHiddenMarker
 	local choices = {}
@@ -2043,6 +2584,27 @@ local returnSavedPartyToLobby
 local closePartyAndReturn
 local recoverHostWorldState
 local automationRunSerial = 0
+
+function TransactionRuntime.retryTaskCompletion(record, fallbackProfile)
+	if not record or partySession.task ~= record or record.status ~= "Completing"
+		or record.completionRetryScheduled == true
+	then
+		return
+	end
+	record.completionRetryScheduled = true
+	task.delay(0.5, function()
+		record.completionRetryScheduled = false
+		if partySession.task ~= record or record.status ~= "Completing" then
+			return
+		end
+		local retryProfile = hostProfile() or fallbackProfile
+		if retryProfile and partyCanProgress() then
+			completeTask(retryProfile, record)
+		else
+			TransactionRuntime.retryTaskCompletion(record, fallbackProfile)
+		end
+	end)
+end
 
 local function armTaskAutomation(record, definition)
 	if not record or not definition or record.automated == true then
@@ -2168,10 +2730,381 @@ local function automationRunIsActive(profile, upgradeId)
 	return false
 end
 
+-- M1_TASK_ELIGIBILITY_CONTRACT
+-- A task's earners are captured exactly once at the authoritative start. The
+-- frozen identity set is never recomputed from whoever happens to be connected
+-- when the final prompt fires. Resolution is tracked separately so retries and
+-- reconnects cannot manufacture a second identity or a duplicate payout.
+local function captureTaskEligibility(version)
+	local userIds = {}
+	local memberSet = {}
+	for userId, player in pairs(partySession.activePlayers) do
+		local profile = profilesByUserId[userId]
+		if partySession.expectedMembers[userId] == true
+			and player.Parent == Players and profile and profile.player == player
+			and profile.loaded and not profile.releasing and not profile.leaseLost
+			and profile.detached ~= true
+			and (dataStore == nil or profile.leaseOwned == true)
+		then
+			memberSet[userId] = true
+			table.insert(userIds, userId)
+		end
+	end
+	table.sort(userIds)
+	return table.freeze({
+		version = version,
+		capturedAt = serverNow(),
+		userIds = table.freeze(userIds),
+		memberSet = table.freeze(memberSet),
+	})
+end
+
+local function forfeitTaskEligibility(record, userId, reason)
+	if not record or type(record.eligibility) ~= "table"
+		or record.eligibility.memberSet[userId] ~= true
+		or record.eligibilityResolutionByUserId[userId] ~= nil
+	then
+		return false
+	end
+	record.eligibilityResolutionByUserId[userId] = table.freeze({
+		status = "Forfeited",
+		reason = tostring(reason or "EligibilityUnavailable"),
+		resolvedAt = serverNow(),
+	})
+	return true
+end
+
+local function eligibleProfileForTask(record, userId)
+	if not record or type(record.eligibility) ~= "table"
+		or record.eligibility.memberSet[userId] ~= true
+	then
+		return nil, "NotEligibleAtTaskStart"
+	end
+	local profile = profilesByUserId[userId]
+	local activePlayer = partySession.activePlayers[userId]
+	local admittedHydration = activePlayer and activePlayer.Parent == Players
+		and profile and profile.player == activePlayer
+		and hydratingProfiles[profile] == true
+		and not profile.releasing and not profile.leaseLost
+	if admittedHydration then
+		if record.recoveredFromCalmTaskStart == true
+			and unixNow() >= (tonumber(profile.hydrationGraceExpiresAtUnix) or 0)
+		then
+			return nil, "RecoveredTaskGraceExpired"
+		end
+		-- An admitted identity loading its exact profile is neither absent nor yet
+		-- writable. Preserve it until the bounded admission deadline; completion
+		-- retries after hydration instead of forfeiting at the recovery boundary.
+		return nil, "ProfileLoading"
+	end
+	if not profile or not profile.loaded or profile.releasing or profile.leaseLost
+		or (dataStore ~= nil and profile.leaseOwned ~= true)
+	then
+		if record.recoveredFromCalmTaskStart == true
+			and unixNow() >= (tonumber(record.recoveryGraceExpiresAt) or math.huge)
+		then
+			return nil, "RecoveredTaskGraceExpired"
+		end
+		return nil, "ProfileNotWritable"
+	end
+	if activePlayer and activePlayer.Parent == Players and profile.player == activePlayer
+		and profile.detached ~= true
+	then
+		return profile, nil
+	end
+	if userId ~= partySession.hostUserId and profile.detached == true then
+		if serverNow() < (tonumber(profile.guestGraceDeadline) or 0) then
+			-- The same retained profile and user id earn the already-captured task;
+			-- a later reconnect merely reattaches this identity.
+			return profile, nil
+		end
+		return nil, "GuestReconnectGraceExpired"
+	end
+	if userId ~= partySession.hostUserId and record.recoveredFromCalmTaskStart == true
+		and unixNow() >= (tonumber(record.recoveryGraceExpiresAt) or math.huge)
+	then
+		return nil, "RecoveredTaskGraceExpired"
+	end
+	return nil, "EligibleMemberUnavailable"
+end
+
+function TransactionRuntime.checkpointValidation(profile, checkpoint)
+	if type(checkpoint) ~= "table" or checkpoint.version ~= 1 then
+		return false, "MissingCheckpoint"
+	end
+	local expectedOrdinal = finiteInteger(profile.data.totalTasks, 0, 0, 10_000_000) + 1
+	if checkpoint.hostUserId ~= partySession.hostUserId
+		or checkpoint.hostUserId ~= profile.player.UserId
+	then
+		return false, "WrongCheckpointHost"
+	end
+	if checkpoint.hostOrdinal < expectedOrdinal then
+		return false, "StaleCheckpoint"
+	elseif checkpoint.hostOrdinal > expectedOrdinal then
+		return false, "FutureCheckpoint"
+	end
+	local expectedTaskId = Config.TaskOrder[((expectedOrdinal - 1) % #Config.TaskOrder) + 1]
+	local expectedLogicalId = string.format(
+		"%d:%d:%s",
+		checkpoint.hostUserId,
+		expectedOrdinal,
+		expectedTaskId
+	)
+	if checkpoint.taskId ~= expectedTaskId or checkpoint.logicalId ~= expectedLogicalId then
+		return false, "CheckpointIdentityMismatch"
+	end
+	return true, nil
+end
+
+function TransactionRuntime.eligibilityFromCheckpoint(checkpoint)
+	local userIds = {}
+	local memberSet = {}
+	for _, userId in ipairs(checkpoint.eligibleUserIds) do
+		memberSet[userId] = true
+		table.insert(userIds, userId)
+	end
+	return table.freeze({
+		version = checkpoint.hostOrdinal,
+		capturedAt = serverNow(),
+		capturedAtUnix = checkpoint.startedAtUnix,
+		userIds = table.freeze(userIds),
+		memberSet = table.freeze(memberSet),
+	})
+end
+
+function TransactionRuntime.armRecoveredEligibilityGrace(profile, record, checkpoint)
+	local expiresAt = finiteInteger(checkpoint.recoveryGraceExpiresAt, 0, 0, 4_102_444_800)
+	if expiresAt <= 0 then
+		return
+	end
+	task.spawn(function()
+		local nextBoundaryUnix = expiresAt
+		while partySession.task == record and record.status ~= "Completed" and not shuttingDown do
+			while partySession.task == record and record.status ~= "Completed"
+				and not shuttingDown and unixNow() < nextBoundaryUnix
+			do
+				task.wait(math.min(1, math.max(0.05, nextBoundaryUnix - unixNow())))
+			end
+			if partySession.task ~= record or record.status == "Completed" or shuttingDown then
+				return
+			end
+
+			local nowUnix = unixNow()
+			local laterBoundaryUnix: number? = nil
+			local resolutionChanged = false
+			for _, userId in ipairs(record.eligibility.userIds) do
+				if userId ~= partySession.hostUserId
+					and record.eligibilityResolutionByUserId[userId] == nil
+				then
+					local activePlayer = partySession.activePlayers[userId]
+					local eligibleProfile = profilesByUserId[userId]
+					local admitted = activePlayer and activePlayer.Parent == Players
+						and eligibleProfile and eligibleProfile.player == activePlayer
+					local active = admitted
+						and eligibleProfile.loaded and not eligibleProfile.releasing
+						and not eligibleProfile.leaseLost and eligibleProfile.detached ~= true
+						and (dataStore == nil or eligibleProfile.leaseOwned == true)
+					local loading = admitted and hydratingProfiles[eligibleProfile] == true
+						and not eligibleProfile.releasing and not eligibleProfile.leaseLost
+					local retainedInGuestGrace = eligibleProfile
+						and eligibleProfile.detached == true
+						and eligibleProfile.loaded and not eligibleProfile.releasing
+						and not eligibleProfile.leaseLost
+						and nowUnix < (tonumber(eligibleProfile.guestGraceUnixExpiresAt) or 0)
+						and (dataStore == nil or eligibleProfile.leaseOwned == true)
+					local retainedWhileLoading = loading
+						and nowUnix < (tonumber(eligibleProfile.hydrationGraceExpiresAtUnix) or 0)
+
+					if retainedInGuestGrace then
+						local boundary = tonumber(eligibleProfile.guestGraceUnixExpiresAt) or nowUnix
+						if laterBoundaryUnix == nil or boundary < laterBoundaryUnix then
+							laterBoundaryUnix = boundary
+						end
+					elseif retainedWhileLoading then
+						local boundary = tonumber(eligibleProfile.hydrationGraceExpiresAtUnix) or nowUnix
+						if laterBoundaryUnix == nil or boundary < laterBoundaryUnix then
+							laterBoundaryUnix = boundary
+						end
+					elseif not active then
+						resolutionChanged = forfeitTaskEligibility(
+							record,
+							userId,
+							"RecoveredTaskGraceExpired"
+						) or resolutionChanged
+					end
+				end
+			end
+			if record.status == "Completing" then
+				TransactionRuntime.retryTaskCompletion(record, profile)
+			end
+			if resolutionChanged then
+				broadcastState()
+			end
+			if not laterBoundaryUnix then
+				return
+			end
+			nextBoundaryUnix = laterBoundaryUnix
+		end
+	end)
+end
+
+function TransactionRuntime.exposeCalmTaskCheckpoint(profile, checkpoint, recovered)
+	if partySession.task or not partyCanProgress() or hostProfile() ~= profile then
+		return false
+	end
+	local valid, invalidReason = TransactionRuntime.checkpointValidation(profile, checkpoint)
+	if not valid then
+		if invalidReason == "StaleCheckpoint" then
+			profile.data.calmTaskCheckpoint = nil
+			profile.calmTaskCheckpointDurable = false
+			markDirty(profile)
+			TransactionRuntime.safeSave(profile)
+		else
+			warn("[CooperGame] CalmTaskStart checkpoint failed closed: " .. tostring(invalidReason))
+		end
+		return false
+	end
+	local id = checkpoint.taskId
+	if not taskCanStart(id) then
+		return false
+	end
+	-- Validate every task-specific dependency before changing the live scheduler.
+	-- A missing marker or an already-running robot must leave the cursor, serial,
+	-- plush rotation, and visible task untouched so the same durable checkpoint
+	-- can be retried without skipping or duplicating work.
+	if id == "MissyPlush"
+		and (checkpoint.markerName == "" or not taskLocation(checkpoint.markerName))
+	then
+		warn("[CooperGame] Recovered Missy task checkpoint has no valid hidden marker")
+		return false
+	end
+	local automationDefinition = automationByTaskId[id]
+	if automationDefinition
+		and profile.data.taskAutomationInstalled[automationDefinition.id] == true
+		and automationRunIsActive(profile, automationDefinition.id)
+	then
+		partySession.nextTaskAt = serverNow() + 1
+		return false
+	end
+	local nextCursor = ((checkpoint.hostOrdinal - 1) % #Config.TaskOrder) + 1
+	local nextSerial = partySession.taskSerial + 1
+	local record = {
+		token = string.format("%s:%d", partySession.id, nextSerial),
+		logicalId = checkpoint.logicalId,
+		sessionId = partySession.id,
+		id = id,
+		step = "Start",
+		startedAt = serverNow(),
+		status = "Active",
+		eligibility = TransactionRuntime.eligibilityFromCheckpoint(checkpoint),
+		eligibilityResolutionByUserId = {},
+		rewardOperationIdsByUserId = {},
+		recoveredFromCalmTaskStart = recovered == true,
+		recoveryGraceExpiresAt = recovered == true and checkpoint.recoveryGraceExpiresAt or 0,
+	}
+	if not recovered then
+		for _, userId in ipairs(record.eligibility.userIds) do
+			if userId ~= partySession.hostUserId and profilesByUserId[userId] == nil then
+				-- This member was active when the durable snapshot was captured but
+				-- exhausted guest grace while the checkpoint save was retrying.
+				forfeitTaskEligibility(record, userId, "GuestGraceExpiredBeforeTaskExposure")
+			end
+		end
+	end
+	if id == "GeorgeBeer" then
+		record.step = "Order"
+	elseif id == "MaryTrash" then
+		record.step = "Pickup"
+	elseif id == "MissyPlush" then
+		record.step = "Search"
+		record.markerName = checkpoint.markerName
+		record.plushKind = checkpoint.plushKind
+	elseif id == BANK_TASK_ID then
+		record.step = "Ready"
+		record.bankCycle = checkpoint.bankCycle
+		record.bankReward = checkpoint.bankReward
+		record.bankPreviewStepSeconds = checkpoint.bankPreviewStepSeconds
+		record.bankStartingLength = checkpoint.bankStartingLength
+	end
+	if automationDefinition
+		and profile.data.taskAutomationInstalled[automationDefinition.id] == true
+	then
+		armTaskAutomation(record, automationDefinition)
+	end
+	-- CALM_TASK_START_EXPOSURE_AFTER_DURABLE_SAVE
+	partySession.taskCursor = nextCursor
+	partySession.taskSerial = nextSerial
+	if id == "MissyPlush" then
+		partySession.nextPlushKind = record.plushKind == "Rabbit" and "Teddy" or "Rabbit"
+	end
+	partySession.task = record
+	profile.calmTaskCheckpointRecovered = false
+	feedback(nil, "TaskStarted", {
+		title = taskById[id].title,
+		requester = taskById[id].requester,
+		text = taskDescription(profile).description,
+		recovered = recovered == true,
+	})
+	if recovered then
+		TransactionRuntime.armRecoveredEligibilityGrace(profile, record, checkpoint)
+	end
+	if record.automated then
+		launchTaskAutomation(profile, record, automationDefinition)
+	end
+	broadcastState()
+	return true
+end
+
+function TransactionRuntime.commitCalmTaskStart(profile, recovered)
+	local checkpoint = profile.data.calmTaskCheckpoint
+	if not checkpoint or profile.calmTaskCheckpointWriteInFlight
+		or profile.transactionInFlight or profile.transactionReconciliationBlocked
+		or serverNow() < (tonumber(profile.calmTaskCheckpointRetryAt) or 0)
+	then
+		return false
+	end
+	local valid, _invalidReason = TransactionRuntime.checkpointValidation(profile, checkpoint)
+	if not valid then
+		return TransactionRuntime.exposeCalmTaskCheckpoint(profile, checkpoint, recovered)
+	end
+	if recovered and checkpoint.recoveryGraceExpiresAt <= 0 then
+		checkpoint.recoveryGraceExpiresAt = unixNow() + partyConfig.GuestReconnectGraceSeconds
+		profile.calmTaskCheckpointDurable = false
+		markDirty(profile)
+	end
+	profile.calmTaskCheckpointWriteInFlight = true
+	local durable = profile.calmTaskCheckpointDurable == true
+	if not durable then
+		durable = TransactionRuntime.safeSave(profile)
+		profile.calmTaskCheckpointDurable = durable == true
+	end
+	profile.calmTaskCheckpointWriteInFlight = false
+	if not durable then
+		profile.calmTaskCheckpointRetryCount = math.min(
+			(tonumber(profile.calmTaskCheckpointRetryCount) or 0) + 1,
+			6
+		)
+		profile.calmTaskCheckpointRetryAt = serverNow()
+			+ math.min(2 ^ (profile.calmTaskCheckpointRetryCount - 1), 30)
+		warn("[CooperGame] CalmTaskStart checkpoint save was not verified; task exposure remains blocked")
+		return false
+	end
+	profile.calmTaskCheckpointRetryCount = 0
+	profile.calmTaskCheckpointRetryAt = 0
+	return TransactionRuntime.exposeCalmTaskCheckpoint(profile, checkpoint, recovered)
+end
+
 local function startNextTask(profile)
 	if not profile or not profile.loaded or not partyIsHost(profile.player)
 		or not partyCanProgress() or partySession.task
 	then
+		return
+	end
+	if profile.data.calmTaskCheckpoint then
+		TransactionRuntime.commitCalmTaskStart(
+			profile,
+			profile.calmTaskCheckpointRecovered == true
+		)
 		return
 	end
 	local order = Config.TaskOrder
@@ -2185,53 +3118,39 @@ local function startNextTask(profile)
 		and profile.data.taskAutomationInstalled[automationDefinition.id] == true
 		and automationRunIsActive(profile, automationDefinition.id)
 	then
-		-- Never stack a second job onto the same physical robot. Keep this exact
-		-- task at the head of the rotation until the first run has returned home.
 		partySession.nextTaskAt = serverNow() + 1
 		return
 	end
-	partySession.taskCursor = nextCursor
-	partySession.taskSerial += 1
-	local record = {
-		token = string.format("%s:%d", partySession.id, partySession.taskSerial),
-		id = id,
-		step = "Start",
-		startedAt = serverNow(),
-		status = "Active",
-		rewardedUserIds = {},
+	local eligibility = captureTaskEligibility(profile.data.totalTasks + 1)
+	if eligibility.memberSet[profile.player.UserId] ~= true then
+		return
+	end
+	local markerName = ""
+	local plushKind = partySession.nextPlushKind == "Rabbit" and "Rabbit" or "Teddy Bear"
+	if id == "MissyPlush" then
+		markerName = pickHiddenLocation(profile).name
+	end
+	local hostOrdinal = finiteInteger(profile.data.totalTasks, 0, 0, 10_000_000) + 1
+	profile.data.calmTaskCheckpoint = {
+		version = 1,
+		logicalId = string.format("%d:%d:%s", profile.player.UserId, hostOrdinal, id),
+		taskId = id,
+		hostUserId = profile.player.UserId,
+		hostOrdinal = hostOrdinal,
+		eligibleUserIds = table.clone(eligibility.userIds),
+		startedAtUnix = unixNow(),
+		recoveryGraceExpiresAt = 0,
+		markerName = markerName,
+		plushKind = plushKind,
+		bankCycle = id == BANK_TASK_ID and (bankHackSuccessCount(profile) + 1) or 1,
+		bankReward = id == BANK_TASK_ID and bankHackReward(profile) or 0,
+		bankPreviewStepSeconds = id == BANK_TASK_ID and bankHackPreviewStep(profile) or 0.78,
+		bankStartingLength = id == BANK_TASK_ID and bankHackStartingLength(profile) or 2,
 	}
-	if id == "GeorgeBeer" then
-		record.step = "Order"
-	elseif id == "MaryTrash" then
-		record.step = "Pickup"
-	elseif id == "MissyPlush" then
-		local location = pickHiddenLocation(profile)
-		record.step = "Search"
-		record.markerName = location.name
-		record.plushKind = partySession.nextPlushKind == "Rabbit" and "Rabbit" or "Teddy Bear"
-		partySession.nextPlushKind = record.plushKind == "Rabbit" and "Teddy" or "Rabbit"
-	elseif id == BANK_TASK_ID then
-		record.step = "Ready"
-		record.bankCycle = bankHackSuccessCount(profile) + 1
-		record.bankReward = bankHackReward(profile)
-		record.bankPreviewStepSeconds = bankHackPreviewStep(profile)
-		record.bankStartingLength = bankHackStartingLength(profile)
-	end
-	if automationDefinition
-		and profile.data.taskAutomationInstalled[automationDefinition.id] == true
-	then
-		armTaskAutomation(record, automationDefinition)
-	end
-	partySession.task = record
-	feedback(nil, "TaskStarted", {
-		title = taskById[id].title,
-		requester = taskById[id].requester,
-		text = taskDescription(profile).description,
-	})
-	if record.automated then
-		launchTaskAutomation(profile, record, automationDefinition)
-	end
-	broadcastState()
+	profile.calmTaskCheckpointDurable = false
+	profile.calmTaskCheckpointRecovered = false
+	markDirty(profile)
+	TransactionRuntime.commitCalmTaskStart(profile, false)
 end
 
 local function scheduleNextTask(profile)
@@ -2256,9 +3175,16 @@ end
 completeTask = function(profile, expectedRecord)
 	local record = expectedRecord or partySession.task
 	if not profile or not partyCanProgress() or not record
-		or partySession.task ~= record or record.status ~= "Active"
+		or partySession.task ~= record
+		or (record.status ~= "Active" and record.status ~= "Completing")
 	then
 		return false
+	end
+	if record.completionWorkerActive == true then
+		-- One coroutine owns recipient reservation, persistence, and finalization.
+		-- Same-frame prompt/robot callbacks observe the in-flight claim and cannot
+		-- advance the shared cursor a second time after the first save yields.
+		return true
 	end
 	local definition = record and taskById[record.id] or nil
 	if not definition then
@@ -2266,43 +3192,241 @@ completeTask = function(profile, expectedRecord)
 	end
 	local reward = finiteInteger(definition.reward, 0, 0, 2_000_000_000)
 	if record.id == BANK_TASK_ID then
-		-- Manual play needs the exact final-key validation bit. Automated play has
-		-- a different proof: an installed HackerBot and the exact authoritative run
-		-- id created by launchTaskAutomation. Neither path can impersonate the other.
-		local automationProfile = hostProfile()
-		local automatedBankProof = automationProfile ~= nil and record.automated == true
-			and record.automationUpgradeId == "HackerBot"
-			and automationProfile.data.taskAutomationInstalled.HackerBot == true
-			and type(record.bankAutomationRunId) == "string"
-			and record.bankAutomationRunId == record.automationRunId
-			and automationProfile.automationRuns[record.automationRunId] == record
-		local manualBankProof = record.automated ~= true and record.bankHackValidated == true
-		if (not automatedBankProof and not manualBankProof) or record.bankSuccessCounted == true then
-			return false
-		end
-		record.bankSuccessCounted = true
+		-- Keep the checkpointed scaled payout stable across save/reconciliation
+		-- retries. Re-entering completeTask while status is Completing must not fall
+		-- back to the task definition's base reward.
 		reward = finiteInteger(record.bankReward, bankHackReward(profile), 0, 2_000_000_000)
+		if record.status == "Active" then
+			-- Manual play needs the exact final-key validation bit. Automated play has
+			-- a different proof: an installed HackerBot and the exact authoritative run
+			-- id created by launchTaskAutomation. Neither path can impersonate the other.
+			local automationProfile = hostProfile()
+			local automatedBankProof = automationProfile ~= nil and record.automated == true
+				and record.automationUpgradeId == "HackerBot"
+				and automationProfile.data.taskAutomationInstalled.HackerBot == true
+				and type(record.bankAutomationRunId) == "string"
+				and record.bankAutomationRunId == record.automationRunId
+				and automationProfile.automationRuns[record.automationRunId] == record
+			local manualBankProof = record.automated ~= true and record.bankHackValidated == true
+			if (not automatedBankProof and not manualBankProof) or record.bankSuccessCounted == true then
+				return false
+			end
+			record.bankSuccessCounted = true
+		end
 	end
 	-- Consume the shared token synchronously before any deferred save, robot
 	-- callback, or duplicate world prompt can observe it as payable.
 	record.status = "Completing"
-	local recipients = presentProfiles()
-	for _, recipient in ipairs(recipients) do
-		local userId = recipient.player.UserId
-		if record.rewardedUserIds[userId] ~= true then
-			record.rewardedUserIds[userId] = true
-			setAllowance(recipient, recipient.data.allowance + reward)
-			recipient.data.totalTasks += 1
-			recipient.data.cycleIndex = math.floor(recipient.data.totalTasks / #Config.TaskOrder) + 1
-			recipient.data.cycleTaskIndex = (recipient.data.totalTasks % #Config.TaskOrder) + 1
-			if record.id == BANK_TASK_ID then
-				recipient.data.bankHackSuccesses = bankHackSuccessCount(recipient) + 1
-			end
-			markDirty(recipient)
+	record.completionWorkerActive = true
+	record.rewardFeedbackByUserId = record.rewardFeedbackByUserId or {}
+	local recipients = {}
+	local payoutUserIds = {}
+	for _, userId in ipairs(record.eligibility.userIds) do
+		if userId ~= partySession.hostUserId then
+			table.insert(payoutUserIds, userId)
 		end
 	end
+	if record.eligibility.memberSet[partySession.hostUserId] == true then
+		table.insert(payoutUserIds, partySession.hostUserId)
+	end
+	for _, userId in ipairs(payoutUserIds) do
+		if userId == partySession.hostUserId then
+			local everyGuestTerminal = true
+			for _, eligibleUserId in ipairs(record.eligibility.userIds) do
+				if eligibleUserId ~= partySession.hostUserId then
+					local guestResolution = record.eligibilityResolutionByUserId[eligibleUserId]
+					if not guestResolution
+						or (guestResolution.status ~= "Committed" and guestResolution.status ~= "Forfeited")
+					then
+						everyGuestTerminal = false
+						break
+					end
+				end
+			end
+			if not everyGuestTerminal then
+				-- The host's totalTasks value is the durable logical-task checkpoint.
+				-- Never advance it while an eligible guest is still reconciling; a
+				-- crash must restart the same host ordinal and recover that guest.
+				break
+			end
+		end
+		local resolution = record.eligibilityResolutionByUserId[userId]
+		if resolution == nil then
+			local recipient, unavailableReason = eligibleProfileForTask(record, userId)
+			if recipient then
+				local operationKind = "TaskReward:" .. tostring(record.logicalId)
+				local operationRecord = TransactionRuntime.findLogicalOperation(recipient, operationKind)
+				local reserveStatus = operationRecord and "ExistingLogicalOperation" or nil
+				if not operationRecord or operationRecord.state == "RolledBack" then
+					operationRecord, reserveStatus = TransactionRuntime.reserveProfileValueOperation(
+						recipient,
+						operationKind,
+						reward,
+						record.sessionId
+					)
+				end
+				if operationRecord and operationRecord.state == "Pending" then
+					record.rewardOperationIdsByUserId[userId] = operationRecord.id
+					resolution = {
+						status = "Committing",
+						operationId = operationRecord.id,
+						reservedAt = serverNow(),
+					}
+					record.eligibilityResolutionByUserId[userId] = resolution
+				elseif operationRecord and operationRecord.state == "NeedsReconciliation" then
+					record.rewardOperationIdsByUserId[userId] = operationRecord.id
+					resolution = {
+						status = "Committing",
+						operationId = operationRecord.id,
+						reservedAt = serverNow(),
+					}
+					record.eligibilityResolutionByUserId[userId] = resolution
+					TransactionRuntime.deferReconciliationSave(recipient, operationRecord.id, 0)
+				elseif operationRecord and operationRecord.state == "Committed" then
+					record.eligibilityResolutionByUserId[userId] = table.freeze({
+						status = "Committed",
+						operationId = operationRecord.id,
+						operationState = "Committed",
+						recovered = true,
+						resolvedAt = serverNow(),
+					})
+					record.rewardFeedbackByUserId[userId] = true
+				elseif reserveStatus == "TransactionBusy" then
+					-- Another exactly-once operation owns this profile. Retry without
+					-- changing the immutable eligibility decision.
+				else
+					warn(string.format(
+						"[CooperGame] Could not reserve task reward for %d: %s",
+						userId,
+						tostring(reserveStatus)
+					))
+				end
+			elseif unavailableReason == "GuestReconnectGraceExpired"
+				or unavailableReason == "RecoveredTaskGraceExpired"
+			then
+				-- Exact expiry is the only rule that can forfeit a captured member.
+				-- Loading, respawn, host pause, and transient save states all retry.
+				forfeitTaskEligibility(record, userId, unavailableReason)
+			end
+			resolution = record.eligibilityResolutionByUserId[userId]
+		end
+
+		if resolution and resolution.status == "Committing" then
+			-- Once reserved, this exact retained profile remains the operation owner
+			-- even if its guest reconnect grace expires. Re-running the initial
+			-- presence rule here could orphan a durable reward and stall the party.
+			local recipient = profilesByUserId[userId]
+			if recipient and (not recipient.loaded or recipient.releasing or recipient.leaseLost
+				or (dataStore ~= nil and recipient.leaseOwned ~= true))
+			then
+				recipient = nil
+			end
+			local operationId = resolution.operationId
+			if recipient and type(operationId) == "string" then
+				local operationKind = "TaskReward:" .. tostring(record.logicalId)
+				local currentOperation = TransactionLedger.lookup(
+					TransactionRuntime.operationJournalFor(recipient),
+					operationId
+				)
+				if currentOperation and currentOperation.state == "Committed"
+					and currentOperation.kind == operationKind
+				then
+					record.eligibilityResolutionByUserId[userId] = table.freeze({
+						status = "Committed",
+						operationId = operationId,
+						operationState = "Committed",
+						resolvedAt = serverNow(),
+					})
+					if record.rewardFeedbackByUserId[userId] ~= true then
+						record.rewardFeedbackByUserId[userId] = true
+						table.insert(recipients, recipient)
+					end
+				elseif currentOperation and currentOperation.state == "NeedsReconciliation" then
+					TransactionRuntime.deferReconciliationSave(recipient, operationId, 0)
+				elseif currentOperation and currentOperation.state == "RolledBack" then
+					record.eligibilityResolutionByUserId[userId] = nil
+					record.rewardOperationIdsByUserId[userId] = nil
+				else
+					local accepted, durable, _, operationRecord, operationStatus = TransactionRuntime.commitProfileValueOperation(
+						recipient,
+						operationKind,
+						reward,
+						operationId,
+						record.sessionId,
+						function()
+							if userId == partySession.hostUserId then
+								local checkpoint = recipient.data.calmTaskCheckpoint
+								assert(
+									type(checkpoint) == "table"
+										and checkpoint.logicalId == record.logicalId
+										and checkpoint.hostOrdinal == recipient.data.totalTasks + 1,
+									"Host CalmTaskStart checkpoint changed before reward commit"
+								)
+							end
+							setAllowance(recipient, recipient.data.allowance + reward)
+							recipient.data.totalTasks += 1
+							recipient.data.cycleIndex = math.floor(recipient.data.totalTasks / #Config.TaskOrder) + 1
+							recipient.data.cycleTaskIndex = (recipient.data.totalTasks % #Config.TaskOrder) + 1
+							if record.id == BANK_TASK_ID then
+								recipient.data.bankHackSuccesses = bankHackSuccessCount(recipient) + 1
+							end
+							if userId == partySession.hostUserId then
+								-- Same profile transaction as host reward/ordinal: a crash can
+								-- observe the old checkpoint or the advanced ordinal, never both.
+								recipient.data.calmTaskCheckpoint = nil
+								recipient.calmTaskCheckpointDurable = false
+							end
+							return {
+								allowance = recipient.data.allowance,
+								totalTasks = recipient.data.totalTasks,
+								taskId = record.id,
+								taskToken = record.token,
+							}
+						end
+					)
+					if accepted and durable then
+						record.eligibilityResolutionByUserId[userId] = table.freeze({
+							status = "Committed",
+							operationId = operationId,
+							operationState = operationRecord and operationRecord.state or operationStatus,
+							resolvedAt = serverNow(),
+						})
+						if record.rewardFeedbackByUserId[userId] ~= true then
+							record.rewardFeedbackByUserId[userId] = true
+							table.insert(recipients, recipient)
+						end
+					elseif not accepted and operationStatus == "RolledBack" then
+						warn("[CooperGame] Rolled-back task reward requires operator review: " .. tostring(operationId))
+					end
+				end
+			end
+		end
+	end
+
+	local allResolved = true
+	for _, userId in ipairs(record.eligibility.userIds) do
+		local resolution = record.eligibilityResolutionByUserId[userId]
+		if not resolution or (resolution.status ~= "Committed" and resolution.status ~= "Forfeited") then
+			allResolved = false
+			break
+		end
+	end
+	if not allResolved then
+		record.completionWorkerActive = false
+		TransactionRuntime.retryTaskCompletion(record, profile)
+		broadcastState()
+		return true
+	end
+	-- Finalizer CAS: no other callback may have replaced or closed this shared
+	-- record while a recipient save yielded.
+	if partySession.task ~= record or record.status ~= "Completing" then
+		record.completionWorkerActive = false
+		return true
+	end
+	record.status = "Completed"
 	partySession.completedTasks += 1
 	partySession.task = nil
+	record.completionWorkerActive = false
 	if record.automated == true then
 		partySession.nextTaskAt = serverNow() + math.max(
 			0.5,
@@ -2320,16 +3444,13 @@ completeTask = function(profile, expectedRecord)
 			automated = record.automated == true,
 			automationUpgradeId = record.automationUpgradeId,
 			text = record.automated == true
-				and string.format("%s accepted the shared chore. Everyone present earned $%d.", tostring(record.automationUpgradeId or "Robot"), reward)
+				and string.format("%s accepted the shared chore. Everyone eligible at task start earned $%d.", tostring(record.automationUpgradeId or "Robot"), reward)
 				or string.format("Shared task complete! You earned $%d allowance.", reward),
 		})
 	end
 	broadcastState()
-	-- Task income is real progression. Persist it immediately just like paid
-	-- purchases so a sudden server shutdown cannot discard a completed chore.
-	for _, recipient in ipairs(recipients) do
-		task.defer(saveProfile, recipient.player, false)
-	end
+	-- Every recipient was synchronously passed through the schema-12 ledger.
+	-- Deferred work may retry a failed save, but it never reapplies the reward.
 	return true
 end
 
@@ -2762,10 +3883,84 @@ local function hostMutationAllowed(profile)
 	if not partyCanProgress() then
 		return false, "Party progression is paused while the host reconnects."
 	end
+	if profile.transactionReconciliationBlocked == true then
+		return false, "This profile has an unresolved value operation and is locked against another charge."
+	end
 	if not partyIsHost(profile.player) or hostProfile() ~= profile then
 		return false, "Only the party host can change this house's permanent upgrades."
 	end
 	return true
+end
+
+function TransactionRuntime.purchaseStillAuthorized(profile, operationKind, price)
+	local allowed, denial = hostMutationAllowed(profile)
+	if not allowed then
+		return false, denial
+	end
+	if profile.data.allowance < price then
+		return false, "Allowance changed while the purchase was queued."
+	end
+	local partPending = profile.data.pendingPartStage > 0
+	local boomboxPending = profile.data.boomboxPurchased and not profile.data.boomboxPlaced
+	local automationPending = profile.data.pendingTaskUpgradeId ~= ""
+	local chemistryPending = profile.data.chemistrySetupPurchased and not profile.data.chemistrySetupPlaced
+	if operationKind == "PurchaseMachinePart" then
+		return not partPending and not boomboxPending and not automationPending and not chemistryPending,
+			"Another delivery became active while this component order was queued."
+	elseif operationKind == "PurchaseBoombox" then
+		return profile.data.boomboxPurchased ~= true and not partPending
+			and not automationPending and not chemistryPending,
+			"The boombox is owned already or another delivery became active."
+	elseif operationKind == "PurchaseBoomboxAutoplay" then
+		return profile.data.boomboxPurchased == true and profile.data.boomboxPlaced == true
+			and profile.data.boomboxAutoplayPurchased ~= true,
+			"The boombox autoplay entitlement changed while this purchase was queued."
+	elseif string.sub(operationKind, 1, 20) == "PurchaseTaskUpgrade:" then
+		local upgradeId = string.sub(operationKind, 21)
+		return automationById[upgradeId] ~= nil
+			and profile.data.taskAutomationInstalled[upgradeId] ~= true
+			and not automationPending and not partPending and not boomboxPending and not chemistryPending,
+			"That robot is owned already or another delivery became active."
+	elseif operationKind == "PurchaseSecretBunker" then
+		return profile.data.secretBunkerPurchased ~= true,
+			"The secret bunker entitlement changed while this purchase was queued."
+	elseif operationKind == "PurchaseChemistrySetup" then
+		return secretBunkerSnapshot(profile).unlocked == true
+			and profile.data.chemistrySetupPurchased ~= true
+			and not partPending and not boomboxPending and not automationPending,
+			"The chemistry entitlement changed or another delivery became active."
+	end
+	return false, "Unknown purchase operation."
+end
+
+function TransactionRuntime.commitHostPurchase(profile, operationKind, price, mutate)
+	local operationSessionId = TransactionRuntime.activeSessionId()
+	if not operationSessionId then
+		return false, false, "StaleSession"
+	end
+	local accepted, durable, _, _, status = TransactionRuntime.commitProfileValueOperation(
+		profile,
+		operationKind,
+		-price,
+		nil,
+		operationSessionId,
+		mutate,
+		function()
+			return TransactionRuntime.purchaseStillAuthorized(profile, operationKind, price)
+		end
+	)
+	if accepted and not durable then
+		feedback(profile.player, "TransactionReconciliation", {
+			title = "SAVING PURCHASE",
+			operation = operationKind,
+			text = "Your purchase is recorded and will not be charged twice while its save is reconciled.",
+		})
+		-- Presentation is reconstructed only after the reconciliation worker has
+		-- verified the debit and entitlement in durable storage. Never dispatch a
+		-- truck, construction sequence, or success toast from an ambiguous save.
+		return false, false, "SavePending"
+	end
+	return accepted and durable, durable, status
 end
 
 local function orderMachinePart(profile, expectedStage)
@@ -2800,13 +3995,26 @@ local function orderMachinePart(profile, expectedStage)
 	if profile.data.allowance < cost then
 		return false, string.format("You need $%d more allowance.", cost - profile.data.allowance)
 	end
-	setAllowance(profile, profile.data.allowance - cost)
-	profile.data.pendingPartStage = definition.stage
+	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+		profile,
+		"PurchaseMachinePart",
+		cost,
+		function()
+			setAllowance(profile, profile.data.allowance - cost)
+			profile.data.pendingPartStage = definition.stage
+			return {
+				allowance = profile.data.allowance,
+				pendingPartStage = definition.stage,
+				item = definition.name,
+			}
+		end
+	)
+	if not purchased then
+		return false, "The component purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
 	profile.partDeliveryStep = "WaitingDelivery"
-	markDirty(profile)
 	queueDelivery(profile, "MachinePart", definition.stage)
 	broadcastState()
-	task.defer(saveProfile, profile.player, false)
 	return true, definition.name, definition.stage, cost
 end
 
@@ -2841,12 +4049,25 @@ local function orderBoombox(profile)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	setAllowance(profile, profile.data.allowance - price)
-	profile.data.boomboxPurchased = true
-	profile.data.boomboxPlaced = false
-	profile.data.boomboxNextPlayAt = 0
+	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+		profile,
+		"PurchaseBoombox",
+		price,
+		function()
+			setAllowance(profile, profile.data.allowance - price)
+			profile.data.boomboxPurchased = true
+			profile.data.boomboxPlaced = false
+			profile.data.boomboxNextPlayAt = 0
+			return {
+				allowance = profile.data.allowance,
+				boomboxPurchased = true,
+			}
+		end
+	)
+	if not purchased then
+		return false, "The boombox purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
 	profile.boomboxDeliveryStep = "WaitingDelivery"
-	markDirty(profile)
 	syncBoomboxPlacedAttribute(profile)
 	queueDelivery(profile, "Boombox", 0)
 	feedback(profile.player, "BoomboxPurchased", {
@@ -2854,7 +4075,6 @@ local function orderBoombox(profile)
 		text = string.format("Boombox ordered for $%d. Watch for the delivery truck.", price),
 	})
 	broadcastState()
-	task.defer(saveProfile, profile.player, false)
 	return true, "Cooper Party Boombox", price
 end
 
@@ -2883,9 +4103,22 @@ local function upgradeBoomboxAutoplay(profile)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	setAllowance(profile, profile.data.allowance - price)
-	profile.data.boomboxAutoplayPurchased = true
-	markDirty(profile)
+	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+		profile,
+		"PurchaseBoomboxAutoplay",
+		price,
+		function()
+			setAllowance(profile, profile.data.allowance - price)
+			profile.data.boomboxAutoplayPurchased = true
+			return {
+				allowance = profile.data.allowance,
+				boomboxAutoplayPurchased = true,
+			}
+		end
+	)
+	if not purchased then
+		return false, "The autoplay purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
 	feedback(profile.player, "BoomboxAutoplayPurchased", {
 		price = price,
 		text = string.format(
@@ -2894,7 +4127,6 @@ local function upgradeBoomboxAutoplay(profile)
 		),
 	})
 	broadcastState()
-	task.defer(saveProfile, profile.player, false)
 	return true, "Boombox Autoplay", price
 end
 
@@ -2945,12 +4177,24 @@ local function orderTaskUpgrade(profile, requestedUpgradeId)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	-- Do not yield between the authoritative balance check, debit, and durable
-	-- pending marker. Roblox processes this section atomically on one Lua thread.
-	setAllowance(profile, profile.data.allowance - price)
-	profile.data.pendingTaskUpgradeId = upgradeId
+	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+		profile,
+		"PurchaseTaskUpgrade:" .. upgradeId,
+		price,
+		function()
+			setAllowance(profile, profile.data.allowance - price)
+			profile.data.pendingTaskUpgradeId = upgradeId
+			return {
+				allowance = profile.data.allowance,
+				pendingTaskUpgradeId = upgradeId,
+				item = definition.name,
+			}
+		end
+	)
+	if not purchased then
+		return false, "The automation purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
 	profile.taskUpgradeDeliveryStep = "WaitingDelivery"
-	markDirty(profile)
 	queueDelivery(profile, "TaskUpgrade", 0, upgradeId)
 	feedback(profile.player, "TaskUpgradeOrdered", {
 		upgradeId = upgradeId,
@@ -2960,7 +4204,6 @@ local function orderTaskUpgrade(profile, requestedUpgradeId)
 		text = string.format("%s ordered for $%d. Watch for the delivery truck.", definition.name, price),
 	})
 	broadcastState()
-	task.defer(saveProfile, profile.player, false)
 	return true, definition.name, price
 end
 
@@ -2990,19 +4233,32 @@ local function orderSecretBunker(profile)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	-- Do not yield between balance validation and these durable mutations.
-	setAllowance(profile, profile.data.allowance - price)
-	profile.data.secretBunkerPurchased = true
-	profile.data.secretBunkerReadyAt = finiteInteger(
+	local readyAt = finiteInteger(
 		unixNow() + constructionSeconds,
 		unixNow() + constructionSeconds,
 		1,
 		4_102_444_800
 	)
+	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+		profile,
+		"PurchaseSecretBunker",
+		price,
+		function()
+			setAllowance(profile, profile.data.allowance - price)
+			profile.data.secretBunkerPurchased = true
+			profile.data.secretBunkerReadyAt = readyAt
+			return {
+				allowance = profile.data.allowance,
+				secretBunkerPurchased = true,
+				secretBunkerReadyAt = readyAt,
+			}
+		end
+	)
+	if not purchased then
+		return false, "The bunker purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
 	profile.secretBunkerCompletionAnnounced = false
-	markDirty(profile)
 
-	local readyAt = profile.data.secretBunkerReadyAt
 	syncSecretBunkerAttributes(profile)
 	feedback(profile.player, "SecretBunkerPurchased", {
 		id = secretBunkerConfig.Id,
@@ -3018,7 +4274,6 @@ local function orderSecretBunker(profile)
 	})
 	broadcastState()
 	requestSecretBunkerPresentation(profile, "Purchased")
-	task.defer(saveProfile, profile.player, false)
 	return true, secretBunkerConfig.Name, price, readyAt
 end
 
@@ -3064,11 +4319,24 @@ local function orderChemistrySetup(profile)
 		return false, string.format("You need $%d more allowance.", price - profile.data.allowance)
 	end
 
-	setAllowance(profile, profile.data.allowance - price)
-	profile.data.chemistrySetupPurchased = true
-	profile.data.chemistrySetupPlaced = false
+	local purchased, _, transactionStatus = TransactionRuntime.commitHostPurchase(
+		profile,
+		"PurchaseChemistrySetup",
+		price,
+		function()
+			setAllowance(profile, profile.data.allowance - price)
+			profile.data.chemistrySetupPurchased = true
+			profile.data.chemistrySetupPlaced = false
+			return {
+				allowance = profile.data.allowance,
+				chemistrySetupPurchased = true,
+			}
+		end
+	)
+	if not purchased then
+		return false, "The chemistry purchase could not be committed safely (" .. tostring(transactionStatus) .. ")."
+	end
 	profile.chemistryDeliveryStep = "WaitingDelivery"
-	markDirty(profile)
 	syncChemistrySetupAttributes(profile)
 	queueDelivery(profile, "ChemistrySetup", 0)
 	feedback(profile.player, "ChemistrySetupPurchased", {
@@ -3082,7 +4350,6 @@ local function orderChemistrySetup(profile)
 		),
 	})
 	broadcastState()
-	task.defer(saveProfile, profile.player, false)
 	return true, chemistrySetupConfig.Name, price
 end
 
@@ -4479,6 +5746,11 @@ recoverHostWorldState = function(profile, player)
 	return true
 end
 
+-- Reconciliation workers are defined before the world-recovery function to
+-- keep transaction logic adjacent to saveProfile. Bind the callback only after
+-- the complete delivery/construction recovery implementation exists.
+TransactionRuntime.recoverWorld = recoverHostWorldState
+
 local function rejectHouseAdmission(player, reason)
 	local message = tostring(reason or "That private party could not be verified.")
 	local lobbyPlaceId = tonumber(partyConfig.LobbyPlaceId) or 0
@@ -4524,14 +5796,20 @@ local function loadPlayer(player)
 	end
 	local retained = profilesByUserId[player.UserId]
 	if retained then
-		if player.UserId ~= partySession.hostUserId
-			or retained.detached ~= true
+		local retainedIsHost = player.UserId == partySession.hostUserId
+		local hostReconnectAllowed = retainedIsHost
+			and partySession.state == "HostGrace"
+			and serverNow() <= partySession.hostGraceDeadline
+		local guestReconnectAllowed = not retainedIsHost
+			and partySession.expectedMembers[player.UserId] == true
+			and partySession.state ~= "Closing"
+			and serverNow() < (tonumber(retained.guestGraceDeadline) or 0)
+		if retained.detached ~= true
 			or retained.loaded ~= true
 			or retained.releasing == true
 			or retained.leaseLost == true
 			or (dataStore ~= nil and retained.leaseOwned ~= true)
-			or partySession.state ~= "HostGrace"
-			or serverNow() > partySession.hostGraceDeadline
+			or (not hostReconnectAllowed and not guestReconnectAllowed)
 		then
 			rejectHouseAdmission(player, "That profile is already active in this party server.")
 			return
@@ -4549,20 +5827,36 @@ local function loadPlayer(player)
 		retained.player = player
 		retained.detached = false
 		retained.releasing = false
+		if not retainedIsHost then
+			-- Invalidate the exact delayed guest-expiry worker associated with the
+			-- previous Player instance before publishing the replacement slot.
+			retained.guestGraceSerial = (retained.guestGraceSerial or 0) + 1
+			retained.guestGraceDeadline = 0
+			retained.guestGraceUnixExpiresAt = 0
+		end
 		retained.allowanceValue = nil
 		profiles[player] = retained
 		profilesByUserId[player.UserId] = retained
 		setupLeaderstats(player, retained)
 		attachCharacterWatch(player, retained)
-		local pausedFor = math.max(0, serverNow() - partySession.pausedAt)
-		if partySession.nextTaskAt < math.huge then
-			partySession.nextTaskAt += pausedFor
+		if retainedIsHost then
+			local pausedFor = math.max(0, serverNow() - partySession.pausedAt)
+			if partySession.nextTaskAt < math.huge then
+				partySession.nextTaskAt += pausedFor
+			end
+			partySession.state = "Active"
+			partySession.hostGraceDeadline = 0
+			partySession.hostGraceUnixExpiresAt = 0
+			partySession.pausedAt = 0
+			syncSessionManifest("InHouse", 0)
+		else
+			-- A connected admitted guest may keep a server-only route for the live
+			-- session. A later disconnect replaces it with a fresh 90-second cap.
+			updateMemberRejoinRoute(
+				player.UserId,
+				unixNow() + partyConfig.SessionLifetimeSeconds
+			)
 		end
-		partySession.state = "Active"
-		partySession.hostGraceDeadline = 0
-		partySession.hostGraceUnixExpiresAt = 0
-		partySession.pausedAt = 0
-		syncSessionManifest("InHouse", 0)
 		player:SetAttribute("CooperGameSchemaVersion", Config.SchemaVersion)
 		player:SetAttribute("CooperGameProfileLoaded", true)
 		setPartyPlayerAttributes(player)
@@ -4570,11 +5864,18 @@ local function loadPlayer(player)
 		syncSecretBunkerAttributes(retained)
 		syncChemistrySetupAttributes(retained)
 		syncCandyDeliveryAttributes(retained)
-		recoverHostWorldState(retained, player)
-		feedback(nil, "HostReconnected", {
-			title = "HOST RECONNECTED",
-			text = "The host is back. Shared tasks and house progression have resumed.",
-		})
+		if retainedIsHost then
+			recoverHostWorldState(retained, player)
+			feedback(nil, "HostReconnected", {
+				title = "HOST RECONNECTED",
+				text = "The host is back. Shared tasks and house progression have resumed.",
+			})
+		else
+			feedback(nil, "GuestReconnected", {
+				title = "PARTY MEMBER RECONNECTED",
+				text = player.DisplayName .. " rejoined within the 90-second grace period.",
+			})
+		end
 		broadcastState()
 		return
 	end
@@ -4603,6 +5904,18 @@ local function loadPlayer(player)
 		leaseLost = false,
 		leaseExpiresAt = 0,
 		revision = 0,
+		transactionInFlight = false,
+		transactionReconciliationBlocked = false,
+		reconciliationScheduled = {},
+		calmTaskCheckpointDurable = false,
+		calmTaskCheckpointRecovered = false,
+		calmTaskCheckpointWriteInFlight = false,
+		calmTaskCheckpointRetryAt = 0,
+		calmTaskCheckpointRetryCount = 0,
+		-- A recovered eligibility snapshot may include this admitted player even
+		-- while its exact DataStore lease is still hydrating. Keep that identity
+		-- eligible only through this bounded wall-clock deadline.
+		hydrationGraceExpiresAtUnix = unixNow() + partyConfig.GuestReconnectGraceSeconds,
 		partDeliveryStep = nil,
 		boomboxDeliveryStep = nil,
 		taskUpgradeDeliveryStep = nil,
@@ -4614,6 +5927,9 @@ local function loadPlayer(player)
 		automationRuns = {},
 		deliveryQueued = {},
 		detached = false,
+		guestGraceSerial = 0,
+		guestGraceDeadline = 0,
+		guestGraceUnixExpiresAt = 0,
 		closeRequested = false,
 	}
 	profiles[player] = profile
@@ -4659,6 +5975,9 @@ local function loadPlayer(player)
 		end
 		local sanitizedData, didNormalize = sanitizeData(result)
 		profile.data = sanitizedData
+		profile.calmTaskCheckpointDurable = sanitizedData.calmTaskCheckpoint ~= nil
+		profile.calmTaskCheckpointRecovered = sanitizedData.calmTaskCheckpoint ~= nil
+		profile.transactionReconciliationBlocked = TransactionRuntime.hasBlockingReconciliation(profile)
 		if didNormalize then
 			-- Rewrite every sanitizer repair, including malformed current-schema
 			-- entitlements, pending ids, and candy tokens. Version-only detection
@@ -4683,7 +6002,16 @@ local function loadPlayer(player)
 		end
 		return
 	end
+	profile.hydrationGraceExpiresAtUnix = 0
 	profile.loaded = true
+	-- A server can stop after persisting the value plus SAVE_UNCONFIRMED marker
+	-- but before persisting the metadata-only Committed transition. Resume that
+	-- exact record on load; never invoke its debit/reward callback again.
+	TransactionRuntime.resumePersistedReconciliations(profile)
+	updateMemberRejoinRoute(
+		player.UserId,
+		unixNow() + partyConfig.SessionLifetimeSeconds
+	)
 	attachCharacterWatch(player, profile)
 	if partyIsHost(player) then
 		partySession.taskCursor = profile.data.totalTasks % #Config.TaskOrder
@@ -4705,6 +6033,11 @@ local function loadPlayer(player)
 	syncChemistrySetupAttributes(profile)
 	syncCandyDeliveryAttributes(profile)
 	if partyIsHost(player) then
+		if profile.data.calmTaskCheckpoint then
+			-- Recover the named safe checkpoint before the ordinary scheduler can
+			-- select or expose a different task.
+			startNextTask(profile)
+		end
 		recoverHostWorldState(profile, player)
 	end
 	if profile.data.candyDeliveryActive then
@@ -4905,6 +6238,104 @@ local function retainFailedProfileRelease(player, profile)
 	end)
 end
 
+-- M1_GUEST_RECONNECT_GRACE_CONTRACT
+-- Unlike host loss, guest loss never pauses shared progression. The exact
+-- already-loaded profile stays leased in this server for 90 seconds so any task
+-- eligibility captured before departure can resolve against the same identity.
+local function beginGuestReconnectGrace(profile, leavingPlayer)
+	profile.detached = true
+	profile.allowanceValue = nil
+	profile.guestGraceSerial = (profile.guestGraceSerial or 0) + 1
+	local graceSerial = profile.guestGraceSerial
+	profile.guestGraceDeadline = serverNow() + partyConfig.GuestReconnectGraceSeconds
+	profile.guestGraceUnixExpiresAt = unixNow() + partyConfig.GuestReconnectGraceSeconds
+	-- Do not yield this PlayerRemoving path before the grace identity and serial
+	-- are fully published. Both deferred operations re-check that exact serial,
+	-- so a very fast rejoin cannot have its renewed route shortened afterward.
+	task.defer(function()
+		if profilesByUserId[leavingPlayer.UserId] == profile
+			and profile.detached == true and profile.guestGraceSerial == graceSerial
+		then
+			saveProfile(leavingPlayer, false)
+		end
+	end)
+	task.spawn(function()
+		updateMemberRejoinRoute(
+			leavingPlayer.UserId,
+			profile.guestGraceUnixExpiresAt,
+			profile,
+			graceSerial
+		)
+	end)
+	feedback(nil, "GuestReconnectGrace", {
+		title = "PARTY MEMBER DISCONNECTED",
+		seconds = partyConfig.GuestReconnectGraceSeconds,
+		deadline = profile.guestGraceDeadline,
+		text = leavingPlayer.DisplayName .. " has 90 seconds to reconnect. Shared tasks continue.",
+	})
+	broadcastState()
+	task.spawn(function()
+		while not shuttingDown and partySession.state ~= "Closing"
+			and profile.detached == true and profile.guestGraceSerial == graceSerial
+		do
+			local remaining = profile.guestGraceDeadline - serverNow()
+			if remaining <= 0 then
+				break
+			end
+			task.wait(math.min(1, remaining))
+		end
+		if shuttingDown or partySession.state == "Closing"
+			or profile.detached ~= true or profile.guestGraceSerial ~= graceSerial
+			or profile.player ~= leavingPlayer
+			or serverNow() < profile.guestGraceDeadline
+		then
+			return
+		end
+		local activeRecord = partySession.task
+		if activeRecord then
+			forfeitTaskEligibility(
+				activeRecord,
+				leavingPlayer.UserId,
+				"GuestReconnectGraceExpired"
+			)
+			local resolution = activeRecord.eligibilityResolutionByUserId
+				and activeRecord.eligibilityResolutionByUserId[leavingPlayer.UserId]
+			-- A reservation made before expiry owns this retained profile until its
+			-- value+record save is confirmed. Releasing the lease here would make the
+			-- shared task wait forever for an identity that can no longer reattach.
+			while resolution and resolution.status == "Committing"
+				and not shuttingDown and partySession.state ~= "Closing"
+				and profilesByUserId[leavingPlayer.UserId] == profile
+				and profile.loaded and not profile.releasing and not profile.leaseLost
+			do
+				local completionProfile = hostProfile()
+				if completionProfile and partyCanProgress() then
+					completeTask(completionProfile, activeRecord)
+				end
+				task.wait(0.25)
+				resolution = activeRecord.eligibilityResolutionByUserId
+					and activeRecord.eligibilityResolutionByUserId[leavingPlayer.UserId]
+			end
+		end
+		local saved = saveProfile(leavingPlayer, true)
+		if profilesByUserId[leavingPlayer.UserId] == profile then
+			profilesByUserId[leavingPlayer.UserId] = nil
+		end
+		if saved then
+			if profiles[leavingPlayer] == profile then
+				profiles[leavingPlayer] = nil
+			end
+		elseif profiles[leavingPlayer] == profile then
+			warn("[CooperGame] Guest grace expired before release persistence succeeded for "
+				.. leavingPlayer.Name .. "; continuing bounded background release retries")
+			retainFailedProfileRelease(leavingPlayer, profile)
+		end
+		if not shuttingDown then
+			broadcastState()
+		end
+	end)
+end
+
 Players.PlayerRemoving:Connect(function(player)
 	local profile = profiles[player]
 	local wasActivePartyPlayer = partySession.activePlayers[player.UserId] == player
@@ -4936,10 +6367,20 @@ Players.PlayerRemoving:Connect(function(player)
 	resetSharedActorForDeparture(player.UserId)
 	clearLeavingPlayerAttributes(player)
 	local hasRemainingPartyMember = next(partySession.activePlayers) ~= nil
-	local healthyRetainedHost = profile and profile.loaded and not profile.releasing
+	local healthyRetainedProfile = profile and profile.loaded and not profile.releasing
 		and not profile.leaseLost and (dataStore == nil or profile.leaseOwned == true)
-	if healthyRetainedHost and wasHost and hasRemainingPartyMember and not shuttingDown then
+	if healthyRetainedProfile and wasHost and hasRemainingPartyMember and not shuttingDown then
 		beginHostReconnectGrace(profile, player)
+		requestNextAt[player] = nil
+		snapshotNextAt[player] = nil
+		bankInputNextAt[player] = nil
+		return
+	end
+	if healthyRetainedProfile and not wasHost and not shuttingDown
+		and partySession.state ~= "Closing"
+		and (hasRemainingPartyMember or partySession.state == "Loading")
+	then
+		beginGuestReconnectGrace(profile, player)
 		requestNextAt[player] = nil
 		snapshotNextAt[player] = nil
 		bankInputNextAt[player] = nil
@@ -4955,6 +6396,9 @@ Players.PlayerRemoving:Connect(function(player)
 		syncSessionManifest("Closed", 0)
 	elseif not hasRemainingPartyMember and partySession.state == "HostGrace" and not shuttingDown then
 		closePartyAndReturn("Nobody remains in the house party. Closing the saved session.")
+	end
+	if not wasHost and profile and partySession.task then
+		forfeitTaskEligibility(partySession.task, player.UserId, "ProfileCouldNotEnterGuestGrace")
 	end
 	local saved = saveProfile(player, true)
 	if not saved and profiles[player] then

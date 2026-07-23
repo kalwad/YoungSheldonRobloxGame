@@ -91,7 +91,9 @@ MemoryStore, physical-device, and complete regression rows remain open.
 | Studio instance | Canonical local source |
 | --- | --- |
 | `ReplicatedStorage.CooperPartyProtocol` | `CooperPartyProtocol.module.luau` |
+| `ReplicatedStorage.CooperUITheme` | `CooperUITheme.module.luau` |
 | `ReplicatedStorage.CooperGame.Config` | `CooperFamilyTaskConfig.module.luau` |
+| `ReplicatedStorage.CooperGame.TransactionLedger` | `CooperTransactionLedger.module.luau` |
 | `ServerScriptService.CooperGame` | `CooperFamilyTaskGame.server.luau` |
 | `ServerScriptService.CooperTaskWorld` | `CooperFamilyTaskWorld.server.luau` |
 | `ServerScriptService.CooperInteractions` | `CooperInteractions.server.luau` |
@@ -107,6 +109,34 @@ deployment inputs.
 
 Required house contracts:
 
+- `Config.SchemaVersion = 12`; every shared task reward and current paid house
+  purchase stores its server-issued operation record in the same profile payload
+  as the allowance/entitlement mutation. `TransactionLedger.MAX_COMMITTED` is at
+  least 256, rollback tombstones have a separate bounded history, and stale
+  party-session records fail closed. A persisted monotonic issuance watermark
+  prevents bounded or out-of-order history from reviving an old operation.
+  Purchase presentation starts only after a durable debit+entitlement write;
+  ambiguous saves reconcile without replaying the mutation.
+- The Milestone 1 journal closure protects shared task payouts and the six paid
+  order operations (machine part, boombox, autoplay, task robot, bunker, and
+  chemistry setup). Physical install acknowledgements and other legacy income
+  paths remain explicitly outside this closure and require their own operation
+  IDs before a later milestone may claim full-economy exactly-once coverage.
+- Before a task becomes visible, the host durably stores the versioned
+  `CalmTaskStart` checkpoint: logical task identity, host ordinal, immutable
+  eligible user IDs, safe task-start details, and recovery timing. A recovered
+  server exposes that same task and gives absent eligible guests one fixed
+  90-second recovery window. Connected players remain eligible; detached guests
+  and admitted profiles still hydrating use their own bounded exact deadlines,
+  with one rescheduled sweep at each later boundary. Failed checkpoint saves use
+  a per-profile single-writer exponential backoff and cannot expose or advance
+  the task. The host-last reward transaction clears the checkpoint in the same
+  payload that advances `totalTasks`.
+- Serialized saves rebuild the sanitized payload for the exact revision on every
+  retry after a yielded write. Existing terminal operation IDs return their saved
+  result before mutable purchase authorization is checked; Pending/new mutations
+  still revalidate current authority, and a profile-wide reconciliation block
+  cannot hide its own terminal or `NeedsReconciliation` record.
 - `Config.ReleasePlayerCap = 4` and the Creator Dashboard house cap is exactly
   four.
 - `Config.Party.LobbyPlaceId = 100748614383412`.
@@ -121,6 +151,7 @@ Required house contracts:
 | Studio instance | Canonical local source |
 | --- | --- |
 | `ReplicatedStorage.CooperPartyProtocol` | `CooperPartyProtocol.module.luau` |
+| `ReplicatedStorage.CooperUITheme` | `CooperUITheme.module.luau` |
 | `ReplicatedStorage.CooperLobby.Config` | `lobby/CooperLobbyConfig.module.luau` |
 | `ServerScriptService.CooperLobby` | `lobby/CooperLobby.server.luau` |
 | `StarterPlayer.StarterPlayerScripts.CooperLobby` | `lobby/CooperLobby.client.luau` |
@@ -133,9 +164,13 @@ scripts, and it does not overwrite existing synchronized source slots. It is
 still role-specific: run it only on the backed-up lobby/start-place copy, never
 on the reserved house place.
 
-The protocol module must be byte-for-byte equivalent in both places. Required
-lobby configuration is `LobbyPlaceId = 100748614383412`, `HousePlaceId =
-98645411943406`, and `UniverseId = 10480337589`. The lobby contains no Cooper
+The protocol and UI-theme modules must be byte-for-byte equivalent in both
+places. During the Studio in-place handoff, `ReplicatedStorage.CooperUITheme`
+remains the lobby-owned shared copy; the inert preview package must not clone a
+second theme module. This source-map addition does not redesign or migrate the
+existing house UI. Required lobby configuration is `LobbyPlaceId =
+100748614383412`, `HousePlaceId = 98645411943406`, and `UniverseId =
+10480337589`. The lobby contains no Cooper
 house task authority, no public matchmaking, and no reserved-server access code
 in replicated state or TeleportData.
 

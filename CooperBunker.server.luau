@@ -1962,6 +1962,12 @@ local blastDoorOpen = false
 local blastDoorMoving = false
 local mainLightsOn = true
 local recoveryDebounce = {}
+local physicalPromptNextAt = {}
+local PHYSICAL_PROMPT_RATE_SECONDS = table.freeze({
+	Hatch = 0.70,
+	BlastDoor = 0.70,
+	MainLights = 0.45,
+})
 
 local function statusTextLabel()
 	local gui = statusConsole:FindFirstChild("BunkerSignGui")
@@ -2175,10 +2181,16 @@ local function setMainLightsState(shouldEnable)
 end
 
 local function playerCharacterState(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") or player.Parent ~= Players then
+		return nil
+	end
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	local root = character and character:FindFirstChild("HumanoidRootPart")
-	if not character or not humanoid or not root or humanoid.Health <= 0 then
+	if not character or not character:IsDescendantOf(Workspace)
+		or not humanoid or humanoid.Health <= 0
+		or not root or not root:IsA("BasePart") or not root:IsDescendantOf(character)
+	then
 		return nil
 	end
 	return character, humanoid, root
@@ -2190,6 +2202,28 @@ local function isNear(player, object, maximumDistance)
 		return false
 	end
 	return (root.Position - object.Position).Magnitude <= maximumDistance
+end
+
+-- Hatch, blast-door, and power controls each get an independent, bounded
+-- per-player budget. This executes before access snapshots or sweep queries so
+-- forged prompt floods cannot amplify expensive server work.
+local function consumePhysicalPromptRate(player, action)
+	local _, _, root = playerCharacterState(player)
+	local cooldown = PHYSICAL_PROMPT_RATE_SECONDS[action]
+	if not root or type(cooldown) ~= "number" then
+		return false
+	end
+	local playerRates = physicalPromptNextAt[player]
+	if not playerRates then
+		playerRates = {}
+		physicalPromptNextAt[player] = playerRates
+	end
+	local now = Workspace:GetServerTimeNow()
+	if now < (playerRates[action] or 0) then
+		return false
+	end
+	playerRates[action] = now + cooldown
+	return true
 end
 
 local function sendNotice(player, text)
@@ -2949,6 +2983,9 @@ local function blastDoorwayOccupied()
 end
 
 hatchPrompt.Triggered:Connect(function(player)
+	if not consumePhysicalPromptRate(player, "Hatch") then
+		return
+	end
 	if not playerHasBunkerAccess(player) then
 		local snapshot = bunkerAccessSnapshot(player)
 		if snapshot.purchased == true and snapshot.unlocked ~= true then
@@ -2981,6 +3018,9 @@ hatchPrompt.Triggered:Connect(function(player)
 end)
 
 blastDoorPrompt.Triggered:Connect(function(player)
+	if not consumePhysicalPromptRate(player, "BlastDoor") then
+		return
+	end
 	if not playerHasBunkerAccess(player) then
 		sendNotice(player, "This bunker belongs to a different construction authorization.")
 		return
@@ -2996,6 +3036,9 @@ blastDoorPrompt.Triggered:Connect(function(player)
 end)
 
 lightPrompt.Triggered:Connect(function(player)
+	if not consumePhysicalPromptRate(player, "MainLights") then
+		return
+	end
 	if not playerHasBunkerAccess(player) then
 		sendNotice(player, "Bunker power controls are locked.")
 		return
@@ -3050,6 +3093,7 @@ end)
 
 Players.PlayerRemoving:Connect(function(player)
 	recoveryDebounce[player] = nil
+	physicalPromptNextAt[player] = nil
 	candyPresentation.removePlayer(player)
 	candyPresentation.eligibleAt[player] = nil
 	if chemistryExperimentOwnerUserId == player.UserId then

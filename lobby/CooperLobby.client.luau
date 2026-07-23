@@ -17,33 +17,85 @@ local requestRemote = remotes:WaitForChild("Request") :: RemoteFunction
 local stateRemote = remotes:WaitForChild("State") :: RemoteEvent
 local clientCommandRemote = remotes:WaitForChild("ClientCommand") :: RemoteEvent
 
--- The lobby borrows its colors from a late-1980s suburban rec room instead of
--- presenting the house as a science-fiction destination. All foreground pairs
--- are intentionally high contrast and status is always communicated in text.
-local THEME = table.freeze({
-	Scrim = Color3.fromRGB(25, 18, 13),
-	Cabinet = Color3.fromRGB(104, 55, 31),
-	CabinetDark = Color3.fromRGB(61, 35, 25),
-	Screen = Color3.fromRGB(27, 37, 30),
-	ScreenRaised = Color3.fromRGB(42, 54, 40),
-	ScreenSoft = Color3.fromRGB(53, 62, 45),
-	Outline = Color3.fromRGB(181, 153, 91),
-	Cream = Color3.fromRGB(255, 244, 207),
-	Muted = Color3.fromRGB(220, 213, 181),
-	Mustard = Color3.fromRGB(238, 179, 54),
-	MustardText = Color3.fromRGB(48, 31, 10),
-	Avocado = Color3.fromRGB(174, 207, 90),
-	Teal = Color3.fromRGB(133, 208, 197),
-	Rust = Color3.fromRGB(255, 151, 112),
-	Disabled = Color3.fromRGB(75, 76, 62),
-})
+local function createLegacyThemeFallback()
+	-- Compatibility only: an older lobby place may receive this LocalScript
+	-- before ReplicatedStorage.CooperUITheme is synchronized. A present but
+	-- invalid module must fail loudly instead of being hidden by this fallback.
+	return table.freeze({
+		VERSION = 1,
+		ID = "Cooper1980sRecRoom.v1",
+		Colors = table.freeze({
+			Scrim = Color3.fromRGB(25, 18, 13),
+			ScrimGradientWarm = Color3.fromRGB(42, 29, 18),
+			ScrimGradientCool = Color3.fromRGB(15, 20, 16),
+			Shadow = Color3.fromRGB(0, 0, 0),
+			Cabinet = Color3.fromRGB(104, 55, 31),
+			CabinetDark = Color3.fromRGB(61, 35, 25),
+			CabinetGradientLight = Color3.fromRGB(129, 72, 39),
+			CabinetGradientDeep = Color3.fromRGB(76, 43, 29),
+			Screen = Color3.fromRGB(27, 37, 30),
+			ScreenRaised = Color3.fromRGB(42, 54, 40),
+			ScreenSoft = Color3.fromRGB(53, 62, 45),
+			ScreenGradientLight = Color3.fromRGB(35, 48, 38),
+			ScreenGradientDark = Color3.fromRGB(20, 28, 24),
+			Outline = Color3.fromRGB(181, 153, 91),
+			Cream = Color3.fromRGB(255, 244, 207),
+			Muted = Color3.fromRGB(220, 213, 181),
+			Mustard = Color3.fromRGB(238, 179, 54),
+			MustardText = Color3.fromRGB(48, 31, 10),
+			Avocado = Color3.fromRGB(174, 207, 90),
+			Teal = Color3.fromRGB(133, 208, 197),
+			TealText = Color3.fromRGB(16, 35, 31),
+			Rust = Color3.fromRGB(255, 151, 112),
+			Disabled = Color3.fromRGB(75, 76, 62),
+		}),
+		Fonts = table.freeze({
+			Body = Enum.Font.Gotham,
+			Medium = Enum.Font.GothamMedium,
+			Strong = Enum.Font.GothamBold,
+			Mono = Enum.Font.RobotoMono,
+		}),
+		Metrics = table.freeze({
+			SpacingUnit = 8,
+			MinimumTouchTarget = 56,
+			ActionHeight = 60,
+		}),
+		Accessibility = table.freeze({
+			BodyTextContrastMinimum = 4.5,
+			LargeTextContrastMinimum = 3,
+			ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets,
+			ClipToDeviceSafeArea = true,
+		}),
+	})
+end
+
+local function loadCooperUITheme()
+	local themeModule = ReplicatedStorage:FindFirstChild("CooperUITheme")
+	if themeModule == nil then
+		warn("[CooperLobby] ReplicatedStorage.CooperUITheme is missing; using embedded v1 compatibility palette for this stale place")
+		return createLegacyThemeFallback()
+	end
+	assert(themeModule:IsA("ModuleScript"), "ReplicatedStorage.CooperUITheme must be a ModuleScript")
+	local theme = require(themeModule)
+	assert(type(theme) == "table" and theme.VERSION == 1, "CooperUITheme v1 is required")
+	assert(type(theme.Colors) == "table", "CooperUITheme.Colors is missing")
+	assert(type(theme.Fonts) == "table", "CooperUITheme.Fonts is missing")
+	assert(type(theme.Metrics) == "table", "CooperUITheme.Metrics is missing")
+	assert(type(theme.Accessibility) == "table", "CooperUITheme.Accessibility is missing")
+	return theme
+end
+
+-- The approved late-1980s rec-room palette now comes from the versioned
+-- cross-place theme. The alias keeps the presentation code compact.
+local UITheme = loadCooperUITheme()
+local THEME = UITheme.Colors
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "CooperLobbyUI"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = false
-gui.ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets
-gui.ClipToDeviceSafeArea = true
+gui.ScreenInsets = UITheme.Accessibility.ScreenInsets
+gui.ClipToDeviceSafeArea = UITheme.Accessibility.ClipToDeviceSafeArea
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 20
 gui.Parent = playerGui
@@ -61,8 +113,8 @@ backdrop.Parent = gui
 
 local backdropGradient = Instance.new("UIGradient")
 backdropGradient.Color = ColorSequence.new({
-	ColorSequenceKeypoint.new(0, Color3.fromRGB(42, 29, 18)),
-	ColorSequenceKeypoint.new(1, Color3.fromRGB(15, 20, 16)),
+	ColorSequenceKeypoint.new(0, THEME.ScrimGradientWarm),
+	ColorSequenceKeypoint.new(1, THEME.ScrimGradientCool),
 })
 backdropGradient.Transparency = NumberSequence.new({
 	NumberSequenceKeypoint.new(0, 0.74),
@@ -75,7 +127,7 @@ backdropGradient.Parent = backdrop
 local shadow = Instance.new("Frame")
 shadow.Name = "CabinetShadow"
 shadow.AnchorPoint = Vector2.new(0.5, 0.5)
-shadow.BackgroundColor3 = Color3.new(0, 0, 0)
+shadow.BackgroundColor3 = THEME.Shadow
 shadow.BackgroundTransparency = 0.46
 shadow.BorderSizePixel = 0
 shadow.ZIndex = 1
@@ -103,9 +155,9 @@ panelStroke.Parent = panel
 
 local cabinetGradient = Instance.new("UIGradient")
 cabinetGradient.Color = ColorSequence.new({
-	ColorSequenceKeypoint.new(0, Color3.fromRGB(129, 72, 39)),
+	ColorSequenceKeypoint.new(0, THEME.CabinetGradientLight),
 	ColorSequenceKeypoint.new(0.48, THEME.Cabinet),
-	ColorSequenceKeypoint.new(1, Color3.fromRGB(76, 43, 29)),
+	ColorSequenceKeypoint.new(1, THEME.CabinetGradientDeep),
 })
 cabinetGradient.Rotation = 22
 cabinetGradient.Parent = panel
@@ -132,8 +184,8 @@ screenStroke.Parent = screen
 
 local screenGradient = Instance.new("UIGradient")
 screenGradient.Color = ColorSequence.new({
-	ColorSequenceKeypoint.new(0, Color3.fromRGB(35, 48, 38)),
-	ColorSequenceKeypoint.new(1, Color3.fromRGB(20, 28, 24)),
+	ColorSequenceKeypoint.new(0, THEME.ScreenGradientLight),
+	ColorSequenceKeypoint.new(1, THEME.ScreenGradientDark),
 })
 screenGradient.Rotation = 75
 screenGradient.Parent = screen
@@ -149,7 +201,7 @@ local eyebrow = Instance.new("TextLabel")
 eyebrow.Name = "Eyebrow"
 eyebrow.Size = UDim2.new(0.63, 0, 0, 20)
 eyebrow.BackgroundTransparency = 1
-eyebrow.Font = Enum.Font.RobotoMono
+eyebrow.Font = UITheme.Fonts.Mono
 eyebrow.Text = "CHANNEL 86  •  MEDFORD, TEXAS"
 eyebrow.TextColor3 = THEME.Mustard
 eyebrow.TextSize = 13
@@ -164,7 +216,7 @@ modeBadge.Position = UDim2.new(1, 0, 0, 0)
 modeBadge.Size = UDim2.new(0.35, 0, 0, 24)
 modeBadge.BackgroundColor3 = THEME.ScreenRaised
 modeBadge.BorderSizePixel = 0
-modeBadge.Font = Enum.Font.GothamBold
+modeBadge.Font = UITheme.Fonts.Strong
 modeBadge.Text = "PRIVATE LOBBY"
 modeBadge.TextColor3 = THEME.Cream
 modeBadge.TextSize = 12
@@ -180,7 +232,7 @@ title.Name = "Title"
 title.Position = UDim2.fromOffset(0, 25)
 title.Size = UDim2.new(1, 0, 0, 39)
 title.BackgroundTransparency = 1
-title.Font = Enum.Font.GothamBold
+title.Font = UITheme.Fonts.Strong
 title.Text = "COOPER HOUSE"
 title.TextColor3 = THEME.Cream
 title.TextSize = 29
@@ -193,7 +245,7 @@ subtitle.Name = "Subtitle"
 subtitle.Position = UDim2.fromOffset(0, 65)
 subtitle.Size = UDim2.new(1, 0, 0, 42)
 subtitle.BackgroundTransparency = 1
-subtitle.Font = Enum.Font.Gotham
+subtitle.Font = UITheme.Fonts.Body
 subtitle.Text = "Play alone or invite up to three friends to your private Cooper house."
 subtitle.TextColor3 = THEME.Muted
 subtitle.TextSize = 15
@@ -209,7 +261,7 @@ notice.Position = UDim2.fromOffset(0, 112)
 notice.Size = UDim2.new(1, 0, 0, 48)
 notice.BackgroundColor3 = THEME.ScreenRaised
 notice.BorderSizePixel = 0
-notice.Font = Enum.Font.GothamMedium
+notice.Font = UITheme.Fonts.Medium
 notice.Text = "Loading your party..."
 notice.TextColor3 = THEME.Muted
 notice.TextSize = 15
@@ -255,9 +307,9 @@ studioBanner.LayoutOrder = 0
 studioBanner.Size = UDim2.new(1, -8, 0, 48)
 studioBanner.BackgroundColor3 = THEME.Teal
 studioBanner.BorderSizePixel = 0
-studioBanner.Font = Enum.Font.GothamBold
+studioBanner.Font = UITheme.Fonts.Strong
 studioBanner.Text = "STUDIO PARTY TEST  •  IN-PLACE HOUSE PREVIEW"
-studioBanner.TextColor3 = Color3.fromRGB(16, 35, 31)
+studioBanner.TextColor3 = THEME.TealText
 studioBanner.TextSize = 14
 studioBanner.TextWrapped = true
 studioBanner.Visible = false
@@ -272,7 +324,7 @@ memberHeading.Name = "MemberHeading"
 memberHeading.LayoutOrder = 10
 memberHeading.Size = UDim2.new(1, -8, 0, 28)
 memberHeading.BackgroundTransparency = 1
-memberHeading.Font = Enum.Font.GothamBold
+memberHeading.Font = UITheme.Fonts.Strong
 memberHeading.Text = "WHO'S PLAYING"
 memberHeading.TextColor3 = THEME.Cream
 memberHeading.TextSize = 17
@@ -301,7 +353,7 @@ actionHeading.Name = "ActionHeading"
 actionHeading.LayoutOrder = 30
 actionHeading.Size = UDim2.new(1, -8, 0, 28)
 actionHeading.BackgroundTransparency = 1
-actionHeading.Font = Enum.Font.GothamBold
+actionHeading.Font = UITheme.Fonts.Strong
 actionHeading.Text = "CHOOSE HOW TO PLAY"
 actionHeading.TextColor3 = THEME.Cream
 actionHeading.TextSize = 17
@@ -331,11 +383,11 @@ local function makeButton(name: string, text: string, order: number, primary: bo
 	button.Name = name
 	button.LayoutOrder = order
 	button.SelectionOrder = order
-	button.Size = UDim2.new(1, 0, 0, 60)
+	button.Size = UDim2.new(1, 0, 0, UITheme.Metrics.ActionHeight)
 	button.AutoButtonColor = false
 	button.BackgroundColor3 = if primary then THEME.Mustard else THEME.ScreenRaised
 	button.BorderSizePixel = 0
-	button.Font = Enum.Font.GothamBold
+	button.Font = UITheme.Fonts.Strong
 	button.Text = text
 	button.TextColor3 = if primary then THEME.MustardText else THEME.Cream
 	button.TextSize = 17
@@ -405,7 +457,7 @@ launchStatus.LayoutOrder = 65
 launchStatus.Size = UDim2.new(1, 0, 0, 46)
 launchStatus.BackgroundColor3 = THEME.ScreenSoft
 launchStatus.BorderSizePixel = 0
-launchStatus.Font = Enum.Font.GothamMedium
+launchStatus.Font = UITheme.Fonts.Medium
 launchStatus.Text = "Waiting for party information."
 launchStatus.TextColor3 = THEME.Muted
 launchStatus.TextSize = 14
@@ -428,7 +480,7 @@ studioNote.Name = "StudioNote"
 studioNote.LayoutOrder = 50
 studioNote.Size = UDim2.new(1, -8, 0, 54)
 studioNote.BackgroundTransparency = 1
-studioNote.Font = Enum.Font.Gotham
+studioNote.Font = UITheme.Fonts.Body
 studioNote.Text = "Studio opens the verified Cooper House inside this playtest. Published builds still use a secure reserved-house teleport."
 studioNote.TextColor3 = THEME.Muted
 studioNote.TextSize = 14
@@ -503,7 +555,7 @@ local function addMemberRow(member: any, order: number)
 	nameLabel.Position = UDim2.new(0, 27, 0, 0)
 	nameLabel.Size = UDim2.new(0.61, -27, 1, 0)
 	nameLabel.BackgroundTransparency = 1
-	nameLabel.Font = Enum.Font.GothamMedium
+	nameLabel.Font = UITheme.Fonts.Medium
 	nameLabel.Text = tostring(member.displayName) .. (if member.isHost then "  • HOST" else "")
 	nameLabel.TextColor3 = THEME.Cream
 	nameLabel.TextSize = 16
@@ -517,7 +569,7 @@ local function addMemberRow(member: any, order: number)
 	statusLabel.Position = UDim2.new(1, -12, 0, 0)
 	statusLabel.Size = UDim2.new(0.39, 0, 1, 0)
 	statusLabel.BackgroundTransparency = 1
-	statusLabel.Font = Enum.Font.GothamBold
+	statusLabel.Font = UITheme.Fonts.Strong
 	statusLabel.Text = if not member.present then "JOINING…" elseif member.ready then "READY  ✓" else "NOT READY"
 	statusLabel.TextColor3 = if member.ready then THEME.Avocado else THEME.Muted
 	statusLabel.TextSize = 13
@@ -606,7 +658,7 @@ local function render(state: any)
 	studioBanner.Visible = isStudio
 	modeBadge.Text = if isStudio then "STUDIO PARTY TEST" else "PRIVATE LOBBY"
 	modeBadge.BackgroundColor3 = if isStudio then THEME.Teal else THEME.ScreenRaised
-	modeBadge.TextColor3 = if isStudio then Color3.fromRGB(16, 35, 31) else THEME.Cream
+	modeBadge.TextColor3 = if isStudio then THEME.TealText else THEME.Cream
 
 	authoritativeSelfReady = state.selfReady == true
 	clearMemberRows()

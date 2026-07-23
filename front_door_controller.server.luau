@@ -2,11 +2,77 @@
 -- Relocation- and obstruction-safe controller for the Cooper front door.
 
 local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
 local door = script.Parent
 assert(door and door:IsA("Model"), "FrontDoorController must be parented to the front-door Model")
 local prompt = door.Parent:WaitForChild("FrontDoorPromptAnchor"):WaitForChild("DoorPrompt") :: ProximityPrompt
+assert(prompt:IsA("ProximityPrompt"), "Front DoorPrompt must be a ProximityPrompt")
+
+-- SECURITY: ProximityPrompt client presentation is not an authority boundary.
+-- Revalidate the exact live player/root and a hard-capped server distance, then
+-- consume this door action's own rate budget before touching physical state.
+local PROMPT_RATE_SECONDS = 0.65
+local PROMPT_DISTANCE_SLACK = 3
+local PROMPT_DISTANCE_HARD_CAP = 16
+local nextPromptAtByPlayer: { [Player]: number } = {}
+
+local function livePlayerRoot(player: Player): BasePart?
+	if typeof(player) ~= "Instance" or not player:IsA("Player") or player.Parent ~= Players then
+		return nil
+	end
+	local partyState = player:GetAttribute("CooperPartyState")
+	if player:GetAttribute("CooperPartyMember") ~= true
+		or player:GetAttribute("CooperGameProfileLoaded") ~= true
+		or (partyState ~= "Active" and partyState ~= "HostGrace")
+	then
+		return nil
+	end
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not character or not character:IsDescendantOf(Workspace)
+		or not humanoid or humanoid.Health <= 0
+		or not root or not root:IsA("BasePart") or not root:IsDescendantOf(character)
+	then
+		return nil
+	end
+	return root
+end
+
+local function promptWorldPosition(): Vector3?
+	local anchor = prompt.Parent
+	if anchor and anchor:IsA("Attachment") then
+		return anchor.WorldPosition
+	elseif anchor and anchor:IsA("BasePart") then
+		return anchor.Position
+	end
+	return nil
+end
+
+local function playerCanReachPrompt(player: Player): boolean
+	local root = livePlayerRoot(player)
+	local position = promptWorldPosition()
+	if not root or not position or not prompt.Enabled or not prompt:IsDescendantOf(Workspace) then
+		return false
+	end
+	local maximumDistance = math.clamp(
+		prompt.MaxActivationDistance + PROMPT_DISTANCE_SLACK,
+		4,
+		PROMPT_DISTANCE_HARD_CAP
+	)
+	return (root.Position - position).Magnitude <= maximumDistance
+end
+
+local function consumePromptRate(player: Player): boolean
+	local now = Workspace:GetServerTimeNow()
+	if now < (nextPromptAtByPlayer[player] or 0) then
+		return false
+	end
+	nextPromptAtByPlayer[player] = now + PROMPT_RATE_SECONDS
+	return true
+end
 
 local closedPivot = door:GetAttribute("ClosedPivot")
 local openPivot = door:GetAttribute("OpenPivot")
@@ -37,6 +103,7 @@ end
 
 door:SetAttribute("ClosedPivot", closedPivot)
 door:SetAttribute("OpenPivot", openPivot)
+door:SetAttribute("IsOpen", isOpen)
 door:SetAttribute("AutomationHoldOpen", false)
 door:SetAttribute("AutomationOriginalOpen", nil)
 
@@ -157,12 +224,21 @@ local function setDoor(open: boolean): boolean
 	return true
 end
 
-prompt.Triggered:Connect(function()
+prompt.Triggered:Connect(function(player: Player)
+	if not playerCanReachPrompt(player) or not consumePromptRate(player)
+		or busy or door.Parent == nil or door:GetAttribute("IsOpen") ~= isOpen
+	then
+		return
+	end
 	if door:GetAttribute("AutomationHoldOpen") == true and isOpen then
 		updatePromptText()
 		return
 	end
-	setDoor(not (door:GetAttribute("IsOpen") == true))
+	setDoor(not isOpen)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	nextPromptAtByPlayer[player] = nil
 end)
 
 local automationCommandInstance = door:FindFirstChild("AutomationDoorCommand")

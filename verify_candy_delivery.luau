@@ -85,7 +85,7 @@ else
 	freshConfig:Destroy()
 end
 local delivery = Config.CandyDelivery
-check(Config.SchemaVersion == 11, "Candy delivery persistence must use schema 11")
+check(Config.SchemaVersion == 12, "Candy delivery persistence must use schema 12")
 check(type(delivery) == "table", "Config.CandyDelivery is missing")
 check(delivery.Id == "blue_rock_candy.delivery", "Candy delivery id changed")
 check(delivery.Name == "Deliver Blue Rock Candy", "Candy delivery player-facing name changed")
@@ -548,7 +548,7 @@ end
 if RunService:IsRunning() then
 	local state = gameRoot:FindFirstChild("State")
 	check(state and state:IsA("Folder"), "Runtime CooperGame.State is missing")
-	check(state:GetAttribute("SchemaVersion") == 11, "Runtime shared state does not expose schema 11")
+	check(state:GetAttribute("SchemaVersion") == 12, "Runtime shared state does not expose schema 12")
 	check(state:GetAttribute("SupportsCandyDelivery") == true, "Runtime shared state has candy delivery disabled")
 	local serverEvents = ServerScriptService:FindFirstChild(Config.ServerEventsName or "CooperGameServerEvents")
 	local familyAPI = serverEvents and serverEvents:FindFirstChild("API")

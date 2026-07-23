@@ -80,7 +80,7 @@ else
 end
 local chemistry = Config.ChemistrySetup
 local candyDelivery = Config.CandyDelivery
-check(Config.SchemaVersion == 11, "Chemistry/candy persistence must use schema 11")
+check(Config.SchemaVersion == 12, "Chemistry/candy persistence must use schema 12")
 check(type(chemistry) == "table", "Config.ChemistrySetup is missing")
 check(chemistry.Id == "chemistry.setup", "Chemistry setup id changed")
 check(chemistry.Name == "Advanced Chemistry Setup", "Chemistry setup name changed")
@@ -99,7 +99,7 @@ check(Config.ProfileDefaults.candyBatchesSold == 0, "Fresh profiles must begin w
 
 local state = gameRoot:FindFirstChild("State")
 check(state and state:IsA("Folder"), "CooperGame.State is missing")
-check(state:GetAttribute("SchemaVersion") == 11, "Shared State must advertise schema 11")
+check(state:GetAttribute("SchemaVersion") == 12, "Shared State must advertise schema 12")
 check(state:GetAttribute("SupportsSecretBunkerUnlock") == true, "Shared State lost bunker progression support")
 check(state:GetAttribute("SupportsBunkerChemistrySetup") == true, "Shared State does not advertise bunker chemistry")
 

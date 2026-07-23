@@ -22,6 +22,7 @@ end
 
 local root = requireChild(ReplicatedStorage, "CooperGame", "Folder")
 local configModule = requireChild(root, "Config", "ModuleScript")
+local transactionLedgerModule = requireChild(root, "TransactionLedger", "ModuleScript")
 local state = requireChild(root, "State", "Folder")
 local remotes = requireChild(root, "Remotes", "Folder")
 for _, name in ipairs({ "Snapshot", "Feedback", "Request", "BankHack" }) do
@@ -40,7 +41,7 @@ else
 	config = require(freshConfig)
 	freshConfig:Destroy()
 end
-assert(config.SchemaVersion == 11, "The personal profile schema must be version 11")
+assert(config.SchemaVersion == 12, "The personal profile schema must be version 12")
 assert(config.DataStoreName == "CooperFamilyTasks_v2", "Unexpected profile DataStore")
 assert(#config.Tasks == 5, "The family loop must contain exactly five task definitions")
 assert(#config.MachineStages == 11, "The Time Machine must retain all 11 stages")
@@ -97,8 +98,21 @@ assert(boombox.DanceBPM == 130, "Boombox dance timing must remain locked to 130 
 assert(math.abs(boombox.DanceBeatOffsetSeconds - 0.16) < 0.000001, "Boombox dance beat offset changed")
 assert(math.abs(boombox.DanceJumpHeight - 1.05) < 0.000001, "Boombox dance jump height changed")
 
+local transactionLedger = require(transactionLedgerModule)
+assert(type(transactionLedger) == "table" and transactionLedger.VERSION == 1, "Transaction ledger v1 is missing")
+assert(transactionLedger.MAX_COMMITTED >= 256, "Transaction journal capacity fell below 256 committed records")
+assert(transactionLedger.MAX_ROLLED_BACK > 0, "Transaction journal rollback tombstones are missing")
+assert(type(transactionLedger.issuedHighWater) == "function", "Persistent transaction issuance watermark is missing")
+
 local defaults = config.ProfileDefaults
-assert(type(defaults) == "table" and defaults.schemaVersion == 11, "Profile defaults are not v11")
+assert(type(defaults) == "table" and defaults.schemaVersion == 12, "Profile defaults are not v12")
+assert(
+	type(defaults.operationJournal) == "table"
+		and defaults.operationJournal.version == 1
+		and #defaults.operationJournal.pending == 0
+		and #defaults.operationJournal.committed == 0,
+	"Fresh profile operation journal is missing or non-empty"
+)
 assert(defaults.allowance == 0 and defaults.machineStage == 0 and defaults.pendingPartStage == 0, "Core profile defaults changed")
 assert(defaults.totalTasks == 0, "Fresh profiles must start with zero completed tasks")
 assert(defaults.boomboxPurchased == false, "Fresh profiles must not own the boombox")
@@ -118,6 +132,15 @@ for _, marker in ipairs({
 	"pendingPartStage",
 	"PlayerRemoving",
 	"BindToClose",
+	"M1_SERVER_TRANSACTION_JOURNAL_CONTRACT",
+	"TransactionRuntime.commitProfileValueOperation(",
+	"TransactionRuntime.commitHostPurchase(",
+	"TransactionRuntime.reserveProfileValueOperation(",
+	"TransactionRuntime.resumePersistedReconciliations(profile)",
+	"TransactionRuntime.purchaseStillAuthorized(profile, operationKind, price)",
+	"local everyGuestTerminal = true",
+	"record.completionWorkerActive = true",
+	"TransactionLedger.markNeedsReconciliation(",
 	"OrderMachinePart",
 		"OrderBoombox",
 		"orderBoombox",
@@ -629,7 +652,7 @@ for _, specification in ipairs({
 	requireChild(serverEvents, specification[1], specification[2])
 end
 
-assert(state:GetAttribute("SchemaVersion") == 11, "Running state does not expose schema version 11")
+assert(state:GetAttribute("SchemaVersion") == 12, "Running state does not expose schema version 12")
 assert(state:GetAttribute("FoundationContract") == "PersonalV4", "Running state does not expose PersonalV4")
 assert(state:GetAttribute("SupportsPaidPartOrdering") == true, "Paid component ordering contract is missing")
 assert(state:GetAttribute("SupportsBoombox") == true, "Boombox ownership/delivery contract is missing")

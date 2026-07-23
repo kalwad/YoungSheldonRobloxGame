@@ -84,13 +84,20 @@ local houseRemoteFolders = {
 local lobbyServer = ServerScriptService:FindFirstChild("CooperLobby")
 local bridge = ServerScriptService:FindFirstChild("StudioHousePreview")
 local lobbyClient = StarterPlayer.StarterPlayerScripts:FindFirstChild("CooperLobby")
+local uiTheme = ReplicatedStorage:FindFirstChild("CooperUITheme")
 check(lobbyServer and lobbyServer:IsA("Script"), "ServerScriptService.CooperLobby is missing")
 check(bridge and bridge:IsA("Script"), "ServerScriptService.StudioHousePreview is missing")
 check(lobbyClient and lobbyClient:IsA("LocalScript"), "StarterPlayerScripts.CooperLobby is missing")
+check(uiTheme and uiTheme:IsA("ModuleScript"), "ReplicatedStorage.CooperUITheme is missing")
 
 local lobbySource = sourceOf(lobbyServer)
 local bridgeSource = sourceOf(bridge)
 local clientSource = sourceOf(lobbyClient)
+local themeSource = sourceOf(uiTheme)
+check(contains(themeSource, "Theme.VERSION = 1"), "CooperUITheme must remain at approved version 1")
+check(contains(themeSource, 'Theme.ID = "Cooper1980sRecRoom.v1"'), "CooperUITheme approved ID changed")
+check(contains(themeSource, "ActionHeight = 60"), "CooperUITheme lost its 60-pixel lobby controls")
+check(contains(themeSource, "Enum.ScreenInsets.CoreUISafeInsets"), "CooperUITheme lost its safe-area contract")
 for _, marker in ipairs({
 	"STUDIO_HOUSE_BRIDGE_UNAVAILABLE",
 	"bridgeLaunch:Invoke",
@@ -117,6 +124,7 @@ for _, marker in ipairs({
 	"controls:Enable()",
 	"camera.CameraType = Enum.CameraType.Custom",
 	"gui:Destroy()",
+	"local UITheme = loadCooperUITheme()",
 }) do
 	check(contains(clientSource, marker), "Lobby client is missing transition cleanup marker: " .. marker)
 end
@@ -125,9 +133,18 @@ local package = ServerStorage:FindFirstChild("StudioHousePreviewPackage")
 check(package and package:IsA("Folder"), "ServerStorage.StudioHousePreviewPackage is missing")
 if package and package:IsA("Folder") then
 	check(typedChild(package, "CooperHouseEnvironment", "Model") ~= nil, "Preview package is missing CooperHouseEnvironment")
-	check(typedChild(package, "CooperGame", "Folder") ~= nil, "Preview package is missing replicated CooperGame folder")
+	local packagedGame = typedChild(package, "CooperGame", "Folder")
+	check(packagedGame ~= nil, "Preview package is missing replicated CooperGame folder")
+	check(
+		packagedGame and typedChild(packagedGame, "TransactionLedger", "ModuleScript") ~= nil,
+		"Preview package is missing CooperGame.TransactionLedger"
+	)
 	check(typedChild(package, "CooperFamilyLocalImages", "Folder") ~= nil, "Preview package is missing local-image asset map")
 	check(typedChild(package, "CooperFamilyLocalAudio", "Folder") ~= nil, "Preview package is missing local-audio asset map")
+	check(
+		typedChild(package, "CooperUITheme", "ModuleScript") == nil,
+		"Preview package must retain the lobby's shared CooperUITheme rather than shadowing it"
+	)
 	for _, name in ipairs(serverNames) do
 		check(typedChild(package, name, "Script") ~= nil, "Preview package is missing server script " .. name)
 	end
@@ -150,7 +167,16 @@ if active then
 	check(Workspace:FindFirstChild("InteractiveFrontDoor") == nil, "Duplicate top-level front door was cloned")
 	check(Workspace:FindFirstChild("InteractiveDenPatioDoor") == nil, "Duplicate top-level patio door was cloned")
 	check(Workspace:FindFirstChild("InteractiveSectionalGarageDoor") == nil, "Duplicate top-level garage door was cloned")
-	check(ReplicatedStorage:FindFirstChild("CooperGame") ~= nil, "Active preview is missing ReplicatedStorage.CooperGame")
+	local activeGame = typedChild(ReplicatedStorage, "CooperGame", "Folder")
+	check(activeGame ~= nil, "Active preview is missing ReplicatedStorage.CooperGame")
+	check(
+		activeGame and typedChild(activeGame, "TransactionLedger", "ModuleScript") ~= nil,
+		"Active preview is missing CooperGame.TransactionLedger"
+	)
+	check(
+		ReplicatedStorage:FindFirstChild("CooperUITheme") == uiTheme,
+		"Studio handoff replaced or removed the lobby's shared CooperUITheme"
+	)
 	for folderName, eventNames in pairs(houseRemoteFolders) do
 		local folder = typedChild(ReplicatedStorage, folderName, "Folder")
 		check(folder ~= nil, "Active preview is missing house remote folder " .. folderName)

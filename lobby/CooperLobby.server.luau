@@ -18,6 +18,7 @@ assert(Config.ProtocolVersion == Protocol.VERSION, "Lobby config and party proto
 assert(Config.MaximumPartySize == Protocol.MAX_PARTY_SIZE, "Lobby and protocol party-size caps differ")
 assert(Config.MinimumPartySize == 1, "Milestone 1 requires solo-party support")
 assert(Config.ArrivalTicketTTLSeconds > 0 and Config.ArrivalTicketTTLSeconds <= 300, "Invalid arrival-ticket lifetime")
+assert(Config.GuestAdmissionGraceSeconds == 90, "Milestone 1 requires a 90-second guest admission window")
 assert(Config.RejoinTicketTTLSeconds > 0 and Config.RejoinTicketTTLSeconds <= 300, "Invalid rejoin-ticket lifetime")
 
 local isStudio = RunService:IsStudio()
@@ -1502,6 +1503,18 @@ local function launchParty(player: Player): (boolean, string?, string?)
 	local ticketIdsByUserId: { [string]: string } = {}
 	for _, userId in ipairs(party.memberUserIds) do
 		local ticketId = Protocol.newOpaqueId("arrival")
+		-- M1_GUEST_ADMISSION_GRACE_CONTRACT
+		-- A guest who never reaches the house must not retain an invitation for the
+		-- full reserved-session lifetime. Once admitted, the house authority renews
+		-- this same server-only route while connected and replaces it with a real
+		-- 90-second route if that guest disconnects. The host has separate recovery
+		-- semantics and therefore keeps the launch-session route here.
+		local rejoinRouteLifetime = if userId == party.hostUserId
+			then Config.SessionTTLSeconds
+			else Config.GuestAdmissionGraceSeconds
+		local arrivalTicketLifetime = if userId == party.hostUserId
+			then Config.ArrivalTicketTTLSeconds
+			else Config.GuestAdmissionGraceSeconds
 		ticketIdsByUserId[tostring(userId)] = ticketId
 		local ticketStored = mapSet("Tickets", "ticket:" .. ticketId, {
 			v = Protocol.VERSION,
@@ -1510,8 +1523,8 @@ local function launchParty(player: Player): (boolean, string?, string?)
 			hostUserId = party.hostUserId,
 			members = table.clone(party.memberUserIds),
 			issuedAt = now,
-			expiresAt = now + Config.ArrivalTicketTTLSeconds,
-		}, Config.ArrivalTicketTTLSeconds)
+			expiresAt = now + arrivalTicketLifetime,
+		}, arrivalTicketLifetime)
 		local rejoinStored = mapSet("Rejoins", rejoinKey(userId), {
 			v = Protocol.VERSION,
 			sessionId = sessionId,
@@ -1521,8 +1534,8 @@ local function launchParty(player: Player): (boolean, string?, string?)
 			hostUserId = party.hostUserId,
 			members = table.clone(party.memberUserIds),
 			accessCode = accessCode,
-			expiresAt = now + Config.SessionTTLSeconds,
-		}, Config.SessionTTLSeconds)
+			expiresAt = now + rejoinRouteLifetime,
+		}, rejoinRouteLifetime)
 		if not ticketStored or not rejoinStored then
 			rollbackLaunch(party.partyId, sessionId, party.memberUserIds, ticketIdsByUserId)
 			return rejectLaunch("MEMBER_TICKET_WRITE_FAILED", "The secure launch route could not be created. Please try again.", {

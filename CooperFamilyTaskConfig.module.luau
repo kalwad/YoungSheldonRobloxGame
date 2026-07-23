@@ -4,7 +4,7 @@
 
 local Config = {}
 
-Config.SchemaVersion = 11
+Config.SchemaVersion = 12
 Config.DataStoreName = "CooperFamilyTasks_v2"
 Config.DataStoreKeyPrefix = "player_"
 Config.AutoSaveSeconds = 75
@@ -42,6 +42,7 @@ Config.Party = table.freeze({
 	ProtocolVersion = 1,
 	MaxMembers = 4,
 	HostReconnectGraceSeconds = 60,
+	GuestReconnectGraceSeconds = 90,
 	InviteLifetimeSeconds = 300,
 	LaunchTicketLifetimeSeconds = 180,
 	SessionLifetimeSeconds = 3600,
@@ -376,6 +377,14 @@ Config.BankHack = {
 
 Config.ProfileDefaults = {
 	schemaVersion = Config.SchemaVersion,
+	-- Schema 12 adds a bounded, server-owned exactly-once journal. Runtime
+	-- sanitization rebuilds this table through CooperGame.TransactionLedger so
+	-- malformed records and client-shaped values never enter a save payload.
+	operationJournal = {
+		version = 1,
+		pending = {},
+		committed = {},
+	},
 	allowance = 0,
 	machineStage = 0,
 	pendingPartStage = 0,
