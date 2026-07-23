@@ -26,12 +26,18 @@ CORE_SCRIPTS=(
 )
 
 # O1/g1 is the ordinary local baseline that previously produced a false pass.
-# O0/g0 and O1/g2 exercise the register-allocation profiles that reproduced the
-# Studio "Out of local registers ... exceeded limit 200" startup failure.
+# Exercise the complete supported optimization/debug matrix so a future change
+# cannot move register pressure into a profile that this gate happens to skip.
 COMPILE_PROFILES=(
-	"1:1:baseline"
 	"0:0:register-guard"
+	"0:1:register-guard"
+	"0:2:register-guard"
+	"1:0:register-guard"
+	"1:1:baseline"
 	"1:2:studio-debug-guard"
+	"2:0:register-guard"
+	"2:1:register-guard"
+	"2:2:register-guard"
 )
 
 failures=0

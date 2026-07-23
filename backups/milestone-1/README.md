@@ -99,15 +99,36 @@ candidate passed or was published.
 | --- | --- | ---: | --- |
 | `2026-07-22_22-11-28_EDT_pre-schema12-ui-security-lobby.rbxm` | Complete current lobby authoring surface and inert Studio house preview package | 637247 | `d9f1876505f0fafaa592d3dd8e3a5063068806009747e9645ea686fd3af21096` |
 
-All original seven verified hashes and both closure hashes above were re-read from the stored files with
-SHA-256. The house was published before the final lobby publication; no house
-version number or publication timestamp was supplied for this manifest.
+### Schema-12 Studio preview candidate — 23:21:46 EDT
+
+This local export records candidate commits `f31c0cd` + `14932d7` after the
+Ready/Start repair, schema-12 journal work, register-overflow repair, and clean
+Studio startup. The exact in-place flow returned `READY_COMMITTED` followed by
+`STUDIO_HOUSE_STARTED`; the current audits passed 120 default compilation,
+27 register-profile, 82 deterministic, 316 lobby-edit, 71 preview-edit, 118
+preview-runtime, and 124 prompt-guard checks. A clean fresh
+`RuntimeStartupReadiness` run passed. This artifact was not published and does
+not certify live teleport, MemoryStore, DataStore, multiplayer, physical
+mobile, visual acceptance, or the full existing-feature regression.
+
+| File | Scope | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| `2026-07-22_23-21-46_EDT_schema12-studio-preview-verified.rbxm` | Complete schema-12 local Studio lobby + in-place verified house preview candidate | 668659 | `09dc971d4f534c34c369d82455a7bac026ec6bc7342d0d3ec2cbcf91a5a2fb7a` |
+
+All recorded hashes above, including the schema-12 candidate, were re-read
+from the stored files with SHA-256. The house was published before the
+historical final lobby publication; no house version number or publication
+timestamp was supplied for this manifest. The schema-12 candidate was not
+published.
 
 The Git source baseline for the pre-Milestone exports is commit `813f93c`
 (`feat: complete milestone 0 pre-horror baseline`). Use a detached worktree or a
 fresh clone to inspect it; do not overwrite an uncommitted working tree. The
 verified Milestone 1 implementation source is commit `e1d4b29`
 (`feat: implement milestone 1 lobby and co-op foundation`).
+The current local closure candidate is based on commits `f31c0cd`
+(`test: harden milestone 1 persistence and launch gates`) and `14932d7`
+(`fix: clear Studio server register startup limit`).
 
 ## Narrow house rollback
 
@@ -142,11 +163,13 @@ Use this only if the entire lobby/co-op release must be removed.
 
 ## Forward recovery
 
-If only one Milestone 1 source is damaged, restore that source from commit
-`e1d4b29` instead of importing an entire model. For model
-recovery, import house-verified exports only into place `98645411943406` and
-lobby-verified exports only into place `100748614383412`. Never mix the role
-sets. The live-only and full-regression rows in
+If only one historical Milestone 1 source is damaged, restore that source from
+commit `e1d4b29`; for the current schema-12 candidate, inspect `f31c0cd` and
+`14932d7` in a detached worktree or fresh clone. Do not overwrite an
+uncommitted working tree. For model recovery, import house-verified exports
+only into place `98645411943406` and lobby-verified exports only into place
+`100748614383412`. Never mix the role sets or treat the combined Studio-preview
+artifact as authorization to publish. The live-only and full-regression rows in
 `../../MILESTONE1_TEST_MATRIX.md` must still be completed before treating the
 Studio exports as full release certification.
 

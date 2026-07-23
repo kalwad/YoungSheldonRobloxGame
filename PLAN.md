@@ -36,12 +36,18 @@ The cozy game must remain enjoyable on its own. Horror is a reveal and pressure 
 | Milestone | Implementation status | Verification status | Release meaning |
 |---|---|---|---|
 | 0 — Safe pre-horror baseline | Complete | Complete under the approved 2026-07-22 scope lock | Authoritative rollback baseline |
-| 1 — Lobby and co-op foundation | Foundation deployed; Ready/Start and visual closure implemented in local source + Studio edit, not published | **Gate open** | Must not be called complete or used to unlock Milestone 2 |
+| 1 — Lobby and co-op foundation | Current closure candidate committed and exercised in a local Studio preview; not published or live-reserved-server verified | **Gate open** | Must not be called complete or used to unlock Milestone 2 |
 | 2–9 | Not approved for activation | Not started under this bible | Corresponding feature flags remain disabled |
 
 Milestone 0 is backed by commits `8c16e85` and `813f93c`, dated `.rbxm` exports and SHA-256 hashes, 71/71 local source compilation, 637 edit-mode and 599 runtime baseline checks, migration double-pass checks, gameplay regression suites, responsive terminal captures, and a documented restoration procedure.
 
 Milestone 1 implementation is backed by commits `e1d4b29` and `1343005`, 79/79 source compilation, house verification (530 edit / 616 runtime), lobby verification (181 edit / 225 runtime), a controlled four-client Studio task/reward/purchase test, host-grace testing, sprint and movement-lock checks, and simulated responsive lobby captures.
+
+The current Milestone 1 closure candidate is backed by commits `f31c0cd`
+(`test: harden milestone 1 persistence and launch gates`) and `14932d7`
+(`fix: clear Studio server register startup limit`). Its current evidence is
+recorded in section 2.3 and the milestone matrix. These commits supplement,
+rather than erase, the historical evidence above.
 
 Milestone 1 is **not release-verified**. Before the newly reported Ready/Start defect and the additional tests in this bible, its authoritative matrix stood at:
 
@@ -89,7 +95,74 @@ The repair contract is:
 - Studio cannot prove a live reserved-server teleport. After the same authoritative Ready/Start validation, the Studio-only bridge must instead replace the lobby with an inert, verified in-place Cooper House preview, start the normal house UI/controllers, restore camera and PlayerModule controls, and let the tester walk and interact. The bridge, package, synthetic party state, and scenario privileges must be unavailable in production; a successful Studio preview is still not evidence for published teleport, ticket, MemoryStore, or DataStore rows.
 - Published launch checkpoints are logged from ready receipt through house admission. A failure returns the lobby to a retryable state without duplicate sessions, tickets, or charges.
 
-**2026-07-22 Studio launch evidence:** the exact Create Party → Ready → Start flow opened the Cooper House in the same playtest, removed the lobby GUI/world, loaded all twelve verified house LocalScripts plus normal HUD/NPC/runtime systems, and restored a `16` WalkSpeed character. After dismissing the ordinary first-play `START BUILDING` tutorial, a real held-W input moved the character about 26 studs. `verify_studio_house_preview.luau` passed 63 edit checks and 108 active-runtime checks. Game logs contained no project warning or error; the only warning was an external Studio MCP version mismatch. No place was created, overwritten, or published for this repair.
+**Historical 2026-07-22 Studio launch evidence:** an earlier exact Create Party
+→ Ready → Start flow opened the Cooper House in the same playtest, removed the
+lobby GUI/world, loaded the normal house systems, and restored movement. That
+earlier run remains historical evidence only; the current-candidate results
+below supersede its audit counts. No place was created, overwritten, or
+published for that repair.
+
+### 2.3 Current candidate evidence addendum — `f31c0cd` + `14932d7`
+
+The exact current Studio flow was:
+
+```text
+CreateParty → SetReady true → Launch (zero delay)
+READY_COMMITTED → STUDIO_HOUSE_STARTED
+```
+
+The first candidate run exposed Roblox's 200-register startup failure in both
+`CooperGame` and `CooperBunker`; the resulting missing-event errors in
+`CooperTaskWorld` were downstream symptoms. The sources were refactored, the
+new compiler-register gate passed the full `27/27` `O0`/`O1`/`O2` ×
+`g0`/`g1`/`g2` matrix across all three core servers, and a clean fresh rerun
+ended with `RuntimeStartupReadiness` **PASS**.
+Ordinary default compilation alone is not accepted as Roblox startup evidence.
+
+Current candidate evidence:
+
+- `120/120` local Luau sources passed default compilation.
+- The deterministic suite passed `82/82`.
+- The Milestone 1 lobby edit audit passed `316` checks.
+- A second fresh `PlaySolo` also returned `STUDIO_HOUSE_STARTED` with
+  authoritative `selfReady = true` and `canLaunch = true`; startup readiness
+  passed again, with no project startup errors/warnings in either server or
+  client logs (excluding the external Studio MCP version-mismatch warning).
+- The Studio preview edit audit passed `71` checks and its active-runtime audit
+  passed `118`.
+- The prompt-security audit passed `124` checks. This is not a substitute for
+  published abuse/flood testing.
+- The server advertised schema `12`, `FoundationContract = PartyV1`, a loaded
+  `Active` host profile, exactly four core RemoteEvents, and ready task-world
+  and automation controllers.
+- The runtime family roster was exactly George, Georgie, Mary, and Missy.
+- `Horror`, `SecretExploration`, `TimeMachineFinale`, `Postgame`, and
+  `StudioScenarioTools` all remained `false`.
+- A sustained client-side Humanoid movement command covered `24.68` studs at
+  `WalkSpeed = 16`; the camera was normal and the character was not in
+  `PlatformStand`. Because Studio's window was not renderable to virtual input,
+  this is movement-authority evidence, not a current-candidate keyboard/touch
+  input pass.
+- An idle profiler sample reported a maximum server script share of `1.68%`
+  for `CooperYardRideables`; the largest client entry was external/core and
+  remained below `0.8%`. This is an idle sample, not a gameplay, mobile,
+  four-player, encounter, or soak performance pass.
+- The dated local export
+  `2026-07-22_23-21-46_EDT_schema12-studio-preview-verified.rbxm` is `668659`
+  bytes with SHA-256
+  `09dc971d4f534c34c369d82455a7bac026ec6bc7342d0d3ec2cbcf91a5a2fb7a`.
+
+The schema-12 operation journal currently protects shared task payouts and the
+six paid order operations documented in the implementation record. Global
+exactly-once closure is still incomplete: candy payout, boombox payout ticks,
+`AdjustCurrency`, `SpendAllowance`, and physical install transitions remain
+outside the operation-ID/reconciliation path.
+
+This addendum does **not** claim screenshot or physical-device/mobile visual
+acceptance, a published or reserved-server launch, live MemoryStore or
+DataStore behavior, multiplayer completion, or a full existing-feature
+regression. Milestone 1 therefore remains **GATE OPEN**, and Milestone 2
+production runtime remains **BLOCKED**.
 
 ---
 

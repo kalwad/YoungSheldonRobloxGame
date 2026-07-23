@@ -27,7 +27,9 @@ Run from the repository root before any Studio synchronization:
 bash verify_runtime_register_budget.sh
 ```
 
-The verifier compiles the three core server sources under all of these profiles:
+The verifier compiles the three core server sources under every supported
+combination of `-O0/-O1/-O2` and `-g0/-g1/-g2` (27 checks total). These three
+rows explain the historically important profiles:
 
 | Profile | Purpose |
 | --- | --- |
@@ -35,7 +37,7 @@ The verifier compiles the three core server sources under all of these profiles:
 | `-O0 -g0` | Unoptimized register-pressure guard |
 | `-O1 -g2` | Debug-information register-pressure guard that reproduced Studio failure |
 
-Every row must pass. Any compiler error, especially `Out of local registers`,
+Every matrix row must pass. Any compiler error, especially `Out of local registers`,
 blocks Studio handoff, playtesting, publication, and downstream feature
 verification. Do not weaken the matrix or treat the `-O1 -g1` row as sufficient.
 The repair belongs in the failing source architecture—reduce simultaneously

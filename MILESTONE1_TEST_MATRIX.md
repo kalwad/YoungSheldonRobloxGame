@@ -25,7 +25,9 @@ of the row and does not satisfy its remaining live or topology requirement.
 - Only `Lobby` is enabled. Horror, secrets, finale, postgame, and production
   scenario tools remain disabled.
 
-## Ready/Start and visual closure evidence — 2026-07-22
+## Current candidate Studio closure evidence — 2026-07-22
+
+Candidate commits: `f31c0cd` + `14932d7`.
 
 - Root cause reproduced: one shared request timestamp rejected a valid Launch
   immediately after Ready as `Please wait a moment`.
@@ -36,13 +38,9 @@ of the row and does not satisfy its remaining live or topology requirement.
   launch-block reason text. The client does not parse captions to infer state.
 - Launch is atomically locked, diagnostics are allowlisted and secret-safe, and
   stale rollback can only alter its own session/reconnect records.
-- `verify_lobby_launch_repair.luau` passed 32/32 checks in edit mode and 32/32
-  in runtime. `verify_milestone1_foundation.luau` passed 237 edit-mode and 281
-  runtime lobby checks after the final scoped visual update.
-- The responsive CRT UI was inspected at desktop, iPhone 7 portrait/landscape,
-  iPhone 13 portrait, Galaxy A16 landscape, and iPad 6 landscape. All layouts
-  remained legible and scrollable; keyboard/gamepad focus activated Ready and
-  Start successfully. This remains simulator evidence, not physical hardware.
+- The current Milestone 1 lobby edit audit passed `316` checks. No
+  current-candidate screenshot or physical-device/mobile visual acceptance is
+  claimed.
 - The lobby environment is now a warm 1980s suburban rec room. Its updater is
   scoped and idempotent and cannot clear Workspace, Terrain, replicated data,
   StarterGui, or runtime scripts.
@@ -50,26 +48,47 @@ of the row and does not satisfy its remaining live or topology requirement.
   package inside the same playtest after authoritative party validation. The
   published reserved-server rows remain open because this path never exercises
   TeleportService, MemoryStore, live tickets, or production DataStores.
-- The final Create Party → Ready → Start run removed the lobby world/UI, loaded
-  the normal house HUD and all twelve verified LocalScripts, and passed 63 edit
-  plus 108 active-runtime preview checks. After the normal first-play `START
-  BUILDING` tutorial was dismissed, held-W input moved the character about 26
-  studs. Project logs had no errors or warnings; the only warning came from an
-  external Studio MCP plugin/server version mismatch.
+- The exact final flow was Create Party → `SetReady true` → zero-delay Launch.
+  The authoritative responses arrived in order as `READY_COMMITTED` and then
+  `STUDIO_HOUSE_STARTED`.
+- The first run exposed 200-register startup failures in `CooperGame` and
+  `CooperBunker`; the missing core events reported by `CooperTaskWorld` were a
+  downstream cascade. After repair, the full compiler-register matrix passed
+  `27/27` (`O0`/`O1`/`O2` × `g0`/`g1`/`g2` across all three core servers), and
+  a clean fresh run reported `RuntimeStartupReadiness PASS`.
+- A second fresh `PlaySolo` run again returned `STUDIO_HOUSE_STARTED` with
+  authoritative `selfReady = true` and `canLaunch = true`; startup readiness
+  passed again. Server and client startup logs contained no project
+  errors/warnings (only the external Studio MCP version-mismatch warning).
+- The current preview passed `71` edit checks and `118` active-runtime checks.
+  Runtime state was schema `12` / `PartyV1`, with a loaded `Active` host, all
+  four core remotes, ready world and automation controllers, exactly George,
+  Georgie, Mary, and Missy, and every future feature flag still false.
+- A sustained client-side Humanoid movement command covered `24.68` studs at
+  `WalkSpeed = 16`, with a normal camera and no `PlatformStand`. This does not
+  replace a current-candidate keyboard/touch input test.
+- The prompt-security verifier passed `124` checks. Published prompt abuse,
+  flooding, proximity manipulation, and multiplayer contention remain unrun.
+- An idle profiler sample measured a maximum server script share of `1.68%`
+  (`CooperYardRideables`); the largest client entry was external/core and below
+  `0.8%`. This is not mobile, multiplayer, active-feature, or soak evidence.
 
 ## Automated contract checks
 
 | ID | Check | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| A01 | Compile every local `.luau` source | No compile errors | PASS | 2026-07-22 Studio handoff closure: `luau-compile` passed 82/82 local sources; all 66 non-retired sources also passed |
+| A01 | Compile every local `.luau` source | No compile errors | PASS | Current candidate `f31c0cd` + `14932d7`: default `luau-compile` passed 120/120 sources |
 | A02 | `git diff --check` | No whitespace errors | PASS | 2026-07-22: exited 0 with no findings |
-| A03 | Run `verify_milestone1_foundation.luau` in house edit mode | PASS | PASS | 2026-07-22 final house: 530 read-only checks passed |
-| A04 | Run verifier in a one-player house runtime | PASS | PASS | 2026-07-22 final house runtime: 616 checks passed |
-| A05 | Run verifier in lobby edit mode | PASS | PASS | 2026-07-22 launch/UI closure: 237 foundation checks plus 32 launch-repair checks passed |
-| A06 | Run verifier in a lobby runtime | PASS | PASS | 2026-07-22 clean runtime: 281 foundation checks plus 32 launch-repair checks passed |
+| A03 | Run `verify_milestone1_foundation.luau` in house edit mode | PASS | NOT RUN | Historical 2026-07-22 house evidence passed 530 checks, but the current schema-12 candidate was not installed into or rerun in the separate house place |
+| A04 | Run verifier in a one-player house runtime | PASS | NOT RUN | Historical 2026-07-22 house evidence passed 616 checks; the current candidate was exercised only through the explicitly non-production Studio preview adapter |
+| A05 | Run verifier in lobby edit mode | PASS | PASS | Current candidate: 316 Milestone 1 lobby edit checks passed |
+| A06 | Run verifier in a lobby runtime | PASS | PARTIAL | Current candidate zero-delay Ready/Launch and fresh startup-readiness run passed; no complete current-candidate lobby-runtime verifier count was recorded |
 | A07 | Run every Milestone 0 gameplay regression suite | No regressions except intentional M1 source/cap contracts | NOT RUN | |
 | A08 | Client-authority scan | No client cash awards, task completion, host selection, or story forcing | PASS | 2026-07-22: all 13 active local client sources scanned; no forbidden authority pattern |
-| A09 | Studio in-place house verifier | Preview package and safety guards pass before launch; normal house/remotes/scripts/profile pass after launch | PASS | 63/63 edit checks and 108/108 active-runtime checks |
+| A09 | Studio in-place house verifier | Preview package and safety guards pass before launch; normal house/remotes/scripts/profile pass after launch | PASS | Current candidate: 71/71 edit checks and 118/118 active-runtime checks |
+| A10 | Core compiler register preflight and fresh startup readiness | Default plus register-pressure profiles compile; core authorities reach fresh runtime markers | PASS | `verify_runtime_register_budget.sh` passed 27/27 (full `O0`/`O1`/`O2` × `g0`/`g1`/`g2` matrix across all three core servers); two clean fresh runs reported `RuntimeStartupReadiness PASS` |
+| A11 | Deterministic contract suite | Every local contract test passes | PASS | `luau tests/run.luau`: 82/82 passed |
+| A12 | Physical-prompt source/runtime guard audit | Every required prompt guard is present | PASS | `verify_prompt_security_guards.luau`: 124 checks passed; published adversarial abuse remains open |
 
 ## Lobby UI and Studio interaction checks
 
@@ -190,13 +209,18 @@ at least one physical touch device.
 
 | ID | Check | Expected | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| R01 | Four normal PNG NPCs | Only George, Mary, Missy, Georgie; original art/dialogue/catchphrases | NOT RUN | |
+| R01 | Four normal PNG NPCs | Only George, Mary, Missy, Georgie; original art/dialogue/catchphrases | PARTIAL | Current preview runtime roster was exactly George, Georgie, Mary, and Missy; original PNG appearance, dialogue, and catchphrases were not re-certified |
 | R02 | Five tasks, robots, deliveries, boombox, bank, bunker, chemistry, candy | Existing mechanics complete without errors | NOT RUN | |
 | R03 | Doors, truck, furniture, robots and players under four-player load | No phasing, blocking deadlocks, or void spawn | NOT RUN | |
-| R04 | Horror/runtime object audit | No panic/crisis/progression/horror UI or behavior | PASS | Final house edit/runtime and lobby edit/runtime verifiers passed with all future features except Lobby disabled |
-| R05 | Client/server logs through all scenarios | No project warnings or errors | PARTIAL | Final lobby runtime had no project warnings/errors; only external Studio MCP `2.22.3/2.22.0` mismatch warning. Full house regression logs remain open |
+| R04 | Horror/runtime object audit | No panic/crisis/progression/horror UI or behavior | PASS | Current schema-12 preview kept Horror, SecretExploration, TimeMachineFinale, Postgame, and StudioScenarioTools false |
+| R05 | Client/server logs through all scenarios | No project warnings or errors | PARTIAL | Two fresh current-candidate startup runs had no project warnings/errors; only the external Studio MCP version-mismatch warning remained. Full feature and multiplayer scenario logs are still open |
 | R06 | Creator Dashboard | Lobby `100748614383412` is the start place with capacity at least 4 (50 recommended); house `98645411943406` is non-start and capped exactly at 4 | PASS | Dashboard verified: lobby start/cap 50; house cap 4 and `Secure` within-universe access only |
-| R07 | Rollback | Dated exports and Git restore instructions recover Milestone 0 | PASS | Pre-M1 and verified house/lobby `.rbxm` sets, SHA-256 hashes, and restoration procedures are recorded |
+| R07 | Rollback | Dated exports and Git restore instructions recover Milestone 0 | PASS | Historical rollback sets remain documented; current candidate export is 668659 bytes with SHA-256 `09dc971d4f534c34c369d82455a7bac026ec6bc7342d0d3ec2cbcf91a5a2fb7a` |
+| R08 | Runtime performance | Ordinary and stress scenarios stay inside approved budgets | PARTIAL | Idle Studio sample: server max 1.68% (`CooperYardRideables`), client external/core max below 0.8%; active gameplay, mobile, four-player, and soak profiling remain open |
+
+The current schema-12 journal does not yet provide global exactly-once closure.
+Candy payout, boombox payout ticks, `AdjustCurrency`, `SpendAllowance`, and
+physical install transitions still require operation IDs and reconciliation.
 
 ## Sign-off
 

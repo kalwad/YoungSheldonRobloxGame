@@ -580,7 +580,9 @@ if isHouse then
 			"reconnectRemaining",
 			"cycleIndex",
 			"local function captureTaskEligibility(version)",
-			"local eligibility = captureTaskEligibility(partySession.taskSerial)",
+			-- Schema 12 freezes the roster against the durable task ordinal, not
+			-- the transient in-memory serial used by the older M1 implementation.
+			"local eligibility = captureTaskEligibility(profile.data.totalTasks + 1)",
 			"eligibilityResolutionByUserId = {}",
 			"rewardOperationIdsByUserId = {}",
 			"record.status = \"Completing\"",
