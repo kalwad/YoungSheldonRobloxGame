@@ -10,7 +10,7 @@ It combines:
 - The canonical baseline plan in [PLAN.md](PLAN.md)
 - The roadmap review in [COOPER_TIME_MACHINE_PLAN_REVIEW.md](COOPER_TIME_MACHINE_PLAN_REVIEW.md)
 - The test matrix in [COOPER_TIME_MACHINE_TEST_PLAN.md](COOPER_TIME_MACHINE_TEST_PLAN.md)
-- Milestone-specific completion records ([MILESTONE0_*](MILESTONE0_BASELINE.md), [MILESTONE1_*])
+- Milestone-specific completion records ([MILESTONE0_BASELINE](MILESTONE0_BASELINE.md), [MILESTONE0_VERIFICATION](MILESTONE0_VERIFICATION.md), [MILESTONE1_IMPLEMENTATION](MILESTONE1_IMPLEMENTATION.md), [MILESTONE1_TEST_MATRIX](MILESTONE1_TEST_MATRIX.md))
 
 The canonical planning authority remains [PLAN.md](PLAN.md).
 
