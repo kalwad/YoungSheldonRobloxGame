@@ -58,12 +58,20 @@ luau-analyze tests/run.luau tests/support/*.luau tests/specs/*.luau \
   CooperTransactionLedger.module.luau
 while IFS= read -r file; do luau-compile "$file" >/dev/null; done \
   < <(rg --files -g '*.luau')
+bash verify_runtime_register_budget.sh
 git diff --check -- tests TEST_TRACEABILITY.md TEST_RESULTS.md \
   UNRESOLVED_DECISIONS.md REMOTE_SECURITY_MATRIX.md MIGRATION_FIXTURES.md
 ```
 
-Result: **PASS**. The test analyzer emitted no diagnostics, all 119 local Luau
-sources compiled, and `git diff --check` reported no whitespace errors.
+Result: **PASS**. The test analyzer emitted no diagnostics, all 120 local Luau
+sources compiled, all nine core-server register-profile checks passed
+(`O1/g1`, `O0/g0`, and `O1/g2` for CooperGame, CooperBunker, and
+CooperTaskWorld), and `git diff --check` reported no whitespace errors.
+
+The register matrix is a required pre-Studio guard because ordinary `O1/g1`
+compilation previously missed Roblox's 200-register startup failure. The
+separate fresh-Play runtime gate in `verify_runtime_startup_readiness.luau`
+remains **NOT RUN** in this local-only batch.
 
 ## Milestone gate table
 

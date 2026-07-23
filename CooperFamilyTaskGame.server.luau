@@ -2583,7 +2583,7 @@ local cancelBankHackSession
 local returnSavedPartyToLobby
 local closePartyAndReturn
 local recoverHostWorldState
-local automationRunSerial = 0
+TransactionRuntime.automationRunSerial = 0
 
 function TransactionRuntime.retryTaskCompletion(record, fallbackProfile)
 	if not record or partySession.task ~= record or record.status ~= "Completing"
@@ -2625,12 +2625,12 @@ local function launchTaskAutomation(profile, record, definition)
 	then
 		return false
 	end
-	automationRunSerial += 1
+	TransactionRuntime.automationRunSerial += 1
 	local runId = string.format(
 		"automation:%d:%s:%d:%s",
 		profile.player.UserId,
 		definition.id,
-		automationRunSerial,
+		TransactionRuntime.automationRunSerial,
 		HttpService:GenerateGUID(false)
 	)
 	record.automationRunId = runId
@@ -6076,11 +6076,12 @@ local function loadPlayer(player)
 	end
 end
 
-Players.PlayerAdded:Connect(function(player)
-	task.spawn(loadPlayer, player)
-end)
+-- Keep late lifecycle helpers behind the existing runtime namespace. Apart from
+-- giving this cohesive subsystem an explicit home, table fields do not consume
+-- one long-lived top-level Luau register per helper in this already-large script.
+TransactionRuntime.playerLifecycle = {}
 
-local function resetSharedActorForDeparture(userId)
+function TransactionRuntime.playerLifecycle.resetSharedActorForDeparture(userId)
 	local record = partySession.task
 	if not record or tonumber(record.carrierUserId) ~= userId then
 		return
@@ -6098,7 +6099,7 @@ local function resetSharedActorForDeparture(userId)
 	})
 end
 
-local function clearLeavingPlayerAttributes(player)
+function TransactionRuntime.playerLifecycle.clearLeavingPlayerAttributes(player)
 	for _, attributeName in ipairs({
 		"CooperBoomboxPlaced",
 		"CooperSecretBunkerId",
@@ -6155,7 +6156,7 @@ returnSavedPartyToLobby = function(playersToReturn)
 end
 
 -- M1_HOST_RECONNECT_GRACE_CONTRACT
-local function beginHostReconnectGrace(profile, leavingPlayer)
+function TransactionRuntime.playerLifecycle.beginHostReconnectGrace(profile, leavingPlayer)
 	partySession.state = "HostGrace"
 	partySession.hostGraceSerial += 1
 	local graceSerial = partySession.hostGraceSerial
@@ -6205,7 +6206,7 @@ local function beginHostReconnectGrace(profile, leavingPlayer)
 	end)
 end
 
-local function retainFailedProfileRelease(player, profile)
+function TransactionRuntime.playerLifecycle.retainFailedProfileRelease(player, profile)
 	-- A transient DataStore failure during PlayerRemoving must not orphan a dirty
 	-- profile and its still-owned lease. Keep the old Player instance as a private
 	-- save key and retry until the write/release succeeds or another server proves
@@ -6242,7 +6243,7 @@ end
 -- Unlike host loss, guest loss never pauses shared progression. The exact
 -- already-loaded profile stays leased in this server for 90 seconds so any task
 -- eligibility captured before departure can resolve against the same identity.
-local function beginGuestReconnectGrace(profile, leavingPlayer)
+function TransactionRuntime.playerLifecycle.beginGuestReconnectGrace(profile, leavingPlayer)
 	profile.detached = true
 	profile.allowanceValue = nil
 	profile.guestGraceSerial = (profile.guestGraceSerial or 0) + 1
@@ -6328,7 +6329,7 @@ local function beginGuestReconnectGrace(profile, leavingPlayer)
 		elseif profiles[leavingPlayer] == profile then
 			warn("[CooperGame] Guest grace expired before release persistence succeeded for "
 				.. leavingPlayer.Name .. "; continuing bounded background release retries")
-			retainFailedProfileRelease(leavingPlayer, profile)
+			TransactionRuntime.playerLifecycle.retainFailedProfileRelease(leavingPlayer, profile)
 		end
 		if not shuttingDown then
 			broadcastState()
@@ -6336,7 +6337,7 @@ local function beginGuestReconnectGrace(profile, leavingPlayer)
 	end)
 end
 
-Players.PlayerRemoving:Connect(function(player)
+function TransactionRuntime.playerLifecycle.onPlayerRemoving(player)
 	local profile = profiles[player]
 	local wasActivePartyPlayer = partySession.activePlayers[player.UserId] == player
 	local wasHost = player.UserId == partySession.hostUserId
@@ -6346,7 +6347,7 @@ Players.PlayerRemoving:Connect(function(player)
 	-- A rejected duplicate/forged join shares a UserId with the real member but
 	-- never owned this slot or profile. Its teardown must not disturb the party.
 	if not profile and not wasActivePartyPlayer then
-		clearLeavingPlayerAttributes(player)
+		TransactionRuntime.playerLifecycle.clearLeavingPlayerAttributes(player)
 		requestNextAt[player] = nil
 		snapshotNextAt[player] = nil
 		bankInputNextAt[player] = nil
@@ -6364,13 +6365,13 @@ Players.PlayerRemoving:Connect(function(player)
 	elseif boomboxPlaybackOwner == player then
 		boomboxPlaybackOwner = nil
 	end
-	resetSharedActorForDeparture(player.UserId)
-	clearLeavingPlayerAttributes(player)
+	TransactionRuntime.playerLifecycle.resetSharedActorForDeparture(player.UserId)
+	TransactionRuntime.playerLifecycle.clearLeavingPlayerAttributes(player)
 	local hasRemainingPartyMember = next(partySession.activePlayers) ~= nil
 	local healthyRetainedProfile = profile and profile.loaded and not profile.releasing
 		and not profile.leaseLost and (dataStore == nil or profile.leaseOwned == true)
 	if healthyRetainedProfile and wasHost and hasRemainingPartyMember and not shuttingDown then
-		beginHostReconnectGrace(profile, player)
+		TransactionRuntime.playerLifecycle.beginHostReconnectGrace(profile, player)
 		requestNextAt[player] = nil
 		snapshotNextAt[player] = nil
 		bankInputNextAt[player] = nil
@@ -6380,7 +6381,7 @@ Players.PlayerRemoving:Connect(function(player)
 		and partySession.state ~= "Closing"
 		and (hasRemainingPartyMember or partySession.state == "Loading")
 	then
-		beginGuestReconnectGrace(profile, player)
+		TransactionRuntime.playerLifecycle.beginGuestReconnectGrace(profile, player)
 		requestNextAt[player] = nil
 		snapshotNextAt[player] = nil
 		bankInputNextAt[player] = nil
@@ -6411,7 +6412,7 @@ Players.PlayerRemoving:Connect(function(player)
 	if saved then
 		profiles[player] = nil
 	elseif profile and profiles[player] == profile then
-		retainFailedProfileRelease(player, profile)
+		TransactionRuntime.playerLifecycle.retainFailedProfileRelease(player, profile)
 	end
 	requestNextAt[player] = nil
 	snapshotNextAt[player] = nil
@@ -6419,13 +6420,9 @@ Players.PlayerRemoving:Connect(function(player)
 	if not shuttingDown then
 		broadcastState()
 	end
-end)
-
-for _, player in ipairs(Players:GetPlayers()) do
-	task.spawn(loadPlayer, player)
 end
 
-game:BindToClose(function()
+function TransactionRuntime.playerLifecycle.onClose()
 	shuttingDown = true
 	if partySession.validated and not partySession.studioSynthetic then
 		partySession.state = "Closing"
@@ -6462,9 +6459,9 @@ game:BindToClose(function()
 			.. tostring(next(hydratingProfiles) ~= nil and "an active" or "no active")
 			.. " profile hydration still pending")
 	end
-end)
+end
 
-task.spawn(function()
+function TransactionRuntime.runMaintenanceLoop()
 	local nextAutoSave = os.clock() + Config.AutoSaveSeconds
 	while script.Parent and not shuttingDown do
 		local currentTime = serverNow()
@@ -6532,9 +6529,9 @@ task.spawn(function()
 		end
 		task.wait(0.35)
 	end
-end)
+end
 
-task.spawn(function()
+function TransactionRuntime.runSessionHeartbeatLoop()
 	local heartbeatSeconds = math.clamp(
 		tonumber(partyConfig.SessionHeartbeatSeconds) or 120,
 		30,
@@ -6551,7 +6548,21 @@ task.spawn(function()
 			)
 		end
 	end
-end)
+end
 
-broadcastState()
-print("[CooperGame] Personal family tasks, allowance, and paid Time Machine construction ready")
+function TransactionRuntime.start()
+	Players.PlayerAdded:Connect(function(player)
+		task.spawn(loadPlayer, player)
+	end)
+	Players.PlayerRemoving:Connect(TransactionRuntime.playerLifecycle.onPlayerRemoving)
+	for _, player in ipairs(Players:GetPlayers()) do
+		task.spawn(loadPlayer, player)
+	end
+	game:BindToClose(TransactionRuntime.playerLifecycle.onClose)
+	task.spawn(TransactionRuntime.runMaintenanceLoop)
+	task.spawn(TransactionRuntime.runSessionHeartbeatLoop)
+	broadcastState()
+	print("[CooperGame] Personal family tasks, allowance, and paid Time Machine construction ready")
+end
+
+TransactionRuntime.start()

@@ -1961,13 +1961,9 @@ local hatchMoving = false
 local blastDoorOpen = false
 local blastDoorMoving = false
 local mainLightsOn = true
-local recoveryDebounce = {}
-local physicalPromptNextAt = {}
-local PHYSICAL_PROMPT_RATE_SECONDS = table.freeze({
-	Hatch = 0.70,
-	BlastDoor = 0.70,
-	MainLights = 0.45,
-})
+local physicalPromptSecurity = {
+	recoveryDebounce = {},
+}
 
 local function statusTextLabel()
 	local gui = statusConsole:FindFirstChild("BunkerSignGui")
@@ -2207,23 +2203,42 @@ end
 -- Hatch, blast-door, and power controls each get an independent, bounded
 -- per-player budget. This executes before access snapshots or sweep queries so
 -- forged prompt floods cannot amplify expensive server work.
-local function consumePhysicalPromptRate(player, action)
-	local _, _, root = playerCharacterState(player)
-	local cooldown = PHYSICAL_PROMPT_RATE_SECONDS[action]
-	if not root or type(cooldown) ~= "number" then
-		return false
+-- Only the small security facade escapes this scope. Keeping the backing maps
+-- and helper closures scoped prevents this large controller from exhausting
+-- Luau's top-level local-register budget in Studio debug builds.
+do
+	local physicalPromptNextAt = {}
+	local PHYSICAL_PROMPT_RATE_SECONDS = table.freeze({
+		Hatch = 0.70,
+		BlastDoor = 0.70,
+		MainLights = 0.45,
+	})
+
+	local function consumePhysicalPromptRate(player, action)
+		local _, _, root = playerCharacterState(player)
+		local cooldown = PHYSICAL_PROMPT_RATE_SECONDS[action]
+		if not root or type(cooldown) ~= "number" then
+			return false
+		end
+		local playerRates = physicalPromptNextAt[player]
+		if not playerRates then
+			playerRates = {}
+			physicalPromptNextAt[player] = playerRates
+		end
+		local now = Workspace:GetServerTimeNow()
+		if now < (playerRates[action] or 0) then
+			return false
+		end
+		playerRates[action] = now + cooldown
+		return true
 	end
-	local playerRates = physicalPromptNextAt[player]
-	if not playerRates then
-		playerRates = {}
-		physicalPromptNextAt[player] = playerRates
+
+	local function clearPhysicalPromptRate(player)
+		physicalPromptNextAt[player] = nil
 	end
-	local now = Workspace:GetServerTimeNow()
-	if now < (playerRates[action] or 0) then
-		return false
-	end
-	playerRates[action] = now + cooldown
-	return true
+
+	physicalPromptSecurity.consumePhysicalPromptRate = consumePhysicalPromptRate
+	physicalPromptSecurity.clearPlayer = clearPhysicalPromptRate
 end
 
 local function sendNotice(player, text)
@@ -2718,8 +2733,10 @@ FLOW: CHARGING]]
 	return true
 end
 
-local chemistryAttributeConnections = {}
-local chemistryPlacedState = {}
+local chemistryOwnershipState = {
+	attributeConnections = {},
+	placed = {},
+}
 
 local function anyChemistryOwner()
 	for _, candidate in ipairs(Players:GetPlayers()) do
@@ -2743,18 +2760,18 @@ local function refreshChemistryVisibility(animate)
 end
 
 local function watchChemistryOwnership(player)
-	local old = chemistryAttributeConnections[player]
+	local old = chemistryOwnershipState.attributeConnections[player]
 	if old then
 		for _, connection in ipairs(old) do
 			connection:Disconnect()
 		end
 	end
-	chemistryPlacedState[player] = player:GetAttribute("CooperChemistrySetupPlaced") == true
+	chemistryOwnershipState.placed[player] = player:GetAttribute("CooperChemistrySetupPlaced") == true
 	local connections = {}
 	table.insert(connections, player:GetAttributeChangedSignal("CooperChemistrySetupPlaced"):Connect(function()
-		local wasPlaced = chemistryPlacedState[player] == true
+		local wasPlaced = chemistryOwnershipState.placed[player] == true
 		local isPlaced = player:GetAttribute("CooperChemistrySetupPlaced") == true
-		chemistryPlacedState[player] = isPlaced
+		chemistryOwnershipState.placed[player] = isPlaced
 		if wasPlaced and not isPlaced then
 			if chemistryExperimentOwnerUserId == player.UserId then
 				chemistryExperimentToken += 1
@@ -2777,7 +2794,7 @@ local function watchChemistryOwnership(player)
 			-- A lab found at the profile-loaded boundary is a saved installation and
 			-- restores instantly. Only a later false->true placement transition runs
 			-- the assembly ceremony.
-			chemistryPlacedState[player] = player:GetAttribute("CooperChemistrySetupPlaced") == true
+			chemistryOwnershipState.placed[player] = player:GetAttribute("CooperChemistrySetupPlaced") == true
 			refreshChemistryVisibility(false)
 			if player:GetAttribute("CooperCandyBatchReady") == true then
 				candyPresentation.queuePlayer(player)
@@ -2844,7 +2861,7 @@ local function watchChemistryOwnership(player)
 		player:SetAttribute("CooperBunkerComputerSessionUntil", nil)
 		event:FireClient(player, "TerminalClose", "Research terminal closed")
 	end))
-	chemistryAttributeConnections[player] = connections
+	chemistryOwnershipState.attributeConnections[player] = connections
 	task.defer(refreshChemistryVisibility, false)
 	task.delay(0.75, function()
 		ensureCandyDeliveryTool(player, false)
@@ -2983,7 +3000,7 @@ local function blastDoorwayOccupied()
 end
 
 hatchPrompt.Triggered:Connect(function(player)
-	if not consumePhysicalPromptRate(player, "Hatch") then
+	if not physicalPromptSecurity.consumePhysicalPromptRate(player, "Hatch") then
 		return
 	end
 	if not playerHasBunkerAccess(player) then
@@ -3018,7 +3035,7 @@ hatchPrompt.Triggered:Connect(function(player)
 end)
 
 blastDoorPrompt.Triggered:Connect(function(player)
-	if not consumePhysicalPromptRate(player, "BlastDoor") then
+	if not physicalPromptSecurity.consumePhysicalPromptRate(player, "BlastDoor") then
 		return
 	end
 	if not playerHasBunkerAccess(player) then
@@ -3036,7 +3053,7 @@ blastDoorPrompt.Triggered:Connect(function(player)
 end)
 
 lightPrompt.Triggered:Connect(function(player)
-	if not consumePhysicalPromptRate(player, "MainLights") then
+	if not physicalPromptSecurity.consumePhysicalPromptRate(player, "MainLights") then
 		return
 	end
 	if not playerHasBunkerAccess(player) then
@@ -3052,7 +3069,7 @@ end)
 recoveryZone.Touched:Connect(function(hit)
 	local character = hit:FindFirstAncestorOfClass("Model")
 	local player = character and Players:GetPlayerFromCharacter(character)
-	if not player or recoveryDebounce[player] then
+	if not player or physicalPromptSecurity.recoveryDebounce[player] then
 		return
 	end
 	local currentCharacter, humanoid, root = playerCharacterState(player)
@@ -3060,7 +3077,7 @@ recoveryZone.Touched:Connect(function(hit)
 		return
 	end
 	if not playerHasBunkerAccess(player) then
-		recoveryDebounce[player] = true
+		physicalPromptSecurity.recoveryDebounce[player] = true
 		local viewingAnchor = environment:FindFirstChild("BunkerConstructionViewingAnchor", true)
 		local destination = if viewingAnchor and viewingAnchor:IsA("BasePart")
 			then viewingAnchor.CFrame * CFrame.new(0, 3.2, 0)
@@ -3072,14 +3089,14 @@ recoveryZone.Touched:Connect(function(hit)
 		root.AssemblyAngularVelocity = Vector3.zero
 		sendNotice(player, "Bunker access is locked to its construction authorization.")
 		task.delay(1.5, function()
-			recoveryDebounce[player] = nil
+			physicalPromptSecurity.recoveryDebounce[player] = nil
 		end)
 		return
 	end
 
 	-- This fail-safe is the bunker's only character relocation. Normal entry
 	-- and exit always use the physical hatch, shaft, landings, and ladder.
-	recoveryDebounce[player] = true
+	physicalPromptSecurity.recoveryDebounce[player] = true
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
 	currentCharacter:PivotTo(recoveryAnchor.CFrame)
@@ -3087,13 +3104,13 @@ recoveryZone.Touched:Connect(function(hit)
 	root.AssemblyAngularVelocity = Vector3.zero
 	sendNotice(player, "Emergency floor recovery returned you to the airlock.")
 	task.delay(1.5, function()
-		recoveryDebounce[player] = nil
+		physicalPromptSecurity.recoveryDebounce[player] = nil
 	end)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-	recoveryDebounce[player] = nil
-	physicalPromptNextAt[player] = nil
+	physicalPromptSecurity.recoveryDebounce[player] = nil
+	physicalPromptSecurity.clearPlayer(player)
 	candyPresentation.removePlayer(player)
 	candyPresentation.eligibleAt[player] = nil
 	if chemistryExperimentOwnerUserId == player.UserId then
@@ -3106,13 +3123,13 @@ Players.PlayerRemoving:Connect(function(player)
 		-- released. CooperGame saves the same ready token during PlayerRemoving.
 		candyPresentation.release(player, false)
 	end
-	chemistryPlacedState[player] = nil
-	local chemistryConnections = chemistryAttributeConnections[player]
+	chemistryOwnershipState.placed[player] = nil
+	local chemistryConnections = chemistryOwnershipState.attributeConnections[player]
 	if chemistryConnections then
 		for _, chemistryConnection in ipairs(chemistryConnections) do
 			chemistryConnection:Disconnect()
 		end
-		chemistryAttributeConnections[player] = nil
+		chemistryOwnershipState.attributeConnections[player] = nil
 	end
 	local connection = accessCharacterConnections[player]
 	if connection then
@@ -3124,18 +3141,20 @@ end)
 
 -- Smooth, bounded fan/beacon/lab motion. All moving parts remain anchored, and
 -- the 12 Hz cosmetic cadence keeps replicated property traffic modest on mobile.
-local fanAngle = 0
-local visualAccumulator = 0
+local visualState = {
+	fanAngle = 0,
+	accumulator = 0,
+}
 RunService.Heartbeat:Connect(function(deltaTime)
-	visualAccumulator += deltaTime
-	if visualAccumulator < 1 / 12 then
+	visualState.accumulator += deltaTime
+	if visualState.accumulator < 1 / 12 then
 		return
 	end
-	local step = visualAccumulator
-	visualAccumulator = 0
+	local step = visualState.accumulator
+	visualState.accumulator = 0
 	if bunkerIsUnlocked() and mainLightsOn and fanBlades.Parent then
-		fanAngle = (fanAngle + step * 1.8) % (math.pi * 2)
-		fanBlades:PivotTo(fanBasePivot * CFrame.Angles(0, 0, fanAngle))
+		visualState.fanAngle = (visualState.fanAngle + step * 1.8) % (math.pi * 2)
+		fanBlades:PivotTo(fanBasePivot * CFrame.Angles(0, 0, visualState.fanAngle))
 	end
 	if hatchOpen and beaconLight.Enabled then
 		beaconLight.Brightness = 1.35 + math.sin(os.clock() * 5.5) * 0.65
