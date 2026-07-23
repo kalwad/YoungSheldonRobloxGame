@@ -7,12 +7,12 @@ Last updated: 2026-07-23
 This file is the single, practical roadmap reference for the current repository state.
 
 It combines:
-- The canonical baseline plan in [PLAN.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/PLAN.md)
-- The roadmap review in [COOPER_TIME_MACHINE_PLAN_REVIEW.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/COOPER_TIME_MACHINE_PLAN_REVIEW.md)
-- The test matrix in [COOPER_TIME_MACHINE_TEST_PLAN.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/COOPER_TIME_MACHINE_TEST_PLAN.md)
-- Milestone-specific completion records ([MILESTONE0_*](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/MILESTONE0_BASELINE.md), [MILESTONE1_*])
+- The canonical baseline plan in [PLAN.md](PLAN.md)
+- The roadmap review in [COOPER_TIME_MACHINE_PLAN_REVIEW.md](COOPER_TIME_MACHINE_PLAN_REVIEW.md)
+- The test matrix in [COOPER_TIME_MACHINE_TEST_PLAN.md](COOPER_TIME_MACHINE_TEST_PLAN.md)
+- Milestone-specific completion records ([MILESTONE0_*](MILESTONE0_BASELINE.md), [MILESTONE1_*])
 
-The canonical planning authority remains [PLAN.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/PLAN.md).
+The canonical planning authority remains [PLAN.md](PLAN.md).
 
 ## 1) Review summary: what is currently working vs not
 
@@ -20,7 +20,7 @@ The canonical planning authority remains [PLAN.md](/Users/tanishkalwad/Documents
 
 | Milestone | State | Current evidence | Next requirement |
 |---|---|---|---|
-| 0 — Safe pre-horror baseline | **Complete** | Rollback exports, profile migration checks, and full verifier pass in baseline scope are recorded in [MILESTONE0_VERIFICATION.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/MILESTONE0_VERIFICATION.md). | Keep preserved and untouched. |
+| 0 — Safe pre-horror baseline | **Complete** | Rollback exports, profile migration checks, and full verifier pass in baseline scope are recorded in [MILESTONE0_VERIFICATION.md](MILESTONE0_VERIFICATION.md). | Keep preserved and untouched. |
 | 1 — Lobby + co-op foundation | **Partially complete / gate open** | Newer source is in repo but not fully re-synced through Studio/published gates yet. Deterministic static suite and verifier suites now pass locally on the latest source tree. | Finish candidate freeze, re-run all pending Studio audits, then run private published solo/2-player/4-player end-to-end launch/reconnect gates before any Milestone 2 implementation. |
 | 2–9 | **Not started for gameplay in production** | Flags are frozen false for all future systems. No active Horror/SecretExploration/Finale/Postgame runtime. | Only begin after Milestone 1 is closed via the gate matrix. |
 
@@ -60,12 +60,12 @@ The canonical planning authority remains [PLAN.md](/Users/tanishkalwad/Documents
 
 The following files form the current production contract:
 
-- [PLAN.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/PLAN.md) — master contract and current implementation intent
-- [UNRESOLVED_DECISIONS.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/UNRESOLVED_DECISIONS.md) — open Milestone 2 blockers that must remain visible
-- [TEST_RESULTS.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/TEST_RESULTS.md) — current gate status and what remains open
-- [MILESTONE1_IMPLEMENTATION.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/MILESTONE1_IMPLEMENTATION.md) and [MILESTONE1_TEST_MATRIX.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/MILESTONE1_TEST_MATRIX.md)
-- [CooperFamilyTaskConfig.module.luau](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/CooperFamilyTaskConfig.module.luau)
-- [verify_milestone1_local.sh](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/tools/verify_milestone1_local.sh)
+- [PLAN.md](PLAN.md) — master contract and current implementation intent
+- [UNRESOLVED_DECISIONS.md](UNRESOLVED_DECISIONS.md) — open Milestone 2 blockers that must remain visible
+- [TEST_RESULTS.md](TEST_RESULTS.md) — current gate status and what remains open
+- [MILESTONE1_IMPLEMENTATION.md](MILESTONE1_IMPLEMENTATION.md) and [MILESTONE1_TEST_MATRIX.md](MILESTONE1_TEST_MATRIX.md)
+- [CooperFamilyTaskConfig.module.luau](CooperFamilyTaskConfig.module.luau)
+- [verify_milestone1_local.sh](tools/verify_milestone1_local.sh)
 - Runtime/GUI source files in root and lobby folders listed in the current test manifests.
 
 ## 3) Current implementation scope details (what “features complete” means)
@@ -85,7 +85,7 @@ The following files form the current production contract:
 
 ### Config-visible systems that are already authored but may be runtime-gated
 
-From [CooperFamilyTaskConfig.module.luau](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/CooperFamilyTaskConfig.module.luau):
+From [CooperFamilyTaskConfig.module.luau](CooperFamilyTaskConfig.module.luau):
 
 - Feature flags remain at Milestone-1 level (`Lobby=true`, others false).
 - Five tasks and five automation upgrades are defined.
@@ -99,7 +99,7 @@ From [CooperFamilyTaskConfig.module.luau](/Users/tanishkalwad/Documents/Roblox_D
 
 ## 4) Milestone 2 blocker register (must remain open)
 
-See [UNRESOLVED_DECISIONS.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/UNRESOLVED_DECISIONS.md). In brief:
+See [UNRESOLVED_DECISIONS.md](UNRESOLVED_DECISIONS.md). In brief:
 
 - `OPEN-M2-01` task cursor after task timeout
 - `OPEN-M2-02` survival anchor timing
@@ -118,11 +118,11 @@ None of these can be skipped or approximated later by guesswork, because Milesto
 1. **Freeze current source into a candidate baseline** in the existing branch.
 2. **Synchronize only the canonical source map** into the correct backed-up Studio instances.
 3. **Run full local+Studio verifier passes** for: 
-   - [verify_milestone1_foundation.luau](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/verify_milestone1_foundation.luau)
-   - [verify_milestone1_value_operations.luau](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/verify_milestone1_value_operations.luau)
-   - [verify_milestone1_remote_inventory.luau](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/verify_milestone1_remote_inventory.luau)
-   - [verify_ui_accessibility_static.luau](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/verify_ui_accessibility_static.luau)
-4. **Complete pending live M1 gates** from [MILESTONE1_TEST_MATRIX.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/MILESTONE1_TEST_MATRIX.md):
+   - [verify_milestone1_foundation.luau](verify_milestone1_foundation.luau)
+   - [verify_milestone1_value_operations.luau](verify_milestone1_value_operations.luau)
+   - [verify_milestone1_remote_inventory.luau](verify_milestone1_remote_inventory.luau)
+   - [verify_ui_accessibility_static.luau](verify_ui_accessibility_static.luau)
+4. **Complete pending live M1 gates** from [MILESTONE1_TEST_MATRIX.md](MILESTONE1_TEST_MATRIX.md):
    - solo/2-player/4-player launch paths
    - invite/ready/launch rejections
    - host and guest reconnect behavior
@@ -134,7 +134,7 @@ None of these can be skipped or approximated later by guesswork, because Milesto
 
 Use the locked decisions in PLAN plus the test plan sections for Horror/Task Pressure:
 
-1. Resolve all open decisions in [UNRESOLVED_DECISIONS.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/UNRESOLVED_DECISIONS.md) and record answers in PLAN.
+1. Resolve all open decisions in [UNRESOLVED_DECISIONS.md](UNRESOLVED_DECISIONS.md) and record answers in PLAN.
 2. Implement encounter/cycle timing and failure reason architecture with exact-one state transitions.
 3. Deliver reveal pipeline only after reveal media + audio manifest + moderation status is approved (`OPEN-M2-07`).
 4. Add M2 smoke + integration + multiplayer cases from the review/test-plan and keep gates strict.
@@ -156,7 +156,7 @@ Once Milestone 2 is green-lit and closed, continue in this order:
 For any milestone to be marked complete:
 
 - All required tests in the master matrix must have evidence rows marked PASS.
-- Open decisions must be closed and documented in [PLAN.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/PLAN.md).
+- Open decisions must be closed and documented in [PLAN.md](PLAN.md).
 - A rollback-safe candidate artifact exists in `/backups`.
 - A published private test evidence trail proves no duplicate value, no stuck states, and no silent progression loss.
 - Visual/accessibility acceptance for desktop + representative mobile presets is captured and attached.
@@ -174,8 +174,8 @@ Practical interpretation: the project is **around Milestone 1 baseline closure**
 
 Before coding any M2+ feature:
 
-- Read [PLAN.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/PLAN.md) first.
-- Check [TEST_RESULTS.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/TEST_RESULTS.md) for currently blocking rows.
-- Check [UNRESOLVED_DECISIONS.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/UNRESOLVED_DECISIONS.md) for blockers.
-- Use [MILESTONE1_TEST_MATRIX.md](/Users/tanishkalwad/Documents/Roblox_Dev/code/FirstGame/MILESTONE1_TEST_MATRIX.md) as the row-level gate.
+- Read [PLAN.md](PLAN.md) first.
+- Check [TEST_RESULTS.md](TEST_RESULTS.md) for currently blocking rows.
+- Check [UNRESOLVED_DECISIONS.md](UNRESOLVED_DECISIONS.md) for blockers.
+- Use [MILESTONE1_TEST_MATRIX.md](MILESTONE1_TEST_MATRIX.md) as the row-level gate.
 - Do not enable Horror or finale flags before Milestone 1 is actually closed.
